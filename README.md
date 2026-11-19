@@ -34,37 +34,71 @@ model API key or Genesis service is required.
 
 ## Get started
 
-Requires **Node.js 22.20.0 or later**.
+Open your project in Codex or Claude Code and ask:
+
+```text
+Install Genesis EDD in this project from https://github.com/GenesisAgentInfra/genesis-edd.
+Read its README and complete setup for the coding agent I am using.
+```
+
+Your agent can download the framework, install its dependencies, and initialize
+the current project. Include the repository URL on the first install so it can
+find the right project. Requires Git and **Node.js 22.20.0 or later**.
+
+<details>
+<summary>Installation steps for your agent or manual setup</summary>
+
+Keep the target project's absolute path before changing directories. Reuse an
+existing Genesis EDD checkout, or clone it into a persistent tools directory
+outside the target project:
 
 ```sh
 git clone https://github.com/GenesisAgentInfra/genesis-edd.git
 cd genesis-edd
 npm ci --ignore-scripts
-node bin/genesis-edd.js init --repo /absolute/path/to/your-project --mode new --agent both
+node bin/genesis-edd.js init --repo /absolute/path/to/your-project --mode new --agent codex
 ```
 
-Point `--repo` to an existing project directory. Use `--mode existing` if the project
-already has code. Choose `--agent codex`, `--agent claude`, or `--agent both`.
-Keep the Genesis EDD checkout available: the installed skill uses its CLI.
+When reusing a checkout, enter it and start with `npm ci`. Point `--repo` to the target project's
+existing directory. Use `--mode new` for a project without application code, or
+`--mode existing` for an existing codebase. Inspect the project to choose the mode.
+Use `--agent codex` for Codex, `--agent claude` for Claude Code, or `--agent both`
+when the user wants both.
+
+Verify the installed launcher from the target project:
+
+```sh
+node .agents/skills/agent-spec/scripts/run.mjs --version
+```
+
+For Claude Code, use `.claude/skills/agent-spec/scripts/run.mjs` instead.
+Copying only the skill folder leaves out its CLI dependencies and runtime binding;
+complete the dependency installation and `init` step. Keep the Genesis EDD
+checkout available: the installed skill uses its CLI.
 If you installed `genesis-spec`, rerun init to migrate to `agent-spec`. Files that
 differ from the previous shipped version are left untouched for manual review.
 
-Reload your project's skills, then describe the behavior you want.
+</details>
 
-In Codex:
-
-```text
-$agent-spec When report submission fails, do not send a success notification.
-```
-
-In Claude Code:
+## Describe what you want
 
 ```text
-/agent-spec When report submission fails, do not send a success notification.
+I want to add report notifications. When report submission fails, do not send a
+success notification. Help me clarify the requirements and acceptance scenarios.
 ```
+
+You do not have to type a command. Codex and Claude Code can select `agent-spec`
+when your request matches its requirements and acceptance-scenario scope.
+Automatic selection is decided by your coding agent; it is not guaranteed for
+every prompt. To select the skill explicitly, use `$agent-spec` in Codex or
+`/agent-spec` in Claude Code. If the installed skill is not visible, reload your
+agent session.
 
 The agent drafts the spec, clarifies unresolved business decisions, validates it,
 and exports it when ready. You can review and edit the spec in your project.
+
+Genesis checks required inputs when you enter a supported workflow stage. These
+checks do not force your coding agent to select the skill or intercept code edits.
 
 ## License
 
