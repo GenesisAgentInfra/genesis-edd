@@ -1,0 +1,4 @@
+interface:
+  display_name: "Genesis Spec"
+  short_description: "Turn requirements into sourced, testable business specs"
+  default_prompt: "Use $genesis-spec to turn this request into a concise business spec and acceptance scenarios."
