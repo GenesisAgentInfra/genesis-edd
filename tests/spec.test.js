@@ -193,6 +193,27 @@ test('existing project records real Git base and Map identity; stale contents bl
   assert.throws(() => exportSpec(repo, 'report-notifications'), /Referenced Map changed/);
 });
 
+test('files Genesis writes do not make the application working tree dirty', (t) => {
+  const repo = project(t, 'existing', 'both');
+  const git = (args) => {
+    const result = spawnSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git(['init', '-b', 'main']);
+  writeFileSync(path.join(repo, 'app.py'), 'answer = 1\n');
+  git(['add', 'app.py']);
+  git(['commit', '-m', 'Add application code']);
+  mkdirSync(path.join(repo, '.genesis/out/latest'), { recursive: true });
+  writeFileSync(path.join(repo, '.genesis/out/latest/business-map.json'), '{}');
+  // openspec/, .genesis/ and both installed skills are untracked here.
+  assert.equal(newSpec(repo, 'first').context.code.working_tree_dirty, false);
+  writeFileSync(path.join(repo, 'app.py'), 'answer = 2\n');
+  assert.equal(newSpec(repo, 'second').context.code.working_tree_dirty, true);
+  git(['checkout', '--', 'app.py']);
+  writeFileSync(path.join(repo, 'notes.txt'), 'untracked application file\n');
+  assert.equal(newSpec(repo, 'third').context.code.working_tree_dirty, true);
+});
+
 test('existing projects without a Map remain usable with an explicit limitation', (t) => {
   const repo = project(t, 'existing');
   const created = newSpec(repo, 'report-notifications');
