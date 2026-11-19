@@ -16,6 +16,13 @@ const LEGACY_SKILL_HASHES = {
   'scripts/run.mjs': 'sha256:881a4b48652d858fa99c6cccacd9549910b64631152884beef6bb88a70fc1e9a',
   'scripts/.gitignore': 'sha256:141fc8419b0378e8ff6d3161f01cb89a1165dc7b7230df4448f63bb3797d2735',
 };
+// Earlier shipped versions of the agent-spec files. init updates an untouched
+// copy and still refuses to replace an edited one. Add the outgoing hash here
+// whenever a shipped skill file changes.
+const PREVIOUS_SKILL_HASHES = {
+  'SKILL.md': ['sha256:125c0caf12be5e2e0dac8bb9758105173260d842e9cfe144f3b4d38a1ebc7871'],
+  'references/spec-format.md': ['sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1'],
+};
 export const digest = (value) => `sha256:${createHash('sha256').update(value).digest('hex')}`;
 export const readJSON = (file) => JSON.parse(readFileSync(file, 'utf8'));
 
@@ -119,7 +126,8 @@ export function initProject(repo, mode, agent) {
       legacySkills.push(legacy);
     }
     for (const file of listFiles(skillRoot)) {
-      add(`${directory}/skills/agent-spec/${path.relative(skillRoot, file)}`, readFileSync(file, 'utf8'));
+      const relative = path.relative(skillRoot, file).split(path.sep).join('/');
+      add(`${directory}/skills/agent-spec/${relative}`, readFileSync(file, 'utf8'), PREVIOUS_SKILL_HASHES[relative]);
     }
     add(`${directory}/skills/agent-spec/scripts/runtime.json`, runtime);
   }
@@ -128,7 +136,7 @@ export function initProject(repo, mode, agent) {
     if (existsSync(write.file)) {
       const current = readFileSync(write.file, 'utf8');
       if (current !== write.content) {
-        if (digest(current) !== write.previousHash) throw new Error(`Existing file differs; left unchanged: ${write.file}`);
+        if (![write.previousHash].flat().includes(digest(current))) throw new Error(`Existing file differs; left unchanged: ${write.file}`);
         write.update = true;
       }
     }

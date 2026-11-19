@@ -47,15 +47,25 @@ Group a small set of independent, currently answerable questions when useful;
 wait on dependent questions until their prerequisites are settled. After an
 answer or correction, revisit only the affected decisions and scenarios.
 
-Frame questions with a concrete trigger and observable outcome, using the
-project's business vocabulary. Offer meaningful alternatives with their business
-consequences and a brief recommendation when justified. Allow the user to supply
-another answer; silence or acceptance of one option does not approve other
-unanswered questions. Use an available question tool when it helps; the skill
-does not require a particular tool or a fixed number of questions.
+Ask closed questions. State one concrete rule, with its trigger and observable
+outcome in the project's business vocabulary, and ask whether it holds, so the
+user can answer yes or no. Mark the answer you recommend and say that one reply
+can accept every recommendation. Offer two or three mutually exclusive rules to
+pick from only when no single rule is the natural default. Do not ask the user
+to describe what they want in their own words, though they may always do so.
+Silence or acceptance of one item does not approve other unanswered items. Use
+an available question tool when it helps; the skill does not require a
+particular tool or a fixed number of questions.
 
 An unambiguous user statement is enough to record an `explicit` requirement: do
-not ask the user to confirm the same sentence again. Keep model-added constraints
+not ask the user to confirm the same sentence again. `explicit` covers only what
+those words state. A rule you derive from them (the converse of a permission, who
+is refused, a limit, a side effect that must not happen) is model-added even when
+it seems obvious. By default leave it out and do not ask about it: list it in
+your final account as a numbered rule that is not included, worded so the user
+can add it by replying with its number. Ask only when the stated requirement
+cannot be judged without it. When you tell the user what was recorded, separate
+their own words from your reading of them. Keep model-added constraints
 `proposed` until explicitly accepted. Record decisions and unresolved business
 questions in the existing Spec's provenance and `open_questions`, without a
 separate interview log or decision-tree artifact. Implementation choices and
@@ -85,6 +95,9 @@ then proceed to writing and validation without a routine final approval round.
    scenarios and stable headings. Increment a file's revision when its meaning
    changes. For a new iteration after a frozen handoff, prefer a new change and
    reference the accepted earlier spec; never silently replace the old expectation.
+   Before validating, compare every `explicit` and `confirmed` block with its
+   quote or confirmation. Remove a requirement sentence or scenario line that the
+   source does not cover, and list it as not included in your final account.
 3. Run `edd workflow check spec-export <change> --repo <app>`. It is read-only and
    exits nonzero while blocked; read its JSON `gaps`, `next` and `resume` rather
    than treating every failure as a question for the user. Follow the recovery
@@ -93,6 +106,9 @@ then proceed to writing and validation without a routine final approval round.
    of the agreed behavior, relevant delta, remaining limits and the handoff path.
    Do not add a routine approval gate. Export records the supplied provenance; it
    is not independent proof of consent and does not mean an Eval has run.
+   Include the returned `review` in that account: each requirement with its
+   state, the words it rests on and its outcomes. It lets the user spot a rule
+   attributed to them by mistake; it is not a request for approval.
 
 ## Recover missing inputs
 
@@ -104,6 +120,9 @@ For each gap, reuse the current request, accepted decisions and existing files:
   or restore its recorded snapshot. Never invent sources, overwrite a frozen
   handoff or relabel a draft to satisfy a check. Ask for user help only when a
   needed fact or access cannot be obtained with available tools.
+  `explicit_exceeds_quote` means more requirements are labelled `explicit` than
+  the quoted words state. Quote the exact words for each requirement as its own
+  source; a rule with no words of its own is derived, so remove it.
 - `business`: check whether the conversation already settles it. Record that real
   source if so; otherwise ask only the acceptance-changing question and update
   the Spec with the answer. If deferred, keep the draft and resume command.

@@ -44,6 +44,45 @@ export function specStatus(repo, name) {
 
 const nonempty = (value) => typeof value === 'string' && value.trim().length > 0;
 const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+// Sentence-level statements in a quotation. Commas do not split: clauses of one
+// sentence usually qualify each other rather than state separate rules.
+const statementCount = (quote) => Math.max(1,
+  quote.split(/[。！？；!?;\n]+|\.(?=\s|$)/).filter((part) => part.trim()).length);
+
+// Each requirement beside the words it rests on, for the user to read. The CLI
+// cannot judge whether a quote really states a requirement; a person can.
+export function specReview(specs) {
+  const review = [];
+  for (const { path: file, content } of specs) {
+    const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(content);
+    const metadata = parse(match[1]);
+    for (const block of content.slice(match[0].length).split(/^### Requirement:\s*/m).slice(1)) {
+      const [heading, ...rest] = block.split(/\r?\n/);
+      const [, id, name] = /^(REQ-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)\s+(.+)$/.exec(heading.trim());
+      const [intro, ...scenarios] = rest.join('\n').split(/^## /m)[0].split(/^#### Scenario:.*$/m);
+      const outcomes = [];
+      for (const scenario of scenarios) {
+        let step;
+        for (const line of scenario.split('\n')) {
+          const clause = /^\s*-\s*\*\*(GIVEN|WHEN|THEN|AND)\*\*\s*(.+)$/.exec(line);
+          if (!clause) continue;
+          if (clause[1] !== 'AND') step = clause[1];
+          if (step === 'THEN') outcomes.push(clause[2].trim());
+        }
+      }
+      const provenance = metadata.requirements[id];
+      const source = metadata.sources[provenance.source];
+      review.push({
+        requirement: id, name: name.trim(), path: file, state: provenance.state,
+        basis: { source: provenance.source, kind: source.kind, quote: source.quote },
+        ...(provenance.confirmation ? { confirmation: provenance.confirmation } : {}),
+        statement: intro.split('\n').map((line) => line.trim()).filter(Boolean).join(' '),
+        outcomes,
+      });
+    }
+  }
+  return review;
+}
 
 export function validateSpec(repo, name) {
   const directory = changeDirectory(repo, name);
@@ -179,6 +218,23 @@ export function validateSpec(repo, name) {
     for (const id of Object.keys(metadata.requirements ?? {})) {
       if (!seen.has(id)) fail(`Provenance ${id} has no requirement block.`);
     }
+    // Explicit means the quoted words state the requirement, so one quote cannot
+    // back more explicit requirements than it has statements. This catches a
+    // derived rule filed under the sentence it was derived from.
+    const byQuote = new Map();
+    for (const id of seen) {
+      const provenance = metadata.requirements?.[id];
+      const quote = metadata.sources?.[provenance?.source]?.quote;
+      if (provenance?.state !== 'explicit' || !nonempty(quote)) continue;
+      const key = quote.replace(/\s+/g, ' ').trim();
+      byQuote.set(key, [...(byQuote.get(key) ?? []), id]);
+    }
+    for (const [quote, cited] of byQuote) {
+      const stated = statementCount(quote);
+      if (cited.length > stated) {
+        error('explicit_exceeds_quote', `${relative}: ${cited.join(', ')} are ${cited.length} explicit requirements resting on one quote that makes ${stated} statement${stated === 1 ? '' : 's'}. Quote the words that state each requirement as its own source, or remove a rule the user did not state.`, { path: relative, requirement_ids: cited });
+      }
+    }
     specs.push({ path: relative, sha256: digest(content), revision: metadata.revision, content });
   }
   let upstream;
@@ -244,6 +300,7 @@ export function exportSpec(repo, name) {
   }
   return {
     id, file, ready_for_eval_design: true, warnings: result.warnings,
+    review: specReview(result.specs),
     next: 'write-eval (planned): derive cases and execution bindings from this frozen spec handoff.',
   };
 }
