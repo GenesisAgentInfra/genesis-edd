@@ -3,7 +3,7 @@
 Turn feature requests into clear, testable specs with your coding agent.
 
 Genesis EDD helps you define what a feature should do before implementation.
-The current release, **Genesis Spec**, turns your request into concise requirements
+The **agent-spec** skill turns your request into concise requirements
 and concrete acceptance scenarios, with questions focused on decisions that affect
 acceptance.
 
@@ -23,8 +23,14 @@ acceptance.
 Works with Codex and Claude Code. Uses your existing coding agent; no separate
 model API key or Genesis service is required.
 
-**Available today:** spec authoring, validation, and export. Eval generation,
-Eval execution, and the automated implementation loop are not available yet.
+## Skills
+
+| Skill | Purpose | Availability |
+| --- | --- | --- |
+| `agent-spec` | Clarify requirements, write acceptance scenarios, and export a validated spec. | Available |
+| `write-eval` | Turn an accepted spec into an Eval task package. | Not yet available |
+| `run-eval` | Run Evals and compare baseline and head results. | Not yet available |
+| `loop-and-implement` | Implement changes and iterate using Eval feedback. | Not yet available |
 
 ## Get started
 
@@ -40,19 +46,21 @@ node bin/genesis-edd.js init --repo /absolute/path/to/your-project --mode new --
 Point `--repo` to an existing project directory. Use `--mode existing` if the project
 already has code. Choose `--agent codex`, `--agent claude`, or `--agent both`.
 Keep the Genesis EDD checkout available: the installed skill uses its CLI.
+If you installed `genesis-spec`, rerun init to migrate to `agent-spec`. Files that
+differ from the previous shipped version are left untouched for manual review.
 
 Reload your project's skills, then describe the behavior you want.
 
 In Codex:
 
 ```text
-$genesis-spec When report submission fails, do not send a success notification.
+$agent-spec When report submission fails, do not send a success notification.
 ```
 
 In Claude Code:
 
 ```text
-/genesis-spec When report submission fails, do not send a success notification.
+/agent-spec When report submission fails, do not send a success notification.
 ```
 
 The agent drafts the spec, clarifies unresolved business decisions, validates it,

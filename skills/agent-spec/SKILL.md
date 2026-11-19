@@ -1,9 +1,9 @@
 ---
-name: genesis-spec
+name: agent-spec
 description: Turn a new feature request or a change to existing requirements into a concise, sourced business Spec for Genesis EDD. Use for requirement clarification, acceptance scenarios, and incremental spec edits. Supports empty projects and existing codebases with Genesis Maps; implementation and evaluation execution are separate stages.
 ---
 
-# Genesis Spec
+# Agent Spec
 
 Produce a small, reviewable business Spec in the user's application repository.
 Use the user's language. The user's coding agent supplies the reasoning; the CLI

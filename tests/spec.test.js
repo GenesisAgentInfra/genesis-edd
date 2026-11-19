@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -184,14 +184,78 @@ test('init is idempotent, preserves existing config and preflights conflicts', (
   assert.throws(() => newSpec(repo, 'external-change'), /external stores/);
 });
 
-test('installed skill runs the pinned CLI and its local runtime is ignored by Git', (t) => {
+test('agent-spec installs for both agents and runs the pinned CLI', (t) => {
   const repo = project(t, 'new', 'both');
   for (const directory of ['.agents', '.claude']) {
-    const scripts = path.join(repo, directory, 'skills/genesis-spec/scripts');
+    const scripts = path.join(repo, directory, 'skills/agent-spec/scripts');
     const result = spawnSync(process.execPath, [path.join(scripts, 'run.mjs'), '--version'], { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(JSON.parse(result.stdout).openspec, '2.1.0');
     assert.match(readFileSync(path.join(scripts, '.gitignore'), 'utf8'), /runtime.json/);
+    assert.equal(existsSync(path.join(repo, directory, 'skills/genesis-spec')), false);
+  }
+  assert.deepEqual(initProject(repo, 'new', 'both').created, []);
+});
+
+function legacyInstallation(t) {
+  const repo = project(t, 'new', 'both');
+  for (const directory of ['.agents', '.claude']) {
+    const legacy = path.join(repo, directory, 'skills/genesis-spec');
+    renameSync(path.join(repo, directory, 'skills/agent-spec'), legacy);
+    const skill = path.join(legacy, 'SKILL.md');
+    writeFileSync(skill, readFileSync(skill, 'utf8').replace('name: agent-spec', 'name: genesis-spec').replace('# Agent Spec', '# Genesis Spec'));
+    const metadata = path.join(legacy, 'agents/openai.yaml');
+    writeFileSync(metadata, readFileSync(metadata, 'utf8').replace('Agent Spec', 'Genesis Spec').replace('$agent-spec', '$genesis-spec'));
+  }
+  const schema = path.join(repo, 'openspec/schemas/genesis-spec/schema.yaml');
+  writeFileSync(schema, readFileSync(schema, 'utf8').replace('Use the agent-spec skill', 'Use the genesis-spec skill'));
+  return { repo, schema };
+}
+
+test('init renames the unmodified legacy skill without changing specs or handoffs', (t) => {
+  const { repo } = legacyInstallation(t);
+  newSpec(repo, 'report-notifications');
+  const spec = writeSpec(repo);
+  const handoff = exportSpec(repo, 'report-notifications');
+  const frozen = readFileSync(handoff.file, 'utf8');
+  const result = initProject(repo, 'new', 'both');
+  assert.deepEqual(result.migrated, ['.agents/skills/genesis-spec', '.claude/skills/genesis-spec']);
+  assert.deepEqual(result.updated, ['openspec/schemas/genesis-spec/schema.yaml']);
+  for (const directory of ['.agents', '.claude']) {
+    assert.equal(existsSync(path.join(repo, directory, 'skills/genesis-spec')), false);
+    const launcher = path.join(repo, directory, 'skills/agent-spec/scripts/run.mjs');
+    const run = spawnSync(process.execPath, [launcher, 'spec', 'validate', 'report-notifications', '--repo', repo], { encoding: 'utf8' });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(JSON.parse(run.stdout).ready_for_eval_design, true);
+  }
+  assert.equal(readFileSync(spec, 'utf8'), fixture);
+  assert.equal(readFileSync(handoff.file, 'utf8'), frozen);
+  assert.equal(exportSpec(repo, 'report-notifications').id, handoff.id);
+  const repeated = initProject(repo, 'new', 'both');
+  assert.deepEqual(repeated.created, []);
+  assert.deepEqual(repeated.updated, []);
+  assert.deepEqual(repeated.migrated, []);
+});
+
+test('legacy migration preserves custom files and preflights all destinations', (t) => {
+  for (const target of ['skill', 'extra', 'schema', 'destination']) {
+    const { repo, schema } = legacyInstallation(t);
+    const oldSchema = readFileSync(schema, 'utf8');
+    const files = {
+      skill: '.claude/skills/genesis-spec/SKILL.md',
+      extra: '.claude/skills/genesis-spec/custom.md',
+      schema: 'openspec/schemas/genesis-spec/schema.yaml',
+      destination: '.claude/skills/agent-spec/SKILL.md',
+    };
+    const custom = path.join(repo, files[target]);
+    mkdirSync(path.dirname(custom), { recursive: true });
+    writeFileSync(custom, 'User customization\n');
+    assert.throws(() => initProject(repo, 'new', 'both'), /differs; left unchanged/);
+    assert.equal(readFileSync(custom, 'utf8'), 'User customization\n');
+    assert.equal(existsSync(path.join(repo, '.agents/skills/agent-spec')), false);
+    assert.equal(existsSync(path.join(repo, '.agents/skills/genesis-spec/SKILL.md')), true);
+    assert.equal(existsSync(path.join(repo, '.claude/skills/genesis-spec/SKILL.md')), true);
+    if (target !== 'schema') assert.equal(readFileSync(schema, 'utf8'), oldSchema);
   }
 });
 

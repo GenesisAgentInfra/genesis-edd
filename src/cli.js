@@ -14,7 +14,7 @@ genesis-edd spec export NAME --repo PATH
 genesis-edd workflow check STAGE NAME --repo PATH
 
 All commands return JSON. init defaults to --agent both. Spec content is authored
-by your coding agent using the installed genesis-spec skill, not by a CLI model.
+by your coding agent using the installed agent-spec skill, not by a CLI model.
 validate exits 1 for malformed specs; valid drafts report ready_for_eval_design=false.
 export requires a valid spec with no proposed requirements or open questions.
 workflow check is read-only and returns gaps, repair routes and a resume command.

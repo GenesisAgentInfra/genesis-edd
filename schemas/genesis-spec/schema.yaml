@@ -7,7 +7,7 @@ artifacts:
     description: Observable business requirements with sources and acceptance scenarios.
     template: spec.md
     instruction: |
-      Use the genesis-spec skill and its spec-format reference. Read the user's
+      Use the agent-spec skill and its spec-format reference. Read the user's
       request, accepted requirements and relevant business map if available.
       Write one small spec per cohesive capability. Each requirement has a stable
       REQ- identifier, source and explicit/confirmed/proposed status in frontmatter.

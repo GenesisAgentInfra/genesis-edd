@@ -1,12 +1,21 @@
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'yaml';
 
 export const ROOT = fileURLToPath(new URL('../', import.meta.url));
 export const SCHEMA = 'genesis-spec';
+// Exact files shipped before the public skill was renamed to agent-spec.
+const LEGACY_SCHEMA_HASH = 'sha256:a9390e43cec50f174f66d045c5c9c4e5515287e5e55d4ed1efdf26ef21d2b016';
+const LEGACY_SKILL_HASHES = {
+  'SKILL.md': 'sha256:f9e1f45e779069c9d74459b5df4dcf6e3ccac756e3a5424fc4171ce716cf6ffb',
+  'agents/openai.yaml': 'sha256:52b4b1a715ed8689382c0a6dd79c4d036b819e46c8b3e9e30934c168111b1047',
+  'references/spec-format.md': 'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
+  'scripts/run.mjs': 'sha256:881a4b48652d858fa99c6cccacd9549910b64631152884beef6bb88a70fc1e9a',
+  'scripts/.gitignore': 'sha256:141fc8419b0378e8ff6d3161f01cb89a1165dc7b7230df4448f63bb3797d2735',
+};
 export const digest = (value) => `sha256:${createHash('sha256').update(value).digest('hex')}`;
 export const readJSON = (file) => JSON.parse(readFileSync(file, 'utf8'));
 
@@ -80,7 +89,8 @@ export function initProject(repo, mode, agent) {
   if (!['new', 'existing'].includes(mode)) throw new Error('--mode must be new or existing.');
   if (!['codex', 'claude', 'both', 'none'].includes(agent)) throw new Error('--agent must be codex, claude, both or none.');
   const writes = [];
-  const add = (relative, content) => writes.push({ file: localPath(repo, relative), content });
+  const legacySkills = [];
+  const add = (relative, content, previousHash) => writes.push({ file: localPath(repo, relative), content, previousHash });
   const configFile = localPath(repo, 'openspec/config.yaml');
   if (existsSync(configFile)) {
     const config = parse(readFileSync(configFile, 'utf8'));
@@ -91,33 +101,56 @@ export function initProject(repo, mode, agent) {
   add('openspec/genesis.json', `${JSON.stringify({ version: 1, mode }, null, 2)}\n`);
   const schemaRoot = path.join(ROOT, 'schemas', SCHEMA);
   for (const file of listFiles(schemaRoot)) {
-    add(`openspec/schemas/${SCHEMA}/${path.relative(schemaRoot, file)}`, readFileSync(file, 'utf8'));
+    const relative = path.relative(schemaRoot, file);
+    add(`openspec/schemas/${SCHEMA}/${relative}`, readFileSync(file, 'utf8'), relative === 'schema.yaml' ? LEGACY_SCHEMA_HASH : undefined);
   }
   const agentDirs = agent === 'both' ? ['.agents', '.claude'] : agent === 'none' ? [] : [agent === 'codex' ? '.agents' : '.claude'];
-  const skillRoot = path.join(ROOT, 'skills/genesis-spec');
+  const skillRoot = path.join(ROOT, 'skills/agent-spec');
+  const runtime = `${JSON.stringify({ cli: path.join(ROOT, 'bin/genesis-edd.js') }, null, 2)}\n`;
   for (const directory of agentDirs) {
-    for (const file of listFiles(skillRoot)) {
-      add(`${directory}/skills/genesis-spec/${path.relative(skillRoot, file)}`, readFileSync(file, 'utf8'));
+    const legacy = localPath(repo, `${directory}/skills/genesis-spec`);
+    if (existsSync(legacy)) {
+      const expected = { ...LEGACY_SKILL_HASHES, 'scripts/runtime.json': digest(runtime) };
+      const files = listFiles(legacy);
+      if (files.length !== Object.keys(expected).length || files.some((file) =>
+        digest(readFileSync(file, 'utf8')) !== expected[path.relative(legacy, file).split(path.sep).join('/')])) {
+        throw new Error(`Legacy skill differs; left unchanged. Review it before installing agent-spec: ${legacy}`);
+      }
+      legacySkills.push(legacy);
     }
-    add(`${directory}/skills/genesis-spec/scripts/runtime.json`, `${JSON.stringify({ cli: path.join(ROOT, 'bin/genesis-edd.js') }, null, 2)}\n`);
+    for (const file of listFiles(skillRoot)) {
+      add(`${directory}/skills/agent-spec/${path.relative(skillRoot, file)}`, readFileSync(file, 'utf8'));
+    }
+    add(`${directory}/skills/agent-spec/scripts/runtime.json`, runtime);
   }
   // Check the entire install before writing anything; never replace custom files.
-  for (const { file, content } of writes) {
-    if (existsSync(file) && readFileSync(file, 'utf8') !== content) {
-      throw new Error(`Existing file differs; left unchanged: ${file}`);
+  for (const write of writes) {
+    if (existsSync(write.file)) {
+      const current = readFileSync(write.file, 'utf8');
+      if (current !== write.content) {
+        if (digest(current) !== write.previousHash) throw new Error(`Existing file differs; left unchanged: ${write.file}`);
+        write.update = true;
+      }
     }
   }
   const created = [];
-  for (const { file, content } of writes) {
+  const updated = [];
+  for (const { file, content, update } of writes) {
+    if (update) {
+      writeFileSync(file, content);
+      updated.push(path.relative(repo, file));
+      continue;
+    }
     if (existsSync(file)) continue;
     mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(file, content, { flag: 'wx' });
     created.push(path.relative(repo, file));
   }
+  for (const legacy of legacySkills) rmSync(legacy, { recursive: true });
   for (const directory of ['openspec/specs', 'openspec/changes']) {
     mkdirSync(localPath(repo, directory), { recursive: true });
   }
-  return { repo, mode, agent, created, schema: openspec(repo, ['schema', 'validate', SCHEMA, '--json']).data };
+  return { repo, mode, agent, created, updated, migrated: legacySkills.map((file) => path.relative(repo, file)), schema: openspec(repo, ['schema', 'validate', SCHEMA, '--json']).data };
 }
 
 export function changeDirectory(repo, name) {
