@@ -174,7 +174,13 @@ export function captureContext(repo, mode, mapFile) {
     return result.status === 0 ? result.stdout.trim() : null;
   };
   const head = git(['rev-parse', '--verify', 'HEAD']);
-  const workingTree = git(['status', '--porcelain']);
+  // Files Genesis itself writes are not changes to the application.
+  const generated = ['openspec/', '.genesis/', '.agents/skills/agent-spec/', '.claude/skills/agent-spec/'];
+  const status = git(['-c', 'core.quotepath=off', 'status', '--porcelain', '--untracked-files=all']);
+  const workingTree = status === null ? null : status.split('\n')
+    .map((line) => line.trimStart().replace(/^\S{1,2}\s+/, '').split(' -> ').pop().replace(/^"/, ''))
+    .filter((file) => file && !generated.some((prefix) => file.startsWith(prefix)))
+    .join('\n');
   let map = { status: mode === 'new' ? 'not_applicable' : 'missing', reason: mode === 'new' ? 'new_project' : 'not_provided' };
   if (mapFile) {
     const file = path.resolve(repo, mapFile);
