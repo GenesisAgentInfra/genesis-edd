@@ -61,6 +61,27 @@ Map 缺失不阻塞写 Spec，但会返回缺口提示；已提供的 Map 如果
 所有功能命令输出 JSON；`--help` 输出文本。格式错误返回非零退出码。
 合法但仍有待确认项的草案返回 `valid: true, ready_for_eval_design: false`，不能导出。
 
+### 检查输入并继续
+
+```sh
+node /path/to/genesis-edd/bin/genesis-edd.js workflow check spec-export report-notifications \
+  --repo /path/to/application
+```
+
+检查只读，不生成产物或修改状态。返回的 `gaps` 区分 `artifact`（缺产物）、
+`technical`（格式或快照问题）、`business`（待定业务规则）和 `capability`（模块未实现）。
+Agent 按 `next` 回到负责补齐的步骤：先复用已有信息、修复文件，只有业务仍未确定或
+技术缺口无法自行解决时才询问用户。补齐后重跑 `resume.command`，从原请求继续。
+每次都读取实际产物，不能靠手填“已完成”放行；导出入口本身也会重新校验，
+失败时返回分类缺口与恢复命令。
+
+`workflow check write-eval NAME` 会检查当前 Spec 及对应固定版本交接文件。
+即使 `inputs_ready: true`，仍返回 `implemented: false, status: unavailable`，
+因为本版尚未实现 Eval 生成。`run-eval` 和 `loop-and-implement` 的检查返回
+`inputs_ready: null`，表示其输入检查也未实现。直接调用这些阶段并提供 NAME 时，
+只返回上述诊断，不执行阶段。阻塞或不可用的检查返回退出码 1；可导出时返回 0。
+这套检查约束 Genesis 的交接入口，不拦截 Agent 在框架外直接修改代码。
+
 ## 写入应用仓库的内容
 
 ```text

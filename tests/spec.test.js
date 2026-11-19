@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { ROOT, initProject, projectRoot, readJSON } from '../src/project.js';
 import { exportSpec, newSpec, specInstructions, specStatus, validateSpec } from '../src/spec.js';
+import { checkWorkflow } from '../src/workflow.js';
 
 const fixture = readFileSync(path.join(ROOT, 'examples/report-notifications/spec.md'), 'utf8');
 function project(t, mode = 'new', agent = 'none') {
@@ -140,6 +141,7 @@ test('existing projects without a Map remain usable with an explicit limitation'
   const result = validateSpec(repo, 'report-notifications');
   assert.equal(result.ready_for_eval_design, true);
   assert.match(result.warnings.join('\n'), /No Map supplied/);
+  assert.equal(checkWorkflow(repo, 'spec-export', 'report-notifications').status, 'ready');
 });
 
 test('incremental requirements reuse the accepted capability and stable identity', (t) => {
@@ -211,4 +213,163 @@ test('CLI reports invalid specs and deferred commands with nonzero exit codes', 
     assert.equal(result.status, 1);
     assert.doesNotThrow(() => JSON.parse(result.stdout || result.stderr));
   }
+});
+
+test('input checks route missing artifacts without creating them or requesting business decisions', (t) => {
+  const repo = projectRoot(mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-inputs-')));
+  t.after(() => rmSync(repo, { recursive: true, force: true }));
+  let result = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.gaps[0].code, 'project_missing');
+  assert.equal(result.next.owner, 'agent');
+  assert.equal(result.next.route, 'init');
+  assert.equal(existsSync(path.join(repo, 'openspec')), false);
+  initProject(repo, 'new', 'none');
+  result = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  assert.equal(result.gaps[0].code, 'change_missing');
+  assert.equal(result.next.route, 'agent-spec');
+  assert.equal(existsSync(path.join(repo, 'openspec/changes/report-notifications')), false);
+  newSpec(repo, 'report-notifications');
+  result = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  assert.equal(result.gaps[0].code, 'spec_missing');
+  assert.equal(result.gaps[0].kind, 'artifact');
+  assert.equal(result.next.owner, 'agent');
+  writeSpec(repo);
+  result = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  assert.equal(result.status, 'ready');
+  assert.deepEqual(result.gaps, []);
+  assert.equal(existsSync(path.join(repo, 'openspec/changes/report-notifications/handoffs')), false);
+});
+
+test('business blockers identify requirements and questions; technical repair takes precedence', (t) => {
+  const content = fixture.replace('state: explicit', 'state: proposed')
+    .replace('open_questions: []', 'open_questions: ["Should a successful retry send a notification?"]');
+  const { repo, file } = authored(t, content);
+  let result = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.next.owner, 'user');
+  assert.equal(result.gaps.find((gap) => gap.code === 'requirement_proposed').requirement_id, 'REQ-submit-failure');
+  assert.equal(result.gaps.find((gap) => gap.code === 'business_question').question, 'Should a successful retry send a notification?');
+  writeFileSync(file, content.replace('source: request', 'source: missing'));
+  result = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  assert.equal(result.next.owner, 'agent');
+  assert.ok(result.gaps.some((gap) => gap.kind === 'technical'));
+  assert.ok(result.gaps.some((gap) => gap.kind === 'business'));
+  assert.equal(readFileSync(file, 'utf8'), content.replace('source: request', 'source: missing'));
+});
+
+test('export rechecks changed inputs and reports the same classified blockers without a preflight', (t) => {
+  const { repo, file } = authored(t);
+  assert.equal(checkWorkflow(repo, 'spec-export', 'report-notifications').status, 'ready');
+  writeFileSync(file, fixture.replace('state: explicit', 'state: proposed'));
+  const gate = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  assert.throws(() => exportSpec(repo, 'report-notifications'), (error) => {
+    assert.equal(error.code, 'SPEC_INPUT_BLOCKED');
+    assert.deepEqual(error.gaps, gate.gaps);
+    assert.deepEqual(error.resume.command, ['spec', 'export', 'report-notifications', '--repo', repo]);
+    return true;
+  });
+  assert.equal(existsSync(path.join(repo, 'openspec/changes/report-notifications/handoffs')), false);
+});
+
+test('write-eval input check requires the current frozen Spec and preserves older exports', (t) => {
+  const { repo, file } = authored(t);
+  let result = checkWorkflow(repo, 'write-eval', 'report-notifications');
+  assert.equal(result.inputs_ready, false);
+  assert.equal(result.next.route, 'spec-export');
+  assert.equal(result.gaps[0].code, 'handoff_missing');
+  assert.equal(result.resume.stage, 'write-eval');
+  const first = exportSpec(repo, 'report-notifications');
+  const original = readFileSync(first.file, 'utf8');
+  result = checkWorkflow(repo, 'write-eval', 'report-notifications');
+  assert.equal(result.inputs_ready, true);
+  assert.equal(result.status, 'unavailable');
+  assert.equal(result.implemented, false);
+  assert.equal(result.handoff.id, first.id);
+  assert.equal(result.next.owner, 'framework');
+  writeFileSync(file, fixture.replace('revision: 1', 'revision: 2').replace('数量为零', '数量必须为零'));
+  result = checkWorkflow(repo, 'write-eval', 'report-notifications');
+  assert.equal(result.inputs_ready, false);
+  assert.equal(result.gaps[0].code, 'handoff_missing');
+  assert.equal(readFileSync(first.file, 'utf8'), original);
+  const second = exportSpec(repo, 'report-notifications');
+  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').handoff.id, second.id);
+});
+
+test('tampered handoffs and manually supplied readiness flags cannot pass the gate', (t) => {
+  const { repo } = authored(t);
+  const handoff = exportSpec(repo, 'report-notifications');
+  const tampered = { ...readJSON(handoff.file), ready_for_eval_design: true, status: 'completed', specs: [] };
+  writeFileSync(handoff.file, JSON.stringify(tampered));
+  for (const stage of ['spec-export', 'write-eval']) {
+    const result = checkWorkflow(repo, stage, 'report-notifications');
+    assert.equal(result.status, 'blocked');
+    assert.equal(result.gaps[0].code, 'handoff_invalid');
+    assert.equal(result.next.owner, 'agent');
+  }
+  assert.throws(() => exportSpec(repo, 'report-notifications'), (error) => error.code === 'HANDOFF_INVALID');
+  assert.deepEqual(readJSON(handoff.file), tampered);
+});
+
+test('broken context and changed Map snapshots route to technical recovery without asking business questions', (t) => {
+  const repo = project(t, 'existing');
+  const map = path.join(repo, 'map.json');
+  writeFileSync(map, JSON.stringify({ snapshot_id: 'original', analysis_status: 'partial' }));
+  newSpec(repo, 'report-notifications', { map });
+  writeSpec(repo);
+  writeFileSync(map, JSON.stringify({ snapshot_id: 'changed', analysis_status: 'complete' }));
+  let result = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  assert.equal(result.gaps[0].code, 'map_changed');
+  assert.equal(result.next.owner, 'agent');
+  const context = path.join(repo, 'openspec/changes/report-notifications/genesis.json');
+  for (const [content, code] of [['{broken', 'context_unavailable'], ['null', 'context_invalid']]) {
+    writeFileSync(context, content);
+    result = checkWorkflow(repo, 'spec-export', 'report-notifications');
+    assert.equal(result.gaps[0].code, code);
+    assert.equal(result.gaps[0].kind, 'technical');
+    assert.equal(result.next.owner, 'agent');
+  }
+});
+
+test('CLI recovery resumes the original stage after a business decision is supplied', (t) => {
+  const { repo, file } = authored(t, fixture.replace('state: explicit', 'state: proposed'));
+  const run = (args) => spawnSync(process.execPath, [path.join(ROOT, 'bin/genesis-edd.js'), ...args], { encoding: 'utf8' });
+  let response = run(['workflow', 'check', 'spec-export', 'report-notifications', '--repo', repo]);
+  assert.equal(response.status, 1);
+  const blocked = JSON.parse(response.stdout);
+  assert.equal(blocked.next.owner, 'user');
+  const confirmed = fixture.replace('state: explicit', 'state: confirmed\n    confirmation:\n      by: Example user\n      ref: example:approval-message');
+  writeFileSync(file, confirmed);
+  response = run(blocked.resume.command);
+  assert.equal(response.status, 0, response.stderr);
+  const ready = JSON.parse(response.stdout);
+  assert.equal(ready.status, 'ready');
+  response = run(ready.next.command);
+  assert.equal(response.status, 0, response.stderr);
+  assert.equal(readJSON(JSON.parse(response.stdout).file).specs[0].content, confirmed);
+  writeFileSync(file, fixture.replace('state: explicit', 'state: proposed'));
+  response = run(ready.next.command);
+  assert.equal(response.status, 1);
+  assert.equal(JSON.parse(response.stderr).gaps[0].code, 'requirement_proposed');
+});
+
+test('unimplemented stage entries return diagnostics without claiming readiness or running a stage', (t) => {
+  const { repo } = authored(t);
+  for (const stage of ['write-eval', 'run-eval', 'loop-and-implement']) {
+    const result = checkWorkflow(repo, stage, 'report-notifications');
+    assert.equal(result.implemented, false);
+    assert.ok(result.gaps.some((gap) => gap.code === 'stage_unavailable' && gap.owner === 'framework'));
+    if (stage !== 'write-eval') assert.equal(result.inputs_ready, null);
+    const response = spawnSync(process.execPath, [path.join(ROOT, 'bin/genesis-edd.js'), stage, 'report-notifications', '--repo', repo], { encoding: 'utf8' });
+    assert.equal(response.status, 1);
+    const diagnostic = JSON.parse(response.stdout);
+    assert.equal(diagnostic.implemented, false);
+    assert.equal(diagnostic.inputs_ready, result.inputs_ready);
+    assert.equal(diagnostic.status, result.status);
+    assert.deepEqual(diagnostic.gaps, result.gaps);
+    assert.deepEqual(diagnostic.resume, result.resume);
+  }
+  assert.equal(existsSync(path.join(repo, 'openspec/changes/report-notifications/handoffs')), false);
+  assert.throws(() => checkWorkflow(repo, 'unknown', 'report-notifications'), /Unknown stage/);
+  assert.throws(() => checkWorkflow(repo, 'spec-export', '../escape'), /kebab-case/);
 });

@@ -46,35 +46,82 @@ const nonempty = (value) => typeof value === 'string' && value.trim().length > 0
 const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 export function validateSpec(repo, name) {
-  const directory = requireChange(repo, name);
+  const directory = changeDirectory(repo, name);
   const errors = [];
   const blockers = [];
+  const gaps = [];
   const warnings = [];
   const specs = [];
   const ids = new Set();
   const frontmatterOnlyPreambles = new Set();
-  const context = readJSON(path.join(directory, 'genesis.json'));
+  let context = null;
+  const report = (upstream = {}, waived = []) => ({
+    change: name, valid: errors.length === 0, ready_for_eval_design: errors.length === 0 && blockers.length === 0,
+    errors, blockers, gaps, warnings, context, specs, openspec: upstream, openspec_advisory_issues: waived,
+  });
+  const error = (code, message, details = {}) => {
+    errors.push(message);
+    gaps.push({ code, kind: 'technical', owner: 'agent', route: 'agent-spec', message, ...details });
+  };
+  const business = (code, message, details = {}) => {
+    blockers.push(message);
+    gaps.push({ code, kind: 'business', owner: 'user', route: 'agent-spec', message, ...details });
+  };
+  if (!existsSync(localPath(repo, 'openspec/config.yaml')) || !existsSync(localPath(repo, 'openspec/genesis.json'))) {
+    error('project_missing', 'Initialize Genesis from the known project mode, or restore the missing project metadata without overwriting existing work.', { kind: 'artifact', route: 'init' });
+    return report();
+  }
+  try { requireProject(repo); } catch (cause) {
+    error('project_invalid', cause.message, { route: 'init' });
+    return report();
+  }
+  if (!existsSync(directory)) {
+    error('change_missing', 'Create the change and its Spec from the existing request and accepted requirements.', { kind: 'artifact' });
+    return report();
+  }
+  try { requireChange(repo, name); } catch (cause) {
+    error('change_invalid', `Restore the change metadata and preserve existing Spec content: ${cause.message}`);
+    return report();
+  }
+  try { context = readJSON(localPath(repo, `openspec/changes/${name}/genesis.json`)); } catch (cause) {
+    error('context_unavailable', `Restore the recorded code/Map context; do not invent snapshot identities: ${cause.message}`);
+    return report();
+  }
+  if (!record(context)) {
+    error('context_invalid', 'Change context must be an object. Restore its recorded values.');
+    return report();
+  }
   if (context.version !== 1 || !['new', 'existing'].includes(context.project_mode) || !record(context.map) || !record(context.baseline) || !record(context.code)) {
-    errors.push('Invalid change context in genesis.json.');
+    error('context_invalid', 'Invalid change context in genesis.json.');
   }
   if (context.baseline?.status !== 'not_run' || !['no_implementation', 'unknown'].includes(context.baseline?.availability)) {
-    errors.push('The spec stage can only record an unexecuted baseline with no_implementation or unknown availability.');
+    error('baseline_invalid', 'The spec stage can only record an unexecuted baseline with no_implementation or unknown availability.');
   }
-  if (!['available', 'missing', 'not_applicable'].includes(context.map?.status)) errors.push('Invalid Map status.');
+  if (!['available', 'missing', 'not_applicable'].includes(context.map?.status)) error('map_invalid', 'Invalid Map status.');
   if (context.map?.status === 'available') {
     try {
       const mapContent = readFileSync(path.resolve(repo, context.map.path), 'utf8');
-      if (digest(mapContent) !== context.map.sha256) errors.push('Referenced Map changed; create a new change with the updated Map.');
-    } catch { errors.push('Referenced Map is unavailable; restore its snapshot before export.'); }
+      if (digest(mapContent) !== context.map.sha256) error('map_changed', 'Referenced Map changed; restore the recorded snapshot or create a new change with the updated Map.');
+    } catch { error('map_unavailable', 'Referenced Map is unavailable; restore its snapshot before export.'); }
     warnings.push('Map freshness against the current code is not automatically verified.');
   } else if (context.project_mode === 'existing') {
     warnings.push('No Map supplied for an existing project; use repository facts and record coverage limits.');
   }
   const specRoot = localPath(repo, `openspec/changes/${name}/specs`);
-  for (const file of listFiles(specRoot).filter((file) => file.endsWith('.md'))) {
+  let files;
+  try { files = listFiles(specRoot).filter((file) => file.endsWith('.md')); } catch (cause) {
+    error('spec_unreadable', cause.message);
+    return report();
+  }
+  if (!files.length) {
+    error('spec_missing', 'No spec documents found. Author the Spec from the existing request; ask only about unresolved business decisions.', { kind: 'artifact' });
+    return report();
+  }
+  for (const file of files) {
     const relative = path.relative(directory, file);
-    const content = readFileSync(file, 'utf8');
-    const fail = (message) => errors.push(`${relative}: ${message}`);
+    const fail = (message) => error('spec_invalid', `${relative}: ${message}`, { path: relative });
+    let content;
+    try { content = readFileSync(file, 'utf8'); } catch (cause) { fail(cause.message); continue; }
     const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(content);
     if (!match) { fail('Missing Genesis YAML frontmatter.'); continue; }
     let metadata;
@@ -92,7 +139,9 @@ export function validateSpec(repo, name) {
     if (!Array.isArray(metadata.open_questions) || metadata.open_questions.some((q) => !nonempty(q))) {
       fail('open_questions must be an array of nonempty strings.');
     } else if (metadata.open_questions.length) {
-      blockers.push(...metadata.open_questions.map((q) => `${relative}: ${q}`));
+      for (const question of metadata.open_questions) {
+        business('business_question', `${relative}: ${question}`, { path: relative, question });
+      }
     }
     const body = content.slice(match[0].length);
     // OpenSpec warns that archive drops frontmatter. Genesis preserves it in the
@@ -125,15 +174,20 @@ export function validateSpec(repo, name) {
       if (provenance.state === 'confirmed' && (!nonempty(provenance.confirmation?.by) || !nonempty(provenance.confirmation?.ref))) {
         fail(`${id}: confirmed requires confirmation.by and confirmation.ref.`);
       }
-      if (provenance.state === 'proposed') blockers.push(`${id} is proposed, not an accepted requirement.`);
+      if (provenance.state === 'proposed') business('requirement_proposed', `${id} is proposed, not an accepted requirement.`, { path: relative, requirement_id: id });
     }
     for (const id of Object.keys(metadata.requirements ?? {})) {
       if (!seen.has(id)) fail(`Provenance ${id} has no requirement block.`);
     }
     specs.push({ path: relative, sha256: digest(content), revision: metadata.revision, content });
   }
-  if (!specs.length) errors.push('No spec documents found.');
-  const upstream = openspec(repo, ['validate', name, '--type', 'change', '--strict', '--json', '--no-interactive'], { allowFailure: true });
+  let upstream;
+  try {
+    upstream = openspec(repo, ['validate', name, '--type', 'change', '--strict', '--json', '--no-interactive'], { allowFailure: true });
+  } catch (cause) {
+    error('validator_unavailable', cause.message);
+    return report();
+  }
   const archiveWarning = 'Text above the first "## " section is not carried into the main spec by archive. Move it into a requirement, or into proposal.md or design.md.';
   const waived = [];
   const blockingIssues = [];
@@ -145,29 +199,46 @@ export function validateSpec(repo, name) {
     }
   }
   if (waived.length) warnings.push('Genesis preserves YAML provenance in exported handoffs. The OpenSpec archive-frontmatter warning is advisory here; automatic archive/sync is unsupported.');
-  if (!upstream.ok && (blockingIssues.length || !waived.length)) errors.push('OpenSpec strict validation failed; see openspec diagnostics.');
-  return {
-    change: name, valid: errors.length === 0, ready_for_eval_design: errors.length === 0 && blockers.length === 0,
-    errors, blockers, warnings, context, specs, openspec: upstream.data, openspec_advisory_issues: waived,
-  };
+  if (!upstream.ok && (blockingIssues.length || !waived.length)) error('spec_format_invalid', 'OpenSpec strict validation failed; see openspec diagnostics.');
+  return report(upstream.data, waived);
 }
 
-export function exportSpec(repo, name) {
-  const result = validateSpec(repo, name);
-  if (!result.ready_for_eval_design) {
-    throw new Error(`Spec is not ready for Eval design: ${[...result.errors, ...result.blockers].join('; ')}`);
-  }
+export function specHandoff(repo, name, result) {
   const payload = {
     format: 'genesis.spec-handoff', version: 1, change: name,
     context: result.context, specs: result.specs,
   };
   const id = digest(JSON.stringify(payload));
   const directory = localPath(repo, `openspec/changes/${name}/handoffs`);
-  const file = path.join(directory, `${id.slice(7)}.json`);
+  const file = localPath(repo, `openspec/changes/${name}/handoffs/${id.slice(7)}.json`);
   const handoff = { ...payload, id };
-  if (existsSync(file)) {
-    if (JSON.stringify(readJSON(file)) !== JSON.stringify(handoff)) throw new Error('Existing handoff has been modified.');
-  } else {
+  return { id, directory, file, handoff };
+}
+
+export function handoffStatus({ file, handoff }) {
+  if (!existsSync(file)) return 'missing';
+  try { return JSON.stringify(readJSON(file)) === JSON.stringify(handoff) ? 'valid' : 'invalid'; }
+  catch { return 'invalid'; }
+}
+
+export function exportSpec(repo, name) {
+  const result = validateSpec(repo, name);
+  if (!result.ready_for_eval_design) {
+    throw Object.assign(new Error(`Spec is not ready for Eval design: ${[...result.errors, ...result.blockers].join('; ')}`), {
+      code: 'SPEC_INPUT_BLOCKED', gaps: result.gaps,
+      resume: { stage: 'spec-export', change: name, command: ['spec', 'export', name, '--repo', repo] },
+    });
+  }
+  const { id, directory, file, handoff } = specHandoff(repo, name, result);
+  const status = handoffStatus({ file, handoff });
+  if (status === 'invalid') {
+    throw Object.assign(new Error('Existing handoff has been modified. Restore its original contents; do not overwrite it.'), {
+      code: 'HANDOFF_INVALID',
+      gaps: [{ code: 'handoff_invalid', kind: 'technical', owner: 'agent', route: 'spec-export', path: file, message: 'Restore the original frozen handoff before retrying.' }],
+      resume: { stage: 'spec-export', change: name, command: ['spec', 'export', name, '--repo', repo] },
+    });
+  }
+  if (status === 'missing') {
     mkdirSync(directory, { recursive: true });
     writeJSON(file, handoff);
   }
