@@ -58,17 +58,38 @@ change. Preserve IDs across revisions; do not reuse one for an unrelated behavio
 
 `state` is `explicit`, `confirmed` or `proposed`:
 
-- `explicit`: directly expressed in a user source or accepted spec. Do not use it
-  for new assumptions inferred from code, a Map or an ambiguous request.
+- `explicit`: the quoted words of a user source or accepted spec state this
+  requirement's trigger and outcome. Do not use it for new assumptions inferred
+  from code, a Map or an ambiguous request, or for a rule the words only imply:
+  the converse of a permission, who is refused, a limit, or a side effect that
+  must not happen.
 - `confirmed`: an interpretation or suggestion the user actually accepted. Add
   `confirmation: {by: "actual actor", ref: "actual confirmation reference"}`.
+  A confirmation covers what the user was shown and accepted, nothing added later.
 - `proposed`: not accepted; blocks export for Eval design. Keep unresolved business
   questions in `open_questions`, an array of strings. Do not put speculative
   scenarios inside an explicit requirement to bypass this distinction.
 
-The validator checks these fields, not the truth of a quotation, the identity of
-the actor or semantic faithfulness. The authoring agent and reviewers retain that
-responsibility. No interaction transcript is fabricated by the CLI.
+"Users can cancel their own orders" states that an owner can cancel. Refusing a
+different user's attempt is a reading of that sentence, however natural. Leave it
+out by default and mention it as not included. If the user asks for it, it is a
+separate requirement: `proposed` until they accept it.
+
+Scenarios share the state of their requirement. Under an `explicit` or `confirmed`
+requirement, each GIVEN/WHEN/THEN line restates in observable terms what the
+quote or confirmation covers; a concrete example value is fine, a new outcome is
+not. If the user confirmed "shipped orders cannot be cancelled", a scenario line
+"a repeated cancel issues no second refund" adds a rule nobody accepted. Remove
+it; it needs its own requirement if the user wants it.
+
+The validator checks these fields and one consequence of them: a quote cannot
+back more `explicit` requirements than it has sentence-level statements
+(`explicit_exceeds_quote`). When one message states several rules, give each
+requirement its own source quoting its own words. The validator does not check
+the truth of a quotation, the identity of the actor or semantic faithfulness.
+The authoring agent and reviewers retain that responsibility; `spec export`
+returns a `review` list of every requirement beside its quote and outcomes to
+make that reading quick. No interaction transcript is fabricated by the CLI.
 
 ## Updates and limits
 

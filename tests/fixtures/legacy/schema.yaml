@@ -1,0 +1,30 @@
+name: genesis-spec
+version: 1
+description: Business requirements for Genesis EDD; one spec stage, no implementation orchestration.
+artifacts:
+  - id: specs
+    generates: "specs/**/*.md"
+    description: Observable business requirements with sources and acceptance scenarios.
+    template: spec.md
+    instruction: |
+      Use the genesis-spec skill and its spec-format reference. Read the user's
+      request, accepted requirements and relevant business map if available.
+      Write one small spec per cohesive capability. Each requirement has a stable
+      REQ- identifier, source and explicit/confirmed/proposed status in frontmatter.
+      Use ADDED or MODIFIED Requirements and WHEN/THEN scenarios. For MODIFIED,
+      preserve the full existing requirement block, stable name and all scenarios
+      except changes the user requested. Keep requirements in the user's language;
+      OpenSpec structural headings and SHALL/MUST remain in English.
+      Ask only when alternative interpretations change acceptance. User statements
+      can directly authorize explicit requirements; do not ask for ritual approval.
+      Existing code is evidence of current behavior, never automatic authorization.
+      Leave unsupported assumptions proposed. Do not generate design or task files.
+      The Genesis CLI validates provenance structure and exports a frozen handoff.
+      OpenSpec artifact completion alone does not make a spec ready for evaluation.
+    requires: []
+apply:
+  requires: [specs]
+  instruction: |
+    Genesis owns the EDD handoff. Validate and export the spec using genesis-edd.
+    Evaluation generation and the implementation loop are separate modules and
+    are not implemented in v0.1. This schema does not authorize implementation.

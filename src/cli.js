@@ -16,7 +16,9 @@ genesis-edd workflow check STAGE NAME --repo PATH
 All commands return JSON. init defaults to --agent both. Spec content is authored
 by your coding agent using the installed agent-spec skill, not by a CLI model.
 validate exits 1 for malformed specs; valid drafts report ready_for_eval_design=false.
-export requires a valid spec with no proposed requirements or open questions.
+It rejects more explicit requirements than their quoted source states.
+export requires a valid spec with no proposed requirements or open questions and
+returns a review of each requirement beside the words and outcomes it rests on.
 workflow check is read-only and returns gaps, repair routes and a resume command.
 Stages: spec-export, write-eval, run-eval, loop-and-implement. Only spec-export
 executes in this release. write-eval checks its frozen Spec input; later stages

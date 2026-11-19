@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -78,6 +78,66 @@ test('agent assumptions cannot be relabeled as explicit user requirements', (t) 
   const result = validateSpec(repo, 'report-notifications');
   assert.equal(result.valid, false);
   assert.match(result.errors.join('\n'), /agent suggestion/);
+});
+
+const second = '  REQ-submit-success:\n    source: request\n    state: explicit';
+const twoExplicit = `${fixture.replace('    state: explicit', `    state: explicit\n${second}`)}
+### Requirement: REQ-submit-success 提交成功时发送成功通知
+
+系统 MUST 在报告提交成功时发送成功通知。
+
+#### Scenario: 提交成功
+
+- **GIVEN** 报告内容完整
+- **AND** 提交服务可用
+- **WHEN** 报告提交返回成功
+- **THEN** 本次提交发送的成功通知数量为一
+- **AND** 不发送失败通知
+`;
+
+test('a quote cannot back more explicit requirements than it states', (t) => {
+  const { repo, file } = authored(t, twoExplicit);
+  const derived = validateSpec(repo, 'report-notifications');
+  assert.equal(derived.valid, false);
+  const gap = derived.gaps.find((item) => item.code === 'explicit_exceeds_quote');
+  assert.deepEqual(gap.requirement_ids, ['REQ-submit-failure', 'REQ-submit-success']);
+  assert.equal(gap.owner, 'agent');
+  assert.throws(() => exportSpec(repo, 'report-notifications'), /resting on one quote/);
+
+  // Repeating the same words under another source ID does not add a statement.
+  writeFileSync(file, twoExplicit
+    .replace('requirements:', '  again:\n    kind: user\n    ref: "example:report-notifications/request"\n    quote: "报告提交失败时，不要发送成功通知。"\nrequirements:')
+    .replace(second, second.replace('source: request', 'source: again')));
+  assert.equal(validateSpec(repo, 'report-notifications').valid, false);
+
+  // A derived rule is a valid draft once it is labelled as a proposal.
+  writeFileSync(file, twoExplicit.replace(second, second.replace('explicit', 'proposed')));
+  const draft = validateSpec(repo, 'report-notifications');
+  assert.equal(draft.valid, true, JSON.stringify(draft.errors));
+  assert.equal(draft.ready_for_eval_design, false);
+
+  // Two requirements are explicit when the quoted words state both.
+  writeFileSync(file, twoExplicit.replace('不要发送成功通知。"', '不要发送成功通知。提交成功时发送成功通知。"'));
+  assert.equal(validateSpec(repo, 'report-notifications').ready_for_eval_design, true);
+});
+
+test('export lists each requirement beside the words and outcomes it rests on', (t) => {
+  const { repo } = authored(t, twoExplicit.replace('不要发送成功通知。"', '不要发送成功通知。提交成功时发送成功通知。"')
+    .replace(second, `${second.replace('explicit', 'confirmed')}\n    confirmation:\n      by: Example user\n      ref: example:approval-message`));
+  const quote = '报告提交失败时，不要发送成功通知。提交成功时发送成功通知。';
+  assert.deepEqual(exportSpec(repo, 'report-notifications').review, [
+    {
+      requirement: 'REQ-submit-failure', name: '提交失败时不发送成功通知', path: 'specs/notifications/spec.md', state: 'explicit',
+      basis: { source: 'request', kind: 'user', quote },
+      statement: '系统 MUST 在报告提交失败时不发送成功通知。', outcomes: ['本次提交发送的成功通知数量为零'],
+    },
+    {
+      requirement: 'REQ-submit-success', name: '提交成功时发送成功通知', path: 'specs/notifications/spec.md', state: 'confirmed',
+      basis: { source: 'request', kind: 'user', quote },
+      confirmation: { by: 'Example user', ref: 'example:approval-message' },
+      statement: '系统 MUST 在报告提交成功时发送成功通知。', outcomes: ['本次提交发送的成功通知数量为一', '不发送失败通知'],
+    },
+  ]);
 });
 
 test('confirmed interpretations need an actor and actual confirmation reference', (t) => {
@@ -197,18 +257,20 @@ test('agent-spec installs for both agents and runs the pinned CLI', (t) => {
   assert.deepEqual(initProject(repo, 'new', 'both').created, []);
 });
 
+// The exact files shipped before the skill was renamed. They are fixtures, not
+// derived from the current skill, so editing the skill text cannot change them.
+const legacyFixture = path.join(ROOT, 'tests/fixtures/legacy');
 function legacyInstallation(t) {
   const repo = project(t, 'new', 'both');
   for (const directory of ['.agents', '.claude']) {
+    const current = path.join(repo, directory, 'skills/agent-spec');
     const legacy = path.join(repo, directory, 'skills/genesis-spec');
-    renameSync(path.join(repo, directory, 'skills/agent-spec'), legacy);
-    const skill = path.join(legacy, 'SKILL.md');
-    writeFileSync(skill, readFileSync(skill, 'utf8').replace('name: agent-spec', 'name: genesis-spec').replace('# Agent Spec', '# Genesis Spec'));
-    const metadata = path.join(legacy, 'agents/openai.yaml');
-    writeFileSync(metadata, readFileSync(metadata, 'utf8').replace('Agent Spec', 'Genesis Spec').replace('$agent-spec', '$genesis-spec'));
+    cpSync(path.join(legacyFixture, 'skill'), legacy, { recursive: true });
+    renameSync(path.join(current, 'scripts/runtime.json'), path.join(legacy, 'scripts/runtime.json'));
+    rmSync(current, { recursive: true });
   }
   const schema = path.join(repo, 'openspec/schemas/genesis-spec/schema.yaml');
-  writeFileSync(schema, readFileSync(schema, 'utf8').replace('Use the agent-spec skill', 'Use the genesis-spec skill'));
+  writeFileSync(schema, readFileSync(path.join(legacyFixture, 'schema.yaml'), 'utf8'));
   return { repo, schema };
 }
 
@@ -257,6 +319,23 @@ test('legacy migration preserves custom files and preflights all destinations', 
     assert.equal(existsSync(path.join(repo, '.claude/skills/genesis-spec/SKILL.md')), true);
     if (target !== 'schema') assert.equal(readFileSync(schema, 'utf8'), oldSchema);
   }
+});
+
+test('init updates an untouched earlier agent-spec and leaves an edited one alone', (t) => {
+  const repo = project(t, 'new', 'claude');
+  const skill = path.join(repo, '.claude/skills/agent-spec');
+  // The release before the skill text changed: the legacy files under the new name.
+  const previous = readFileSync(path.join(legacyFixture, 'skill/SKILL.md'), 'utf8')
+    .replace('name: genesis-spec', 'name: agent-spec').replace('# Genesis Spec', '# Agent Spec');
+  writeFileSync(path.join(skill, 'SKILL.md'), previous);
+  writeFileSync(path.join(skill, 'references/spec-format.md'), readFileSync(path.join(legacyFixture, 'skill/references/spec-format.md'), 'utf8'));
+  const result = initProject(repo, 'new', 'claude');
+  assert.deepEqual([...result.updated].sort(), ['.claude/skills/agent-spec/SKILL.md', '.claude/skills/agent-spec/references/spec-format.md']);
+  assert.equal(readFileSync(path.join(skill, 'SKILL.md'), 'utf8'), readFileSync(path.join(ROOT, 'skills/agent-spec/SKILL.md'), 'utf8'));
+  assert.deepEqual(initProject(repo, 'new', 'claude').updated, []);
+  writeFileSync(path.join(skill, 'SKILL.md'), `${previous}\nTeam note\n`);
+  assert.throws(() => initProject(repo, 'new', 'claude'), /differs; left unchanged/);
+  assert.match(readFileSync(path.join(skill, 'SKILL.md'), 'utf8'), /Team note/);
 });
 
 test('bad names and symlink destinations cannot escape the selected project', (t) => {
