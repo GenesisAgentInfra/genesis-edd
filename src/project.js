@@ -20,8 +20,14 @@ const LEGACY_SKILL_HASHES = {
 // copy and still refuses to replace an edited one. Add the outgoing hash here
 // whenever a shipped skill file changes.
 const PREVIOUS_SKILL_HASHES = {
-  'SKILL.md': ['sha256:125c0caf12be5e2e0dac8bb9758105173260d842e9cfe144f3b4d38a1ebc7871'],
-  'references/spec-format.md': ['sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1'],
+  'SKILL.md': [
+    'sha256:125c0caf12be5e2e0dac8bb9758105173260d842e9cfe144f3b4d38a1ebc7871',
+    'sha256:3cf1a64417fefb329d1a099070c461172a6ae2d7d495fa1a1f1cfdb6aaad9fb5',
+  ],
+  'references/spec-format.md': [
+    'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
+    'sha256:99a3389ea7a87d2c61077a5f81252d39f594d6e86d5ad21f939c779020b56619',
+  ],
 };
 export const digest = (value) => `sha256:${createHash('sha256').update(value).digest('hex')}`;
 export const readJSON = (file) => JSON.parse(readFileSync(file, 'utf8'));

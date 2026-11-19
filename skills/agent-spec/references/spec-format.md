@@ -117,8 +117,40 @@ snapshot/digest or an explicit absence, and baseline `not_run`. It is technical
 context, not a source of business requirements. A provided Map may be partial or
 stale; source identity alone does not prove coverage or freshness.
 
+## Impact
+
+In an existing project, `impact.md` beside `genesis.json` records which entries
+the request touches. YAML frontmatter carries the checked part; any text below
+it is for the reader.
+
+```markdown
+---
+genesis_impact: 1
+entries:
+  - flow: flow_0123456789ab
+    entry: POST /reports
+    effect: changes
+    evidence: app/reports.py:42
+    note: Stop the success notification when submission fails
+---
+```
+
+`entry` names the route, command or tool. `effect` is `changes` for behavior the
+request alters and `may_affect` for neighbours worth a regression check.
+`evidence` is a project file, optionally with a line, that you read. `flow` is
+optional: use the flow ID from the recorded Map and omit it when the Map does
+not cover the entry. The validator rejects a flow ID that is not in the recorded
+Map and evidence that is not a file, or a line, in the project. It cannot check
+that the list is complete. A missing `impact.md` in an existing project is a
+warning, not a blocker.
+
+## Handoff
+
 `spec export` writes a content-addressed JSON handoff under the change's `handoffs/`
 directory. It includes the exact Markdown, revisions and context, so edits cannot
-silently change an earlier exported expectation. Later stages must verify its
-digest and reference that ID. Export readiness means enough accepted business
+silently change an earlier exported expectation. It also carries `requirements`,
+each with its ID, state, source, statement and scenarios split into `given`,
+`when` and `then`, and the checked `impact`. Later stages read those fields and
+verify the digest; they do not parse the Markdown, so its layout can change
+without breaking them. Export readiness means enough accepted business
 information to design Eval; it does not mean an executable task package exists.
