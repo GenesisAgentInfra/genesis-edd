@@ -16,21 +16,26 @@ const LEGACY_SKILL_HASHES = {
   'scripts/run.mjs': 'sha256:881a4b48652d858fa99c6cccacd9549910b64631152884beef6bb88a70fc1e9a',
   'scripts/.gitignore': 'sha256:141fc8419b0378e8ff6d3161f01cb89a1165dc7b7230df4448f63bb3797d2735',
 };
-export const SKILLS = ['agent-spec', 'write-eval', 'run-eval'];
+export const SKILLS = ['agent-spec', 'write-eval', 'run-eval', 'loop-and-implement'];
 // Earlier shipped versions of skill and schema files. init updates an untouched
 // copy and still refuses to replace an edited one. Add the outgoing hash here
 // whenever a shipped file changes.
-const PREVIOUS_SCHEMA_HASHES = [LEGACY_SCHEMA_HASH, 'sha256:196585c6747f342958a2ebf70b2e29b312664302c0d79e6b15f658b549a2371b'];
+const PREVIOUS_SCHEMA_HASHES = [LEGACY_SCHEMA_HASH, 'sha256:196585c6747f342958a2ebf70b2e29b312664302c0d79e6b15f658b549a2371b',
+  'sha256:2ca194edb19cc4fc87b9d6ef6c58b31f9b75ce49bdde17b970697182d70f89fc'];
 const PREVIOUS_SKILL_HASHES = {
   'agent-spec/SKILL.md': [
     'sha256:125c0caf12be5e2e0dac8bb9758105173260d842e9cfe144f3b4d38a1ebc7871',
     'sha256:3cf1a64417fefb329d1a099070c461172a6ae2d7d495fa1a1f1cfdb6aaad9fb5',
     'sha256:f75b8f0f8992fdeb62442b8b3c0cbac772c783a4069d9072a43722e0b307c2a5',
     'sha256:33663ac9eb83b705a9cfd2fcc11fe78805082404804fed590f163d91e1f0ba09',
+    'sha256:9d037e3bc2c705df8abf1ecc8a64d9bd56397b9aeca081ffe34f1017932d5993',
   ],
   'agent-spec/scripts/run.mjs': ['sha256:881a4b48652d858fa99c6cccacd9549910b64631152884beef6bb88a70fc1e9a'],
   'write-eval/SKILL.md': ['sha256:390f4c0a47e84b7d73a6317dbf9ed054d1879944fcfa38bd94016fd171bf889d'],
-  'run-eval/SKILL.md': ['sha256:ffb9e10f3f25bffc007ed9381df23cb3d1e31b64dc8088352302158215f75ba7'],
+  'run-eval/SKILL.md': [
+    'sha256:ffb9e10f3f25bffc007ed9381df23cb3d1e31b64dc8088352302158215f75ba7',
+    'sha256:0f46f119fcc49a84dff2fd55274aee5ae5c80c9b4c7c99b5d3bc4999d01bded8',
+  ],
   'agent-spec/references/spec-format.md': [
     'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
     'sha256:99a3389ea7a87d2c61077a5f81252d39f594d6e86d5ad21f939c779020b56619',

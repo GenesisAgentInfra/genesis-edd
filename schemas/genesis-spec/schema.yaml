@@ -26,6 +26,6 @@ apply:
   requires: [specs]
   instruction: |
     Genesis owns the EDD handoff. Validate and export the spec using genesis-edd.
-    Eval packages and runs belong to the write-eval and run-eval skills. The
-    implementation loop is not implemented in v0.1. This schema does not
+    Eval packages and runs belong to the write-eval and run-eval skills, and
+    implementation against them to loop-and-implement. This schema does not
     authorize implementation.

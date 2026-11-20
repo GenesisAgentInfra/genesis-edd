@@ -2,18 +2,17 @@ import { changeDirectory } from './project.js';
 import { frozenSpec } from './spec.js';
 import { validateEval } from './eval.js';
 import { recordedBaseline, runTools } from './run.js';
+import { hasLoop, loopInputs } from './loop.js';
 
 const stages = ['spec-export', 'write-eval', 'run-eval', 'loop-and-implement'];
-const implemented = ['spec-export', 'write-eval', 'run-eval'];
 
 // Checks are read-only. The calling agent resolves gaps and retries this same
 // request; readiness is always derived from artifacts, never a saved status flag.
 export function checkWorkflow(repo, stage, name) {
   if (!stages.includes(stage)) throw new Error(`Unknown stage: ${stage}. Expected ${stages.join(', ')}.`);
   changeDirectory(repo, name);
-  const available = implemented.includes(stage);
   const gaps = [];
-  let inputsReady = null;
+  let inputsReady;
   let validation;
   let handoff;
   let evals;
@@ -33,12 +32,14 @@ export function checkWorkflow(repo, stage, name) {
     }
     if (!gaps.length) gaps.push(...runTools().gaps);
     inputsReady = gaps.length === 0;
+  } else if (stage === 'loop-and-implement') {
+    const inputs = loopInputs(repo, name);
+    evals = inputs.evals;
+    gaps.push(...inputs.gaps);
+    if (!gaps.length) gaps.push(...runTools().gaps);
+    inputsReady = gaps.length === 0;
   }
   const inputGap = gaps.find((gap) => gap.owner === 'agent') ?? gaps[0];
-  if (!available) {
-    gaps.push({ code: 'stage_unavailable', kind: 'capability', owner: 'framework', route: null,
-      message: `${stage} is planned and not implemented in v0.1. Missing implementation is not a user business question.` });
-  }
   const proceed = {
     'spec-export': { action: 'export_spec', command: ['spec', 'export', name, '--repo', repo] },
     'write-eval': { action: 'write_eval', command: ['eval', 'new', name, '--repo', repo] },
@@ -47,15 +48,17 @@ export function checkWorkflow(repo, stage, name) {
       ? { action: 'record_baseline', command: ['run', 'start', name, '--repo', repo, '--baseline'],
         note: 'Add --expect FILE with the expected baseline result of each check, or --unavailable no_implementation when nothing can run yet.' }
       : { action: 'run_eval', command: ['run', 'start', name, '--repo', repo] },
+    'loop-and-implement': evals?.spec && hasLoop(repo, name, evals.spec)
+      ? { action: 'loop_status', command: ['loop', 'status', name, '--repo', repo] }
+      : { action: 'start_loop', command: ['loop', 'start', name, '--repo', repo],
+        note: 'Agree the budget with the user first: --max-iterations and --max-minutes.' },
   }[stage];
   const next = inputGap
     ? { owner: inputGap.owner, route: inputGap.route, action: inputGap.owner === 'user' ? 'resolve_business_decisions' : 'repair_inputs' }
-    : available
-      ? { owner: 'agent', route: stage, ...proceed }
-      : { owner: 'framework', route: null, action: 'stage_unavailable' };
+    : { owner: 'agent', route: stage, ...proceed };
   return {
-    version: 1, stage, change: name, implemented: available, inputs_ready: inputsReady,
-    status: inputsReady === false ? 'blocked' : available ? 'ready' : 'unavailable',
+    version: 1, stage, change: name, inputs_ready: inputsReady,
+    status: inputsReady ? 'ready' : 'blocked',
     gaps, warnings: validation?.warnings ?? evals?.warnings ?? [], next,
     resume: { stage, change: name, command: ['workflow', 'check', stage, name, '--repo', repo] },
     ...(validation ? { validation: { valid: validation.valid, ready_for_eval_design: validation.ready_for_eval_design,

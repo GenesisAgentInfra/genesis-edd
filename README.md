@@ -21,8 +21,14 @@ Genesis service or extra model key is needed.
 3. **run-eval.** Run the packages on the code before your change and after it,
    and compare them check by check. A run that could not execute is reported as
    such, never as a failed check.
-4. **loop-and-implement.** Planned: implement and iterate on eval feedback.
+4. **loop-and-implement.** Change the code until the checks pass, within a
+   budget the user agrees to. The spec, the expected results and the baseline
+   stay fixed while the code changes. Every run gets a short report; the loop
+   stops when the checks pass, the budget runs out, the same checks keep
+   failing, or the user must decide. Acceptance is the user's.
 
+The loop needs the project in Git. It records the code of every run and never
+commits for you.
 The skills start from ordinary requests. Each stage checks its inputs first and
 sends the agent back to the stage that owns a gap. It works in a new project or
 an existing one, and uses a Genesis Map when you have one.
@@ -72,7 +78,7 @@ creates an `openspec/` folder there.
 ### Docker and Harbor
 
 Writing specs and packages works without them. Proving packages
-(`eval check`) and running them need:
+(`eval check`), running them and the implementation loop need:
 
 - Docker, running.
 - Harbor. Install it with `uv tool install harbor`, or run it without a global
@@ -133,7 +139,8 @@ Write evals for the report notifications spec.
 ```
 
 ```text
-Record the baseline, then run the evals again after my change.
+Record the baseline, then implement the change until the evals pass. Stop after
+five runs.
 ```
 
 Whether a skill starts on its own is up to your coding agent. To choose one
@@ -149,6 +156,8 @@ project install), or type `$` in Codex and pick the skill.
 | `.genesis/edd/<change>/evals/` | one Harbor task package per scenario | yes |
 | `.genesis/edd/<change>/checks/` | proofs that each package's checks work | no |
 | `.genesis/edd/<change>/runs/` | run records and before/after comparisons | no |
+| `.genesis/edd/<change>/reports/` | one report per run of the implementation loop | yes |
+| `.genesis/edd/<change>/accepted.json` | the user's acceptance of a passing run | yes |
 
 ## Skills
 
@@ -157,7 +166,7 @@ project install), or type `$` in Codex and pick the skill.
 | `agent-spec` | Clarify requirements, write acceptance scenarios, export a validated spec | Available |
 | `write-eval` | Turn an exported spec into eval packages and prove their checks | Available |
 | `run-eval` | Run eval packages and compare the baseline with later runs | Available |
-| `loop-and-implement` | Implement changes and iterate on eval feedback | Planned |
+| `loop-and-implement` | Implement the change and iterate on eval results until the checks pass | Available |
 
 ## Update
 

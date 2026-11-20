@@ -1,0 +1,4 @@
+interface:
+  display_name: "Loop and Implement"
+  short_description: "Change the code until the eval packages pass, with the target fixed"
+  default_prompt: "Use $loop-and-implement to implement the change and iterate on the eval results."

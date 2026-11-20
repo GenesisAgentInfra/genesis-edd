@@ -382,6 +382,6 @@ export function exportSpec(repo, name) {
     id, file, ready_for_eval_design: true, warnings: result.warnings,
     review: specReview(result.specs),
     impact: result.impact?.entries ?? null,
-    next: { stage: 'write-eval', command: ['eval', 'new', name, '--repo', repo] },
+    next: { stage: 'write-eval', command: ['workflow', 'check', 'write-eval', name, '--repo', repo] },
   };
 }

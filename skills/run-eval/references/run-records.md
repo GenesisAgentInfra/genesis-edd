@@ -29,7 +29,7 @@ replace an earlier run.
 | Baseline | `baseline_unavailable_reason` | `no_implementation`, `execution_blocked` or `incompatible_tasks` when there is no usable baseline. |
 | Baseline | `baseline_expectations` | Base runs: the expected result of each check and the reason, fixed before the code changed. |
 | Baseline | `baseline_mismatch` | Base runs: checks whose result differs from the expectation. |
-| Snapshot | `code_snapshot` | Commit, the changed files by path and a digest of the working tree. It identifies the code; it does not store it. A file such as `.dockerignore` counts, because it changes what the image holds. |
+| Snapshot | `code_snapshot` | The commit, the application files that differ from it with their digests, a digest of it all, and `patch`: `code.patch` in the run folder holds those differences. The commit plus the patch restore the exact code. A file such as `.dockerignore` counts, because it changes what the image holds; `.genesis/`, `openspec/` and the installed skills do not. |
 | Snapshot | `task_digest` | Digest of each package together with the project kit. Only identical ones are compared. |
 | Snapshot | `environment_ref` | Harbor version, agent, model, attempts and each case's dependencies with their mode. |
 | Snapshot | `map_ref` | The Map recorded with the Spec, or `null`. |

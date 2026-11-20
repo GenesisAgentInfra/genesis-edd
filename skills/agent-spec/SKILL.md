@@ -151,9 +151,8 @@ unchanged blockers in a loop. A ready check is a snapshot, not a reusable permit
 None of these commands intercept direct code edits.
 
 The export is the input of the `write-eval` skill, which turns it into eval
-packages; `run-eval` then runs them. Hand over to those skills when the user
-wants evals; do not write packages or run anything from here.
-`loop-and-implement` is planned. Say clearly that it is unavailable; never
-report a baseline, generated task package, executed test or implementation that
-did not happen. Continue other user-authorized work with available tools,
-without representing it as an implemented Genesis EDD command.
+packages; `run-eval` runs them and `loop-and-implement` changes the code until
+they pass. Hand over to those skills when the user wants evals or the
+implementation; do not write packages, run anything or change application code
+from here. Never report a baseline, generated task package, executed test or
+implementation that did not happen.

@@ -126,11 +126,24 @@ class ProjectAgent(BaseAgent):
   execution error, not a failing check. Do not raise for an exit status that is
   part of the program's normal behavior, such as "the request was rejected";
   say which statuses those are in `PROJECT.md`.
+- Tell normal from broken by the exit status, not by which stream a message is
+  on. Docker can deliver the program's stderr inside `stdout` and leave
+  `stderr` empty. If you must match a message, search both.
+- `eval check` replaces the adapter with each fixture, so it never runs the
+  adapter. The first real run of the adapter is the baseline: an execution
+  error there usually points at the adapter. Fix it, run `eval check` again,
+  and record the baseline again.
 - An adapter binds dependencies and passes input and output through. It never
   decides an answer or performs an action for the program.
 - Declare an MCP server under `[[environment.mcp_servers]]` in `task.toml`.
   Harbor registers it only for its built-in agents; an adapter reads that
   configuration itself.
+
+## Images
+
+Each trial builds the `main` image from the project as it is at that moment, so
+a code change reaches the next run without a rebuild flag. Docker reuses layers
+whose inputs did not change.
 
 ## Where Harbor comes from
 
