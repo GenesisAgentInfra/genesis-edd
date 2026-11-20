@@ -96,5 +96,5 @@ Read the case's `logs/` first, then classify before changing anything:
 - the package or its environment is wrong: return to `write-eval`, and keep the
   old result as unverified;
 - the application does not meet a confirmed requirement: that is the result.
-  Fixing application code belongs to the implementation loop, which this release
-  does not provide as a command.
+  Changing the code to meet it belongs to `loop-and-implement`, when the user
+  wants the implementation.

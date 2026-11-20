@@ -5,16 +5,16 @@ Do not commit them, local copies, or private Notion links to this public reposit
 Keep public documentation limited to installation, usage, supported behavior,
 contribution instructions and resources required by the shipped skills.
 
-This repository owns requirements and the planned evaluation-driven development
-loop. Genesis Map remains a separate static-analysis dependency. OpenSpec is a
+This repository owns requirements and the evaluation-driven development loop. Genesis Map remains a separate static-analysis dependency. OpenSpec is a
 pinned dependency; do not vendor or modify its source.
 
 Keep the user interaction short. Ask only about ambiguity that changes business
 acceptance. Existing code and maps describe facts, not requirements. Preserve the
 source and status of every requirement; agent suggestions are not user decisions.
 
-Spec authoring, eval packages and eval runs are implemented; the coding loop is
-planned. Do not present a planned command as working functionality. Harbor and
+Spec authoring, eval packages, eval runs and the implementation loop are
+implemented; prepare is planned. Do not present a planned command as working
+functionality. Harbor and
 Docker are separate tools that run-eval needs; do not vendor Harbor.
 Keep baseline unavailability and blocked execution distinct from a failing
 business check.

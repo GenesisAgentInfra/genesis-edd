@@ -9,7 +9,7 @@
   "bin": { "genesis-edd": "bin/genesis-edd.js" },
   "scripts": {
     "test": "node --test",
-    "check": "node --check bin/genesis-edd.js && node --check src/cli.js && node --check src/spec.js && node --check src/project.js && node --check src/workflow.js && node --check src/eval.js && node --check src/run.js"
+    "check": "node --check bin/genesis-edd.js && node --check src/cli.js && node --check src/spec.js && node --check src/project.js && node --check src/workflow.js && node --check src/eval.js && node --check src/run.js && node --check src/loop.js"
   },
   "dependencies": {
     "@fission-ai/openspec": "2.1.0",

@@ -3,6 +3,7 @@ import { initProject, projectRoot } from './project.js';
 import { exportSpec, newSpec, specInstructions, specStatus, validateSpec } from './spec.js';
 import { newEval, validateEval } from './eval.js';
 import { checkEval, startRun } from './run.js';
+import { acceptLoop, loopStatus, startLoop, writeReport } from './loop.js';
 import { checkWorkflow } from './workflow.js';
 
 const help = `Genesis EDD 0.1.0 — requirements and evals for evaluation-driven development
@@ -17,7 +18,12 @@ genesis-edd eval new NAME --repo PATH
 genesis-edd eval validate NAME --repo PATH
 genesis-edd eval check NAME --repo PATH [--case ID] [--timeout MINUTES] [--yes]
 genesis-edd run start NAME --repo PATH [--baseline [--unavailable REASON] [--expect FILE]]
-                           [--agent NAME|module:Class] [--model MODEL] [--timeout MINUTES] [--yes]
+                           [--case ID]... [--attempts N] [--agent NAME|module:Class]
+                           [--model MODEL] [--timeout MINUTES] [--yes]
+genesis-edd loop start NAME --repo PATH [--max-iterations N] [--max-minutes M] [--restart]
+genesis-edd loop status NAME --repo PATH
+genesis-edd loop report NAME --repo PATH [--run RUN_ID]
+genesis-edd loop accept NAME --repo PATH --run RUN_ID --by NAME --ref REF
 genesis-edd workflow check STAGE NAME --repo PATH
 
 All commands return JSON. init defaults to --agent both. Specs, eval packages and
@@ -44,13 +50,24 @@ before a change; --unavailable (no_implementation, execution_blocked or
 incompatible_tasks) records why no baseline could run instead of inventing one.
 Later runs are compared with that baseline check by check. run start exits 1
 when execution was blocked or failed; a failing business check is a result.
+--case runs only the named packages: a quick look that never passes.
+--attempts runs each package N times; a check fails if any attempt fails.
 --yes lets Harbor read host environment variables a task asks for.
+loop start fixes the Spec, the baseline, the starting commit, the packages and
+the budget (default 5 full runs, 60 minutes) for one implementation loop. It
+needs a Git repository; nothing has to be committed, because every run stores
+its code as the commit it started from plus code.patch. loop status is
+read-only: it follows every check through the loop's runs and names the next
+step: iterate, write the report, split changes after a regression, stop when
+stuck or out of budget, review, or ask the user to accept. loop report writes a
+run's report skeleton under .genesis/edd/NAME/reports/ and never overwrites
+one. loop accept records the user's acceptance of a passing run whose report
+is complete, for the code that ran.
 workflow check is read-only and returns gaps, repair routes and a resume command.
-Stages: spec-export, write-eval, run-eval, loop-and-implement. The last is
-planned and reports inputs_ready=null. Blocked or unavailable checks exit 1.
-No stage is executed by a check.
+Stages: spec-export, write-eval, run-eval, loop-and-implement. Blocked checks
+exit 1. No stage is executed by a check.
 
-Planned modules: prepare, loop-and-implement. Genesis Map is a separate tool.
+Planned module: prepare. Genesis Map is a separate tool.
 Harbor and Docker are separate tools that run-eval needs on this machine.
 `;
 
@@ -73,12 +90,13 @@ export function main(argv) {
       if (result.status !== 'ready') process.exitCode = 1;
       return result;
     }
-    throw new Error(command === 'prepare' || command === 'loop-and-implement'
-      ? `${command} is planned and not implemented in v0.1.`
-      : `Use workflow check ${command} NAME --repo PATH, then the ${command === 'write-eval' ? 'eval' : 'run'} commands.`);
+    throw new Error(command === 'prepare'
+      ? 'prepare is planned and not implemented in v0.1.'
+      : `Use workflow check ${command} NAME --repo PATH, then the ${{ 'write-eval': 'eval', 'run-eval': 'run', 'loop-and-implement': 'loop' }[command]} commands.`);
   }
   const init = command === 'init';
-  const actions = { spec: ['new', 'instructions', 'status', 'validate', 'export'], eval: ['new', 'validate', 'check'], run: ['start'] }[command];
+  const actions = { spec: ['new', 'instructions', 'status', 'validate', 'export'], eval: ['new', 'validate', 'check'], run: ['start'],
+    loop: ['start', 'status', 'report', 'accept'] }[command];
   if (!init && (!actions?.includes(action) || !name || name.startsWith('-'))) {
     throw new Error('Unknown command. Run genesis-edd --help.');
   }
@@ -91,7 +109,15 @@ export function main(argv) {
   }
   if (command === 'run') {
     Object.assign(options, { baseline: { type: 'boolean' }, unavailable: { type: 'string' }, expect: { type: 'string' },
+      case: { type: 'string', multiple: true }, attempts: { type: 'string' },
       agent: { type: 'string' }, model: { type: 'string' }, timeout: { type: 'string' }, yes: { type: 'boolean' } });
+  }
+  if (command === 'loop') {
+    Object.assign(options, {
+      start: { 'max-iterations': { type: 'string' }, 'max-minutes': { type: 'string' }, restart: { type: 'boolean' } },
+      status: {}, report: { run: { type: 'string' } },
+      accept: { run: { type: 'string' }, by: { type: 'string' }, ref: { type: 'string' } },
+    }[action]);
   }
   const { values } = parseArgs({ args: argv.slice(init ? 1 : 3), options, strict: true, allowPositionals: false });
   const repo = projectRoot(values.repo);
@@ -104,8 +130,16 @@ export function main(argv) {
     if (!(action === 'check' ? result.passed : result.valid)) process.exitCode = 1;
     return result;
   }
+  if (command === 'loop') {
+    const number = (value) => (value === undefined ? undefined : Number(value));
+    if (action === 'start') return startLoop(repo, name, { iterations: number(values['max-iterations']), minutes: number(values['max-minutes']), restart: values.restart });
+    if (action === 'report') return writeReport(repo, name, values);
+    if (action === 'accept') return acceptLoop(repo, name, values);
+    return loopStatus(repo, name);
+  }
   if (command === 'run') {
-    const result = startRun(repo, name, { ...values, timeout });
+    const attempts = values.attempts === undefined ? undefined : Number(values.attempts);
+    const result = startRun(repo, name, { ...values, timeout, attempts });
     if (!['completed', 'not_run'].includes(result.execution_status)) process.exitCode = 1;
     return result;
   }
