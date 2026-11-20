@@ -17,8 +17,10 @@ All commands return JSON. init defaults to --agent both. Spec content is authore
 by your coding agent using the installed agent-spec skill, not by a CLI model.
 validate exits 1 for malformed specs; valid drafts report ready_for_eval_design=false.
 It rejects more explicit requirements than their quoted source states.
+It checks impact.md, when present, against the recorded Map and the project files.
 export requires a valid spec with no proposed requirements or open questions and
 returns a review of each requirement beside the words and outcomes it rests on.
+The handoff carries structured requirements and impact for later stages.
 workflow check is read-only and returns gaps, repair routes and a resume command.
 Stages: spec-export, write-eval, run-eval, loop-and-implement. Only spec-export
 executes in this release. write-eval checks its frozen Spec input; later stages

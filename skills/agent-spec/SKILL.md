@@ -63,8 +63,10 @@ those words state. A rule you derive from them (the converse of a permission, wh
 is refused, a limit, a side effect that must not happen) is model-added even when
 it seems obvious. By default leave it out and do not ask about it: list it in
 your final account as a numbered rule that is not included, worded so the user
-can add it by replying with its number. Ask only when the stated requirement
-cannot be judged without it. When you tell the user what was recorded, separate
+can add it by replying with its number. Each item is one concrete rule, never a
+question; when two rules compete, list the one you recommend. Ask only when the
+stated requirement cannot be judged without it. When you tell the user what
+was recorded, separate
 their own words from your reading of them. Keep model-added constraints
 `proposed` until explicitly accepted. Record decisions and unresolved business
 questions in the existing Spec's provenance and `open_questions`, without a
@@ -93,22 +95,31 @@ then proceed to writing and validation without a routine final approval round.
 2. Write stable requirement IDs, provenance, and concrete WHEN/THEN scenarios.
    Read existing spec blocks fully before changing them. Preserve unrelated
    scenarios and stable headings. Increment a file's revision when its meaning
-   changes. For a new iteration after a frozen handoff, prefer a new change and
-   reference the accepted earlier spec; never silently replace the old expectation.
+   changes. When the user adds or corrects rules for the request you just
+   exported, edit the same change, increment the revision and export again: the
+   earlier handoff stays as history and one feature keeps one spec. For a later,
+   separate iteration, prefer a new change and reference the accepted earlier
+   spec; never silently replace the old expectation.
    Before validating, compare every `explicit` and `confirmed` block with its
    quote or confirmation. Remove a requirement sentence or scenario line that the
    source does not cover, and list it as not included in your final account.
-3. Run `edd workflow check spec-export <change> --repo <app>`. It is read-only and
+3. In an existing project, record what the request touches in `impact.md` beside
+   the change's `genesis.json`, following the reference. List the entries it
+   changes or may affect, with the Map flow ID when a Map is recorded and a
+   `path:line` you actually read as evidence. It describes expected impact, not
+   current behavior. Skip it in a new project.
+4. Run `edd workflow check spec-export <change> --repo <app>`. It is read-only and
    exits nonzero while blocked; read its JSON `gaps`, `next` and `resume` rather
    than treating every failure as a question for the user. Follow the recovery
    rules below. `spec validate` also returns classified gaps and full diagnostics.
-4. When ready, run `edd spec export <change> --repo <app>`. Report a short account
+5. When ready, run `edd spec export <change> --repo <app>`. Report a short account
    of the agreed behavior, relevant delta, remaining limits and the handoff path.
    Do not add a routine approval gate. Export records the supplied provenance; it
    is not independent proof of consent and does not mean an Eval has run.
    Include the returned `review` in that account: each requirement with its
-   state, the words it rests on and its outcomes. It lets the user spot a rule
-   attributed to them by mistake; it is not a request for approval.
+   state, the words it rests on and its outcomes, then the returned `impact`.
+   It lets the user spot a rule attributed to them by mistake; it is not a
+   request for approval.
 
 ## Recover missing inputs
 

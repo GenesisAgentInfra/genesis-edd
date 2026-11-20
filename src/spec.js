@@ -49,39 +49,86 @@ const record = (value) => value !== null && typeof value === 'object' && !Array.
 const statementCount = (quote) => Math.max(1,
   quote.split(/[。！？；!?;\n]+|\.(?=\s|$)/).filter((part) => part.trim()).length);
 
-// Each requirement beside the words it rests on, for the user to read. The CLI
-// cannot judge whether a quote really states a requirement; a person can.
-export function specReview(specs) {
-  const review = [];
+// The structured form of every requirement. Later stages read this from the
+// handoff, so they never depend on how the Markdown is laid out.
+export function specRequirements(specs) {
+  const requirements = [];
   for (const { path: file, content } of specs) {
     const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(content);
     const metadata = parse(match[1]);
     for (const block of content.slice(match[0].length).split(/^### Requirement:\s*/m).slice(1)) {
       const [heading, ...rest] = block.split(/\r?\n/);
       const [, id, name] = /^(REQ-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)\s+(.+)$/.exec(heading.trim());
-      const [intro, ...scenarios] = rest.join('\n').split(/^## /m)[0].split(/^#### Scenario:.*$/m);
-      const outcomes = [];
-      for (const scenario of scenarios) {
+      const [intro, ...parts] = rest.join('\n').split(/^## /m)[0].split(/^#### Scenario:\s*(.*)$/m);
+      const scenarios = [];
+      for (let index = 0; index < parts.length; index += 2) {
+        const scenario = { name: parts[index].trim(), given: [], when: [], then: [] };
         let step;
-        for (const line of scenario.split('\n')) {
+        for (const line of parts[index + 1].split('\n')) {
           const clause = /^\s*-\s*\*\*(GIVEN|WHEN|THEN|AND)\*\*\s*(.+)$/.exec(line);
           if (!clause) continue;
-          if (clause[1] !== 'AND') step = clause[1];
-          if (step === 'THEN') outcomes.push(clause[2].trim());
+          if (clause[1] !== 'AND') step = clause[1].toLowerCase();
+          if (step) scenario[step].push(clause[2].trim());
         }
+        scenarios.push(scenario);
       }
       const provenance = metadata.requirements[id];
       const source = metadata.sources[provenance.source];
-      review.push({
-        requirement: id, name: name.trim(), path: file, state: provenance.state,
-        basis: { source: provenance.source, kind: source.kind, quote: source.quote },
+      requirements.push({
+        id, name: name.trim(), path: file, state: provenance.state,
+        basis: { source: provenance.source, kind: source.kind, ref: source.ref, quote: source.quote },
         ...(provenance.confirmation ? { confirmation: provenance.confirmation } : {}),
         statement: intro.split('\n').map((line) => line.trim()).filter(Boolean).join(' '),
-        outcomes,
+        scenarios,
       });
     }
   }
-  return review;
+  return requirements;
+}
+
+// Each requirement beside the words it rests on, for the user to read. The CLI
+// cannot judge whether a quote really states a requirement; a person can.
+export const specReview = (specs) => specRequirements(specs).map(({ id, basis, scenarios, ...rest }) => ({
+  requirement: id, ...rest, basis: { source: basis.source, kind: basis.kind, quote: basis.quote },
+  outcomes: scenarios.flatMap((scenario) => scenario.then),
+}));
+
+// Which entries and flows a request touches, written by the agent for an
+// existing project. Flow IDs and evidence are checked against the Map and repo.
+function readImpact(repo, file, mapFlows, fail) {
+  const content = readFileSync(file, 'utf8');
+  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content);
+  let metadata;
+  try { metadata = match && parse(match[1]); } catch (cause) { fail(`Invalid YAML: ${cause.message}`); return null; }
+  if (!record(metadata) || metadata.genesis_impact !== 1 || !Array.isArray(metadata.entries) || !metadata.entries.length) {
+    fail('Needs YAML frontmatter with genesis_impact: 1 and a non-empty entries list.');
+    return null;
+  }
+  const entries = [];
+  metadata.entries.forEach((item, index) => {
+    const label = `entries[${index}]`;
+    if (!record(item) || !nonempty(item.entry) || !['changes', 'may_affect'].includes(item.effect) || !nonempty(item.evidence)) {
+      fail(`${label} needs entry, effect (changes or may_affect) and evidence (path or path:line).`);
+      return;
+    }
+    const [, target, line] = /^(.*?)(?::(\d+))?$/.exec(item.evidence.trim());
+    const source = path.resolve(repo, target);
+    let lines = null;
+    try {
+      if (!source.startsWith(`${repo}${path.sep}`)) throw new Error('outside the project');
+      lines = readFileSync(source, 'utf8').split('\n').length;
+    } catch { fail(`${label} evidence does not point to a file in the project: ${item.evidence}`); }
+    if (lines !== null && line && (Number(line) < 1 || Number(line) > lines)) fail(`${label} evidence line is outside the file: ${item.evidence}`);
+    if (item.flow !== undefined && !nonempty(item.flow)) fail(`${label} flow must be a Map flow ID when given.`);
+    else if (nonempty(item.flow) && mapFlows && !mapFlows.has(item.flow)) fail(`${label} flow is not in the recorded Map: ${item.flow}`);
+    const flowName = nonempty(item.flow) ? mapFlows?.get(item.flow) : undefined;
+    entries.push({
+      ...(nonempty(item.flow) ? { flow: item.flow, ...(nonempty(flowName) ? { flow_name: flowName } : {}) } : {}),
+      entry: item.entry.trim(), effect: item.effect, evidence: item.evidence.trim(),
+      ...(nonempty(item.note) ? { note: item.note.trim() } : {}),
+    });
+  });
+  return { path: 'impact.md', sha256: digest(content), entries };
 }
 
 export function validateSpec(repo, name) {
@@ -94,9 +141,11 @@ export function validateSpec(repo, name) {
   const ids = new Set();
   const frontmatterOnlyPreambles = new Set();
   let context = null;
+  let mapFlows = null;
+  let impact = null;
   const report = (upstream = {}, waived = []) => ({
     change: name, valid: errors.length === 0, ready_for_eval_design: errors.length === 0 && blockers.length === 0,
-    errors, blockers, gaps, warnings, context, specs, openspec: upstream, openspec_advisory_issues: waived,
+    errors, blockers, gaps, warnings, context, specs, impact, openspec: upstream, openspec_advisory_issues: waived,
   });
   const error = (code, message, details = {}) => {
     errors.push(message);
@@ -141,6 +190,10 @@ export function validateSpec(repo, name) {
     try {
       const mapContent = readFileSync(path.resolve(repo, context.map.path), 'utf8');
       if (digest(mapContent) !== context.map.sha256) error('map_changed', 'Referenced Map changed; restore the recorded snapshot or create a new change with the updated Map.');
+      else {
+        const flows = JSON.parse(mapContent).flows;
+        mapFlows = new Map((Array.isArray(flows) ? flows : []).map((flow) => [flow.flow_id, flow.name]));
+      }
     } catch { error('map_unavailable', 'Referenced Map is unavailable; restore its snapshot before export.'); }
     warnings.push('Map freshness against the current code is not automatically verified.');
   } else if (context.project_mode === 'existing') {
@@ -237,6 +290,12 @@ export function validateSpec(repo, name) {
     }
     specs.push({ path: relative, sha256: digest(content), revision: metadata.revision, content });
   }
+  const impactFile = localPath(repo, `openspec/changes/${name}/impact.md`);
+  if (existsSync(impactFile)) {
+    impact = readImpact(repo, impactFile, mapFlows, (message) => error('impact_invalid', `impact.md: ${message}`, { path: 'impact.md' }));
+  } else if (context.project_mode === 'existing') {
+    warnings.push('No impact.md for an existing project: the entries and flows this request touches are not recorded.');
+  }
   let upstream;
   try {
     upstream = openspec(repo, ['validate', name, '--type', 'change', '--strict', '--json', '--no-interactive'], { allowFailure: true });
@@ -261,8 +320,9 @@ export function validateSpec(repo, name) {
 
 export function specHandoff(repo, name, result) {
   const payload = {
-    format: 'genesis.spec-handoff', version: 1, change: name,
+    format: 'genesis.spec-handoff', version: 2, change: name,
     context: result.context, specs: result.specs,
+    requirements: specRequirements(result.specs), impact: result.impact,
   };
   const id = digest(JSON.stringify(payload));
   const directory = localPath(repo, `openspec/changes/${name}/handoffs`);
@@ -301,6 +361,7 @@ export function exportSpec(repo, name) {
   return {
     id, file, ready_for_eval_design: true, warnings: result.warnings,
     review: specReview(result.specs),
+    impact: result.impact?.entries ?? null,
     next: 'write-eval (planned): derive cases and execution bindings from this frozen spec handoff.',
   };
 }

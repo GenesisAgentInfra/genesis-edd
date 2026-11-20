@@ -140,6 +140,67 @@ test('export lists each requirement beside the words and outcomes it rests on', 
   ]);
 });
 
+test('handoffs carry structured requirements so later stages need not parse Markdown', (t) => {
+  const { repo } = authored(t, twoExplicit.replace('不要发送成功通知。"', '不要发送成功通知。提交成功时发送成功通知。"'));
+  assert.doesNotMatch(validateSpec(repo, 'report-notifications').warnings.join('\n'), /impact/);
+  const handoff = readJSON(exportSpec(repo, 'report-notifications').file);
+  assert.equal(handoff.format, 'genesis.spec-handoff');
+  assert.equal(handoff.version, 2);
+  assert.equal(handoff.impact, null);
+  assert.deepEqual(handoff.requirements.map((item) => [item.id, item.state, item.basis.kind]), [
+    ['REQ-submit-failure', 'explicit', 'user'], ['REQ-submit-success', 'explicit', 'user'],
+  ]);
+  const success = handoff.requirements[1];
+  assert.equal(success.basis.ref, 'example:report-notifications/request');
+  assert.equal(success.statement, '系统 MUST 在报告提交成功时发送成功通知。');
+  assert.deepEqual(success.scenarios, [{
+    name: '提交成功', given: ['报告内容完整', '提交服务可用'], when: ['报告提交返回成功'],
+    then: ['本次提交发送的成功通知数量为一', '不发送失败通知'],
+  }]);
+});
+
+test('impact records touched flows and evidence, checked against the Map and the project', (t) => {
+  const repo = project(t, 'existing');
+  mkdirSync(path.join(repo, 'app'));
+  writeFileSync(path.join(repo, 'app/notify.py'), 'def notify():\n    return True\n');
+  const mapFile = path.join(repo, 'map.json');
+  writeFileSync(mapFile, JSON.stringify({
+    snapshot_id: 'sha256:example', analysis_status: 'partial', flows: [{ flow_id: 'flow_submit', name: 'Submit a report' }],
+  }));
+  newSpec(repo, 'report-notifications', { map: mapFile });
+  writeSpec(repo);
+  const unrecorded = validateSpec(repo, 'report-notifications');
+  assert.equal(unrecorded.ready_for_eval_design, true);
+  assert.match(unrecorded.warnings.join('\n'), /No impact\.md/);
+
+  const impactFile = path.join(repo, 'openspec/changes/report-notifications/impact.md');
+  const impact = (entries) => writeFileSync(impactFile, `---\ngenesis_impact: 1\nentries:\n${entries}\n---\n\nNotes for the reader.\n`);
+  impact('  - flow: flow_submit\n    entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:2\n    note: Stop the success notification on failure\n'
+    + '  - entry: notify()\n    effect: may_affect\n    evidence: app/notify.py');
+  const exported = exportSpec(repo, 'report-notifications');
+  assert.deepEqual(exported.impact, [
+    { flow: 'flow_submit', flow_name: 'Submit a report', entry: 'POST /reports', effect: 'changes', evidence: 'app/notify.py:2', note: 'Stop the success notification on failure' },
+    { entry: 'notify()', effect: 'may_affect', evidence: 'app/notify.py' },
+  ]);
+  assert.deepEqual(readJSON(exported.file).impact.entries, exported.impact);
+
+  for (const [entries, pattern] of [
+    ['  - flow: flow_unknown\n    entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:1', /not in the recorded Map/],
+    ['  - entry: POST /reports\n    effect: changes\n    evidence: app/missing.py:1', /does not point to a file/],
+    ['  - entry: POST /reports\n    effect: changes\n    evidence: ../outside.py', /does not point to a file/],
+    ['  - entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:99', /line is outside the file/],
+    ['  - entry: POST /reports\n    effect: rewrites\n    evidence: app/notify.py', /needs entry, effect/],
+  ]) {
+    impact(entries);
+    const result = validateSpec(repo, 'report-notifications');
+    assert.equal(result.valid, false, entries);
+    assert.match(result.errors.join('\n'), pattern);
+    assert.equal(result.gaps.find((gap) => gap.code === 'impact_invalid').owner, 'agent');
+  }
+  writeFileSync(impactFile, 'No frontmatter here.\n');
+  assert.match(validateSpec(repo, 'report-notifications').errors.join('\n'), /genesis_impact: 1/);
+});
+
 test('confirmed interpretations need an actor and actual confirmation reference', (t) => {
   const { repo, file } = authored(t, fixture.replace('state: explicit', 'state: confirmed'));
   assert.equal(validateSpec(repo, 'report-notifications').valid, false);
