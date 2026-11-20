@@ -1,0 +1,16 @@
+schema_version = "1.4"
+
+[task]
+name = "genesis-edd/report-submission-notifications--submit-failure-s1"
+description = "REQ-submit-failure 提交失败时不发送成功通知: 报告提交失败"
+
+[verifier]
+timeout_sec = 600.0
+environment_mode = "shared"
+
+[agent]
+timeout_sec = 600.0
+
+[environment]
+network_mode = "public"
+build_timeout_sec = 600.0

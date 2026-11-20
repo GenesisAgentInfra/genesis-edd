@@ -1,9 +1,11 @@
 import { parseArgs } from 'node:util';
 import { initProject, projectRoot } from './project.js';
 import { exportSpec, newSpec, specInstructions, specStatus, validateSpec } from './spec.js';
+import { newEval, validateEval } from './eval.js';
+import { checkEval, startRun } from './run.js';
 import { checkWorkflow } from './workflow.js';
 
-const help = `Genesis EDD 0.1.0 — requirements for evaluation-driven development
+const help = `Genesis EDD 0.1.0 — requirements and evals for evaluation-driven development
 
 genesis-edd init --repo PATH --mode new|existing [--agent codex|claude|both|none]
 genesis-edd spec new NAME --repo PATH [--mode new|existing] [--map PATH]
@@ -11,24 +13,45 @@ genesis-edd spec instructions NAME --repo PATH
 genesis-edd spec status NAME --repo PATH
 genesis-edd spec validate NAME --repo PATH
 genesis-edd spec export NAME --repo PATH
+genesis-edd eval new NAME --repo PATH
+genesis-edd eval validate NAME --repo PATH
+genesis-edd eval check NAME --repo PATH [--case ID] [--timeout MINUTES] [--yes]
+genesis-edd run start NAME --repo PATH [--baseline [--unavailable REASON] [--expect FILE]]
+                           [--agent NAME|module:Class] [--model MODEL] [--timeout MINUTES] [--yes]
 genesis-edd workflow check STAGE NAME --repo PATH
 
-All commands return JSON. init defaults to --agent both. Spec content is authored
-by your coding agent using the installed agent-spec skill, not by a CLI model.
+All commands return JSON. init defaults to --agent both. Specs, eval packages and
+verifiers are authored by your coding agent using the installed skills, not by a
+CLI model.
 validate exits 1 for malformed specs; valid drafts report ready_for_eval_design=false.
 It rejects more explicit requirements than their quoted source states.
 It checks impact.md, when present, against the recorded Map and the project files.
 export requires a valid spec with no proposed requirements or open questions and
 returns a review of each requirement beside the words and outcomes it rests on.
 The handoff carries structured requirements and impact for later stages.
+eval new writes one Harbor task package per scenario of the exported Spec under
+.genesis/edd/NAME/evals/, with expected results copied from its THEN lines. It
+never rewrites what an existing package owns; it does bring the shipped helper
+and the shared verifier code of the project kit (.genesis/edd/harness/) in line
+in every package. eval validate is read-only: it checks structure, sources and
+coverage, and works out which packages can run and what the others still need.
+eval check runs each finished package's fixtures through Harbor with the real
+verifier and records whether every fixture got the result it expects. A
+package is ready only while that record matches the package and the kit.
+run start runs the ready packages with Harbor in local Docker and writes one
+immutable record under .genesis/edd/NAME/runs/. --baseline records the code
+before a change; --unavailable (no_implementation, execution_blocked or
+incompatible_tasks) records why no baseline could run instead of inventing one.
+Later runs are compared with that baseline check by check. run start exits 1
+when execution was blocked or failed; a failing business check is a result.
+--yes lets Harbor read host environment variables a task asks for.
 workflow check is read-only and returns gaps, repair routes and a resume command.
-Stages: spec-export, write-eval, run-eval, loop-and-implement. Only spec-export
-executes in this release. write-eval checks its frozen Spec input; later stages
-report inputs_ready=null because their input checks are not implemented.
-Blocked or unavailable workflow checks exit 1. No stage is executed by a check.
+Stages: spec-export, write-eval, run-eval, loop-and-implement. The last is
+planned and reports inputs_ready=null. Blocked or unavailable checks exit 1.
+No stage is executed by a check.
 
-Planned modules: prepare, write-eval, run-eval, loop-and-implement.
-They are not implemented by this release. Genesis Map is a separate tool.
+Planned modules: prepare, loop-and-implement. Genesis Map is a separate tool.
+Harbor and Docker are separate tools that run-eval needs on this machine.
 `;
 
 export function main(argv) {
@@ -46,22 +69,46 @@ export function main(argv) {
   if (['prepare', 'write-eval', 'run-eval', 'loop-and-implement'].includes(command)) {
     if (command !== 'prepare' && action && !action.startsWith('-')) {
       const { values } = parseArgs({ args: argv.slice(2), options: { repo: { type: 'string', default: '.' } }, strict: true, allowPositionals: false });
-      process.exitCode = 1;
-      return checkWorkflow(projectRoot(values.repo), command, action);
+      const result = checkWorkflow(projectRoot(values.repo), command, action);
+      if (result.status !== 'ready') process.exitCode = 1;
+      return result;
     }
-    throw new Error(`${command} is planned and not implemented in v0.1.`);
+    throw new Error(command === 'prepare' || command === 'loop-and-implement'
+      ? `${command} is planned and not implemented in v0.1.`
+      : `Use workflow check ${command} NAME --repo PATH, then the ${command === 'write-eval' ? 'eval' : 'run'} commands.`);
   }
   const init = command === 'init';
-  if (!init && (command !== 'spec' || !['new', 'instructions', 'status', 'validate', 'export'].includes(action) || !name || name.startsWith('-'))) {
+  const actions = { spec: ['new', 'instructions', 'status', 'validate', 'export'], eval: ['new', 'validate', 'check'], run: ['start'] }[command];
+  if (!init && (!actions?.includes(action) || !name || name.startsWith('-'))) {
     throw new Error('Unknown command. Run genesis-edd --help.');
   }
   const options = { repo: { type: 'string', default: '.' } };
-  if (init || action === 'new') options.mode = { type: 'string' };
+  if (init || (command === 'spec' && action === 'new')) options.mode = { type: 'string' };
   if (init) options.agent = { type: 'string', default: 'both' };
-  if (action === 'new') options.map = { type: 'string' };
+  if (command === 'spec' && action === 'new') options.map = { type: 'string' };
+  if (command === 'eval' && action === 'check') {
+    Object.assign(options, { case: { type: 'string' }, timeout: { type: 'string' }, yes: { type: 'boolean' } });
+  }
+  if (command === 'run') {
+    Object.assign(options, { baseline: { type: 'boolean' }, unavailable: { type: 'string' }, expect: { type: 'string' },
+      agent: { type: 'string' }, model: { type: 'string' }, timeout: { type: 'string' }, yes: { type: 'boolean' } });
+  }
   const { values } = parseArgs({ args: argv.slice(init ? 1 : 3), options, strict: true, allowPositionals: false });
   const repo = projectRoot(values.repo);
   if (init) return initProject(repo, values.mode, values.agent);
+  const timeout = values.timeout === undefined ? undefined : Number(values.timeout);
+  if (timeout !== undefined && !(timeout > 0)) throw new Error('--timeout is a number of minutes.');
+  if (command === 'eval') {
+    if (action === 'new') return newEval(repo, name);
+    const result = action === 'check' ? checkEval(repo, name, { ...values, timeout }) : validateEval(repo, name);
+    if (!(action === 'check' ? result.passed : result.valid)) process.exitCode = 1;
+    return result;
+  }
+  if (command === 'run') {
+    const result = startRun(repo, name, { ...values, timeout });
+    if (!['completed', 'not_run'].includes(result.execution_status)) process.exitCode = 1;
+    return result;
+  }
   if (action === 'new') return newSpec(repo, name, values);
   if (action === 'instructions') return specInstructions(repo, name);
   if (action === 'status') return specStatus(repo, name);

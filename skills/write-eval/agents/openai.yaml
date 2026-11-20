@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write Eval"
+  short_description: "Turn an exported spec into runnable Harbor eval packages"
+  default_prompt: "Use $write-eval to turn the exported spec into eval packages with sourced checks."

@@ -1,0 +1,52 @@
+{
+  "schema_version": "1.0",
+  "status": "confirmed",
+  "spec_ref": {
+    "id": "report-submission-notifications",
+    "sha256": "sha256:9b44563d7521e7f3cf3839a0ef753113793cb658a3aa52eba9f892bed843e83e"
+  },
+  "scenario": {
+    "requirement": "REQ-submit-failure",
+    "name": "报告提交失败"
+  },
+  "dependencies": [
+    {
+      "name": "report-api",
+      "mode": "simulated",
+      "note": "POST /reports answers with the status this scenario needs and records each report."
+    },
+    {
+      "name": "notify-api",
+      "mode": "simulated",
+      "note": "POST /notifications records each notification."
+    }
+  ],
+  "checks": [
+    {
+      "id": "c1",
+      "intent": "REQ-submit-failure",
+      "expect": "本次提交发送的成功通知数量为零",
+      "role": "gating"
+    }
+  ],
+  "fixtures": [
+    {
+      "name": "no-notification",
+      "expect": {
+        "c1": "pass"
+      }
+    },
+    {
+      "name": "one-notification",
+      "expect": {
+        "c1": "fail"
+      }
+    },
+    {
+      "name": "no-submission",
+      "expect": {
+        "c1": "unknown"
+      }
+    }
+  ]
+}

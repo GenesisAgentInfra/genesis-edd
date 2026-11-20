@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run Eval"
+  short_description: "Run eval packages with Harbor and compare against a fixed baseline"
+  default_prompt: "Use $run-eval to run the eval packages and compare the result with the baseline."

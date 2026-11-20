@@ -1,0 +1,5 @@
+**
+!reportbot/
+!reportbot/*.py
+!example-report.json
+.genesis

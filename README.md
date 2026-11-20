@@ -2,10 +2,11 @@
 
 Turn feature requests into clear, testable specs with your coding agent.
 
-Genesis EDD helps you define what a feature should do before implementation.
-The **agent-spec** skill turns your request into concise requirements
-and concrete acceptance scenarios, with questions focused on decisions that affect
-acceptance.
+Genesis EDD helps you define what a feature should do before implementation,
+and then check it. The **agent-spec** skill turns your request into concise
+requirements and concrete acceptance scenarios. **write-eval** turns each
+scenario into an eval package, and **run-eval** runs the packages before and
+after a change and compares the two.
 
 ## What you can do
 
@@ -19,17 +20,23 @@ acceptance.
   decisions, then continue after they are addressed.
 - **Export a fixed version of the spec.** Preserve requirements, their sources, and
   acceptance scenarios for subsequent work.
+- **Get one eval package per scenario.** Each package is a
+  [Harbor](https://docs.harborframework.com) task with the expected results kept
+  out of the agent's reach.
+- **Compare before and after.** Run the same packages on the code before your
+  change and after it, and see which expected results now hold.
 
-Works with Codex and Claude Code. Uses your existing coding agent; no separate
-model API key or Genesis service is required.
+Works with Codex and Claude Code. Uses your existing coding agent; no Genesis
+service is required. Running evals needs Docker and Harbor on your machine, and
+whatever model access your own agent under test already uses.
 
 ## Skills
 
 | Skill | Purpose | Availability |
 | --- | --- | --- |
 | `agent-spec` | Clarify requirements, write acceptance scenarios, and export a validated spec. | Available |
-| `write-eval` | Turn an accepted spec into an Eval task package. | Not yet available |
-| `run-eval` | Run Evals and compare baseline and head results. | Not yet available |
+| `write-eval` | Turn an exported spec into eval packages, one per scenario. | Available |
+| `run-eval` | Run eval packages and compare baseline and head results. | Available |
 | `loop-and-implement` | Implement changes and iterate using Eval feedback. | Not yet available |
 
 ## Get started
@@ -74,7 +81,11 @@ node .agents/skills/agent-spec/scripts/run.mjs --version
 For Claude Code, use `.claude/skills/agent-spec/scripts/run.mjs` instead.
 Copying only the skill folder leaves out its CLI dependencies and runtime binding;
 complete the dependency installation and `init` step. Keep the Genesis EDD
-checkout available: the installed skill uses its CLI.
+checkout available: the installed skills use its CLI.
+
+`run-eval` also needs Docker running and
+[Harbor](https://docs.harborframework.com) on the `PATH` (for example
+`uv tool install harbor`). The other skills work without them.
 If you installed `genesis-spec`, rerun init to migrate to `agent-spec`. Files that
 differ from the previous shipped version are left untouched for manual review.
 
@@ -96,6 +107,25 @@ agent session.
 
 The agent drafts the spec, clarifies unresolved business decisions, validates it,
 and exports it when ready. You can review and edit the spec in your project.
+
+## Write and run evals
+
+```text
+Write evals for the report notifications spec, then run them before and after
+the change.
+```
+
+`write-eval` creates one package per acceptance scenario under
+`.genesis/edd/<change>/evals/`, on top of a project kit in
+`.genesis/edd/harness/` that holds what every package shares: how your agent is
+started, stand-ins for its dependencies, and the code that reads evidence. A
+package can run once its checking script has been proved against results whose
+verdict is known. `run-eval` records each run under
+`.genesis/edd/<change>/runs/`; run and check records stay out of Git.
+
+A project without an implementation has nothing to run first: the baseline is
+recorded as unavailable, and the first results count for the new code only. A
+run that could not execute is reported as such, never as a failed check.
 
 Genesis checks required inputs when you enter a supported workflow stage. These
 checks do not force your coding agent to select the skill or intercept code edits.

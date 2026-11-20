@@ -13,9 +13,11 @@ Keep the user interaction short. Ask only about ambiguity that changes business
 acceptance. Existing code and maps describe facts, not requirements. Preserve the
 source and status of every requirement; agent suggestions are not user decisions.
 
-Only spec authoring, validation and export are implemented initially. Do not
-present planned evaluation or coding-loop commands as working functionality.
-Keep baseline unavailability distinct from a failing business check.
+Spec authoring, eval packages and eval runs are implemented; the coding loop is
+planned. Do not present a planned command as working functionality. Harbor and
+Docker are separate tools that run-eval needs; do not vendor Harbor.
+Keep baseline unavailability and blocked execution distinct from a failing
+business check.
 
 Use Node's built-in test runner. Run `npm run check` and `npm test` after changes.
 Exercise the real pinned OpenSpec CLI in integration tests. No model credentials,
