@@ -14,6 +14,9 @@ provides OpenSpec templates, deterministic validation and a frozen handoff.
 Run `node /absolute/path/to/this/skill/scripts/run.mjs --version` to locate the
 installed CLI. In commands below, `edd` means that complete command without
 `--version`. Always use the explicit path, not an executable found in the project.
+If the launcher reports that its dependencies are not installed, run the command
+it prints. It installs pinned npm packages inside the Genesis EDD package, needs
+network access, and may need the user's approval outside a sandbox. Then retry.
 If runtime.json is missing, use the documented checkout CLI or reinstall the skill.
 
 Read [references/spec-format.md](references/spec-format.md) before writing a spec.
@@ -87,7 +90,8 @@ then proceed to writing and validation without a routine final approval round.
 
 1. Start or resume with `edd workflow check spec-export <change> --repo <app>`
    and follow the recovery rules below. Initialize a missing project with
-   `edd init --repo <app> --mode new|existing` using known project facts. Create a
+   `edd init --repo <app> --mode new|existing --agent none` using known project
+   facts; the skills are already available to you. Create a
    missing change with `edd spec new <change> --repo <app> --mode new|existing
    [--map <file>]`. For an existing change, use `spec instructions` and edit in
    place. Read the returned template and project rules. Create only the needed

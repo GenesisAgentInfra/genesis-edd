@@ -26,7 +26,11 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:125c0caf12be5e2e0dac8bb9758105173260d842e9cfe144f3b4d38a1ebc7871',
     'sha256:3cf1a64417fefb329d1a099070c461172a6ae2d7d495fa1a1f1cfdb6aaad9fb5',
     'sha256:f75b8f0f8992fdeb62442b8b3c0cbac772c783a4069d9072a43722e0b307c2a5',
+    'sha256:33663ac9eb83b705a9cfd2fcc11fe78805082404804fed590f163d91e1f0ba09',
   ],
+  'agent-spec/scripts/run.mjs': ['sha256:881a4b48652d858fa99c6cccacd9549910b64631152884beef6bb88a70fc1e9a'],
+  'write-eval/SKILL.md': ['sha256:390f4c0a47e84b7d73a6317dbf9ed054d1879944fcfa38bd94016fd171bf889d'],
+  'run-eval/SKILL.md': ['sha256:ffb9e10f3f25bffc007ed9381df23cb3d1e31b64dc8088352302158215f75ba7'],
   'agent-spec/references/spec-format.md': [
     'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
     'sha256:99a3389ea7a87d2c61077a5f81252d39f594d6e86d5ad21f939c779020b56619',
@@ -124,7 +128,6 @@ export function initProject(repo, mode, agent) {
   }
   const agentDirs = agent === 'both' ? ['.agents', '.claude'] : agent === 'none' ? [] : [agent === 'codex' ? '.agents' : '.claude'];
   const runtime = `${JSON.stringify({ cli: path.join(ROOT, 'bin/genesis-edd.js') }, null, 2)}\n`;
-  const launcher = path.join(ROOT, 'skills/agent-spec/scripts');
   for (const directory of agentDirs) {
     const legacy = localPath(repo, `${directory}/skills/genesis-spec`);
     if (existsSync(legacy)) {
@@ -138,15 +141,13 @@ export function initProject(repo, mode, agent) {
     }
     for (const skill of SKILLS) {
       const skillRoot = path.join(ROOT, 'skills', skill);
-      const sources = listFiles(skillRoot).map((file) => [path.relative(skillRoot, file), file]);
-      // Every skill starts the CLI through the same launcher, kept once in agent-spec.
-      if (skill !== 'agent-spec') sources.push(...listFiles(launcher).map((file) => [path.join('scripts', path.relative(launcher, file)), file]));
-      for (const [relative, file] of sources) {
-        const target = relative.split(path.sep).join('/');
+      for (const file of listFiles(skillRoot)) {
+        const target = path.relative(skillRoot, file).split(path.sep).join('/');
         add(`${directory}/skills/${skill}/${target}`, readFileSync(file, 'utf8'), PREVIOUS_SKILL_HASHES[`${skill}/${target}`]);
       }
-      add(`${directory}/skills/${skill}/scripts/runtime.json`, runtime);
     }
+    // Every skill starts the CLI through the one launcher in agent-spec.
+    add(`${directory}/skills/agent-spec/scripts/runtime.json`, runtime);
   }
   // Check the entire install before writing anything; never replace custom files.
   for (const write of writes) {
