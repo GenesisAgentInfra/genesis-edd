@@ -12,9 +12,13 @@ edits a package, a Spec or application code.
 
 ## Tool and context
 
-Run `node /absolute/path/to/this/skill/scripts/run.mjs --version` to locate the
-installed CLI. In commands below, `edd` means that complete command without
+The CLI starts through the launcher of the `agent-spec` skill, installed beside
+this one. Run `node /absolute/path/to/agent-spec/scripts/run.mjs --version` to
+locate it. In commands below, `edd` means that complete command without
 `--version`. Always use the explicit path, not an executable found in the project.
+If the launcher reports that its dependencies are not installed, run the command
+it prints. It installs pinned npm packages inside the Genesis EDD package, needs
+network access, and may need the user's approval outside a sandbox. Then retry.
 
 Read [references/run-records.md](references/run-records.md) before reporting a
 result. A run needs Docker running and Harbor. The CLI runs `harbor` from the

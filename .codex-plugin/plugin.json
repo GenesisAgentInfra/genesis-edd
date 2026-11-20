@@ -1,0 +1,28 @@
+{
+  "name": "genesis-edd",
+  "version": "0.1.0",
+  "description": "Turn a feature request into a testable spec, eval packages, and a before-and-after comparison",
+  "author": {
+    "name": "Genesis Agent Infra",
+    "url": "https://github.com/GenesisAgentInfra"
+  },
+  "homepage": "https://github.com/GenesisAgentInfra/genesis-edd",
+  "repository": "https://github.com/GenesisAgentInfra/genesis-edd",
+  "license": "Apache-2.0",
+  "keywords": ["evals", "eval-driven-development", "specs", "harbor", "agents"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Genesis EDD",
+    "shortDescription": "Specs and evals before you build",
+    "longDescription": "Clarify a feature request into a spec with acceptance scenarios, turn each scenario into a Harbor eval package, and compare runs before and after a change.",
+    "developerName": "Genesis Agent Infra",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": [
+      "Help me write the spec and acceptance scenarios for this feature.",
+      "Write evals for the exported spec.",
+      "Run the evals before and after my change."
+    ],
+    "websiteURL": "https://github.com/GenesisAgentInfra/genesis-edd"
+  }
+}

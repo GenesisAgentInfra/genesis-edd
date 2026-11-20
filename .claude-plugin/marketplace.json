@@ -1,0 +1,18 @@
+{
+  "name": "genesis-edd",
+  "owner": {
+    "name": "Genesis Agent Infra",
+    "url": "https://github.com/GenesisAgentInfra"
+  },
+  "metadata": {
+    "description": "Requirements and evals for evaluation-driven development with your coding agent"
+  },
+  "plugins": [
+    {
+      "name": "genesis-edd",
+      "source": "./",
+      "description": "Turn a feature request into a testable spec, eval packages, and a before-and-after comparison",
+      "homepage": "https://github.com/GenesisAgentInfra/genesis-edd"
+    }
+  ]
+}

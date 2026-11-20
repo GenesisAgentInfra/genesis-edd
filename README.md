@@ -1,134 +1,173 @@
 # Genesis EDD
 
-Turn feature requests into clear, testable specs with your coding agent.
+Evaluation-driven development for coding agents: agree on what a feature must
+do, turn that into evals, and check your change against them.
 
-Genesis EDD helps you define what a feature should do before implementation,
-and then check it. The **agent-spec** skill turns your request into concise
-requirements and concrete acceptance scenarios. **write-eval** turns each
-scenario into an eval package, and **run-eval** runs the packages before and
-after a change and compares the two.
+Genesis EDD is a set of skills for Claude Code and Codex. Your coding agent does
+the reasoning; Genesis keeps what it produces structured and checks it. No
+Genesis service or extra model key is needed.
 
-## What you can do
+## How it works
 
-- **Describe a feature in plain language.** Turn the conversation into a structured
-  spec with observable outcomes.
-- **Work with new or existing projects.** Start from an empty project or use existing
-  specs, code, and available Genesis Maps as context.
-- **Refine requirements without starting over.** Keep accepted decisions and focus
-  the discussion on what changes.
-- **Check readiness before handing off.** Find missing information and unresolved
-  decisions, then continue after they are addressed.
-- **Export a fixed version of the spec.** Preserve requirements, their sources, and
-  acceptance scenarios for subsequent work.
-- **Get one eval package per scenario.** Each package is a
-  [Harbor](https://docs.harborframework.com) task with the expected results kept
-  out of the agent's reach.
-- **Compare before and after.** Run the same packages on the code before your
-  change and after it, and see which expected results now hold.
+1. **agent-spec.** Describe a feature in plain words. The agent writes a spec
+   with requirements and acceptance scenarios, asks only about decisions that
+   change what is accepted, and exports a fixed version.
+2. **write-eval.** Each scenario becomes a [Harbor](https://docs.harborframework.com)
+   task package with expected results taken from the spec. What all packages
+   of a project share, such as how your agent is started and what stands in for
+   its dependencies, is built once in a project kit. A package can run only
+   after its checking script has been proved against results whose verdict is
+   known.
+3. **run-eval.** Run the packages on the code before your change and after it,
+   and compare them check by check. A run that could not execute is reported as
+   such, never as a failed check.
+4. **loop-and-implement.** Planned: implement and iterate on eval feedback.
 
-Works with Codex and Claude Code. Uses your existing coding agent; no Genesis
-service is required. Running evals needs Docker and Harbor on your machine, and
-whatever model access your own agent under test already uses.
+The skills start from ordinary requests. Each stage checks its inputs first and
+sends the agent back to the stage that owns a gap. It works in a new project or
+an existing one, and uses a Genesis Map when you have one.
 
-## Skills
+## Install
 
-| Skill | Purpose | Availability |
-| --- | --- | --- |
-| `agent-spec` | Clarify requirements, write acceptance scenarios, and export a validated spec. | Available |
-| `write-eval` | Turn an exported spec into eval packages, one per scenario. | Available |
-| `run-eval` | Run eval packages and compare baseline and head results. | Available |
-| `loop-and-implement` | Implement changes and iterate using Eval feedback. | Not yet available |
+You need **Node.js 22.20.0 or later**.
 
-## Get started
+### Claude Code
 
-Open your project in Codex or Claude Code and ask:
+```text
+/plugin marketplace add GenesisAgentInfra/genesis-edd
+/plugin install genesis-edd@genesis-edd
+```
+
+Or from your shell:
+
+```bash
+claude plugin marketplace add GenesisAgentInfra/genesis-edd
+```
+
+```bash
+claude plugin install genesis-edd@genesis-edd
+```
+
+Start a new session afterwards.
+
+### Codex
+
+```bash
+codex plugin marketplace add GenesisAgentInfra/genesis-edd
+```
+
+```bash
+codex plugin add genesis-edd@genesis-edd
+```
+
+The first time a skill runs, it installs two pinned npm packages inside the
+plugin folder. Codex's sandbox cannot write there, so Codex may ask you to
+approve that one command.
+
+### In your project
+
+Nothing to set up. The first time you use `agent-spec` in a project, the agent
+creates an `openspec/` folder there.
+
+### Docker and Harbor
+
+Writing specs and packages works without them. Proving packages
+(`eval check`) and running them need:
+
+- Docker, running.
+- Harbor. Install it with `uv tool install harbor`, or run it without a global
+  install by setting
+  `GENESIS_EDD_HARBOR='["uvx","--from","harbor","harbor"]'`.
+
+<details>
+<summary>Install into one project from a checkout</summary>
+
+Use this for a coding agent without plugin support that reads skills from
+`.agents/skills/` or `.claude/skills/`, or to pin a version per project. Do not
+also install the plugin: the agent would see each skill twice.
+
+You can ask your agent:
 
 ```text
 Install Genesis EDD in this project from https://github.com/GenesisAgentInfra/genesis-edd.
-Read its README and complete setup for the coding agent I am using.
+Follow "Install into one project from a checkout" in its README.
 ```
 
-Your agent can download the framework, install its dependencies, and initialize
-the current project. Include the repository URL on the first install so it can
-find the right project. Requires Git and **Node.js 22.20.0 or later**.
+Steps for the agent, or by hand. Keep the target project's absolute path.
+Clone into a tools folder outside the project, or reuse an existing checkout:
 
-<details>
-<summary>Installation steps for your agent or manual setup</summary>
-
-Keep the target project's absolute path before changing directories. Reuse an
-existing Genesis EDD checkout, or clone it into a persistent tools directory
-outside the target project:
-
-```sh
+```bash
 git clone https://github.com/GenesisAgentInfra/genesis-edd.git
 cd genesis-edd
 npm ci --ignore-scripts
-node bin/genesis-edd.js init --repo /absolute/path/to/your-project --mode new --agent codex
+node bin/genesis-edd.js init --repo /absolute/path/to/your-project --mode existing --agent codex
 ```
 
-When reusing a checkout, enter it and start with `npm ci`. Point `--repo` to the target project's
-existing directory. Use `--mode new` for a project without application code, or
-`--mode existing` for an existing codebase. Inspect the project to choose the mode.
-Use `--agent codex` for Codex, `--agent claude` for Claude Code, or `--agent both`
-when the user wants both.
+- `--mode new` for a project without application code, `--mode existing` for
+  an existing codebase.
+- `--agent codex` writes `.agents/skills/`, `--agent claude` writes
+  `.claude/skills/`, `--agent both` writes both.
 
-Verify the installed launcher from the target project:
+Check the install from the project:
 
-```sh
+```bash
 node .agents/skills/agent-spec/scripts/run.mjs --version
 ```
 
-For Claude Code, use `.claude/skills/agent-spec/scripts/run.mjs` instead.
-Copying only the skill folder leaves out its CLI dependencies and runtime binding;
-complete the dependency installation and `init` step. Keep the Genesis EDD
-checkout available: the installed skills use its CLI.
-
-`run-eval` also needs Docker running and
-[Harbor](https://docs.harborframework.com) on the `PATH` (for example
-`uv tool install harbor`). The other skills work without them.
-If you installed `genesis-spec`, rerun init to migrate to `agent-spec`. Files that
-differ from the previous shipped version are left untouched for manual review.
+Use `.claude/skills/...` for Claude Code. Keep the checkout where it is: the
+installed skills run its CLI. Copying only the skill folders does not work.
 
 </details>
 
-## Describe what you want
+## Use
+
+Ask for what you want; the matching skill starts.
 
 ```text
 I want to add report notifications. When report submission fails, do not send a
-success notification. Help me clarify the requirements and acceptance scenarios.
+success notification. Help me write the requirements and acceptance scenarios.
 ```
-
-You do not have to type a command. Codex and Claude Code can select `agent-spec`
-when your request matches its requirements and acceptance-scenario scope.
-Automatic selection is decided by your coding agent; it is not guaranteed for
-every prompt. To select the skill explicitly, use `$agent-spec` in Codex or
-`/agent-spec` in Claude Code. If the installed skill is not visible, reload your
-agent session.
-
-The agent drafts the spec, clarifies unresolved business decisions, validates it,
-and exports it when ready. You can review and edit the spec in your project.
-
-## Write and run evals
 
 ```text
-Write evals for the report notifications spec, then run them before and after
-the change.
+Write evals for the report notifications spec.
 ```
 
-`write-eval` creates one package per acceptance scenario under
-`.genesis/edd/<change>/evals/`, on top of a project kit in
-`.genesis/edd/harness/` that holds what every package shares: how your agent is
-started, stand-ins for its dependencies, and the code that reads evidence. A
-package can run once its checking script has been proved against results whose
-verdict is known. `run-eval` records each run under
-`.genesis/edd/<change>/runs/`; run and check records stay out of Git.
+```text
+Record the baseline, then run the evals again after my change.
+```
 
-A project without an implementation has nothing to run first: the baseline is
-recorded as unavailable, and the first results count for the new code only. A
-run that could not execute is reported as such, never as a failed check.
+Whether a skill starts on its own is up to your coding agent. To choose one
+explicitly, use `/genesis-edd:agent-spec` in Claude Code (`/agent-spec` for a
+project install), or type `$` in Codex and pick the skill.
 
-Genesis checks required inputs when you enter a supported workflow stage. These
-checks do not force your coding agent to select the skill or intercept code edits.
+## What it writes in your project
+
+| Path | Holds | In Git |
+| --- | --- | --- |
+| `openspec/` | specs and their exported versions | yes |
+| `.genesis/edd/harness/` | the project kit shared by every eval package | yes |
+| `.genesis/edd/<change>/evals/` | one Harbor task package per scenario | yes |
+| `.genesis/edd/<change>/checks/` | proofs that each package's checks work | no |
+| `.genesis/edd/<change>/runs/` | run records and before/after comparisons | no |
+
+## Skills
+
+| Skill | Purpose | Status |
+| --- | --- | --- |
+| `agent-spec` | Clarify requirements, write acceptance scenarios, export a validated spec | Available |
+| `write-eval` | Turn an exported spec into eval packages and prove their checks | Available |
+| `run-eval` | Run eval packages and compare the baseline with later runs | Available |
+| `loop-and-implement` | Implement changes and iterate on eval feedback | Planned |
+
+## Update
+
+- **Claude Code:** run `/plugin marketplace update genesis-edd`, then start a
+  new session. To update automatically, open `/plugin`, choose
+  **Marketplaces**, select `genesis-edd` and enable auto-update.
+- **Codex:** run `codex plugin marketplace upgrade genesis-edd`, then start a
+  new session.
+- **Checkout:** run `git pull` and `npm ci --ignore-scripts`, then run `init`
+  again for each project. Installed files you edited are left as they are.
 
 ## License
 
