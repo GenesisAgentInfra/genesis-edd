@@ -508,10 +508,10 @@ test('write-eval input check requires the current frozen Spec and preserves olde
   const original = readFileSync(first.file, 'utf8');
   result = checkWorkflow(repo, 'write-eval', 'report-notifications');
   assert.equal(result.inputs_ready, true);
-  assert.equal(result.status, 'unavailable');
-  assert.equal(result.implemented, false);
+  assert.equal(result.status, 'ready');
+  assert.equal(result.implemented, true);
   assert.equal(result.handoff.id, first.id);
-  assert.equal(result.next.owner, 'framework');
+  assert.equal(result.next.owner, 'agent');
   writeFileSync(file, fixture.replace('revision: 1', 'revision: 2').replace('数量为零', '数量必须为零'));
   result = checkWorkflow(repo, 'write-eval', 'report-notifications');
   assert.equal(result.inputs_ready, false);
@@ -580,11 +580,11 @@ test('CLI recovery resumes the original stage after a business decision is suppl
 
 test('unimplemented stage entries return diagnostics without claiming readiness or running a stage', (t) => {
   const { repo } = authored(t);
-  for (const stage of ['write-eval', 'run-eval', 'loop-and-implement']) {
+  for (const stage of ['loop-and-implement']) {
     const result = checkWorkflow(repo, stage, 'report-notifications');
     assert.equal(result.implemented, false);
     assert.ok(result.gaps.some((gap) => gap.code === 'stage_unavailable' && gap.owner === 'framework'));
-    if (stage !== 'write-eval') assert.equal(result.inputs_ready, null);
+    assert.equal(result.inputs_ready, null);
     const response = spawnSync(process.execPath, [path.join(ROOT, 'bin/genesis-edd.js'), stage, 'report-notifications', '--repo', repo], { encoding: 'utf8' });
     assert.equal(response.status, 1);
     const diagnostic = JSON.parse(response.stdout);

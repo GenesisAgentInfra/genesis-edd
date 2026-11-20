@@ -337,6 +337,26 @@ export function handoffStatus({ file, handoff }) {
   catch { return 'invalid'; }
 }
 
+// The Spec as later stages may read it: valid, with every business decision
+// settled, and exported unchanged. Anything short of that comes back as gaps.
+export function frozenSpec(repo, name, { exported = true } = {}) {
+  const validation = validateSpec(repo, name);
+  const gaps = [...validation.gaps];
+  let handoff;
+  if (validation.ready_for_eval_design) {
+    const expected = specHandoff(repo, name, validation);
+    const status = handoffStatus(expected);
+    if (status === 'invalid') {
+      gaps.push({ code: 'handoff_invalid', kind: 'technical', owner: 'agent', route: 'spec-export', path: expected.file,
+        message: 'Restore the original frozen handoff before retrying; do not overwrite it.' });
+    } else if (status === 'missing') {
+      if (exported) gaps.push({ code: 'handoff_missing', kind: 'artifact', owner: 'agent', route: 'spec-export',
+        message: 'Export the current validated Spec. Older exports do not represent the current draft.' });
+    } else handoff = expected;
+  }
+  return { validation, gaps, handoff };
+}
+
 export function exportSpec(repo, name) {
   const result = validateSpec(repo, name);
   if (!result.ready_for_eval_design) {
@@ -362,6 +382,6 @@ export function exportSpec(repo, name) {
     id, file, ready_for_eval_design: true, warnings: result.warnings,
     review: specReview(result.specs),
     impact: result.impact?.entries ?? null,
-    next: 'write-eval (planned): derive cases and execution bindings from this frozen spec handoff.',
+    next: { stage: 'write-eval', command: ['eval', 'new', name, '--repo', repo] },
   };
 }

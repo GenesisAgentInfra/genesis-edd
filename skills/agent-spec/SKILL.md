@@ -144,12 +144,12 @@ After a material input repair, rerun the returned `resume.command` through `edd`
 Keep the original requested stage when resolving an upstream gap. Do not retry
 unchanged blockers in a loop. A ready check is a snapshot, not a reusable permit:
 `spec export` repeats validation and refuses inputs that changed in the meantime.
-`workflow check write-eval` checks the current frozen Spec input only; even with
-that input ready, it reports the Eval module as unavailable. Later-stage input
-checks are also unavailable. None of these commands intercept direct code edits.
+None of these commands intercept direct code edits.
 
-The v0.1 export is input for the planned `write-eval` module. `run-eval` and
-`loop-and-implement` are also planned. Say clearly that they are unavailable;
-never report a baseline, generated task package, executed test or implementation
-that did not happen. Continue other user-authorized work with available tools,
+The export is the input of the `write-eval` skill, which turns it into eval
+packages; `run-eval` then runs them. Hand over to those skills when the user
+wants evals; do not write packages or run anything from here.
+`loop-and-implement` is planned. Say clearly that it is unavailable; never
+report a baseline, generated task package, executed test or implementation that
+did not happen. Continue other user-authorized work with available tools,
 without representing it as an implemented Genesis EDD command.

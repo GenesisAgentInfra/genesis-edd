@@ -1,0 +1,4 @@
+[
+  { "case": "submit-failure-s1", "check": "c1", "expected": "fail", "reason": "Before the change the notification is sent whatever the submission returns." },
+  { "case": "submit-success-s1", "check": "c1", "expected": "pass", "reason": "A successful submission already sends one notification; this guards it." }
+]

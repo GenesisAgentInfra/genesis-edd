@@ -16,19 +16,24 @@ const LEGACY_SKILL_HASHES = {
   'scripts/run.mjs': 'sha256:881a4b48652d858fa99c6cccacd9549910b64631152884beef6bb88a70fc1e9a',
   'scripts/.gitignore': 'sha256:141fc8419b0378e8ff6d3161f01cb89a1165dc7b7230df4448f63bb3797d2735',
 };
-// Earlier shipped versions of the agent-spec files. init updates an untouched
+export const SKILLS = ['agent-spec', 'write-eval', 'run-eval'];
+// Earlier shipped versions of skill and schema files. init updates an untouched
 // copy and still refuses to replace an edited one. Add the outgoing hash here
-// whenever a shipped skill file changes.
+// whenever a shipped file changes.
+const PREVIOUS_SCHEMA_HASHES = [LEGACY_SCHEMA_HASH, 'sha256:196585c6747f342958a2ebf70b2e29b312664302c0d79e6b15f658b549a2371b'];
 const PREVIOUS_SKILL_HASHES = {
-  'SKILL.md': [
+  'agent-spec/SKILL.md': [
     'sha256:125c0caf12be5e2e0dac8bb9758105173260d842e9cfe144f3b4d38a1ebc7871',
     'sha256:3cf1a64417fefb329d1a099070c461172a6ae2d7d495fa1a1f1cfdb6aaad9fb5',
+    'sha256:f75b8f0f8992fdeb62442b8b3c0cbac772c783a4069d9072a43722e0b307c2a5',
   ],
-  'references/spec-format.md': [
+  'agent-spec/references/spec-format.md': [
     'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
     'sha256:99a3389ea7a87d2c61077a5f81252d39f594d6e86d5ad21f939c779020b56619',
   ],
 };
+// Files Genesis itself writes are not changes to the application.
+const GENERATED = ['openspec/', '.genesis/', ...SKILLS.flatMap((skill) => [`.agents/skills/${skill}/`, `.claude/skills/${skill}/`])];
 export const digest = (value) => `sha256:${createHash('sha256').update(value).digest('hex')}`;
 export const readJSON = (file) => JSON.parse(readFileSync(file, 'utf8'));
 
@@ -115,11 +120,11 @@ export function initProject(repo, mode, agent) {
   const schemaRoot = path.join(ROOT, 'schemas', SCHEMA);
   for (const file of listFiles(schemaRoot)) {
     const relative = path.relative(schemaRoot, file);
-    add(`openspec/schemas/${SCHEMA}/${relative}`, readFileSync(file, 'utf8'), relative === 'schema.yaml' ? LEGACY_SCHEMA_HASH : undefined);
+    add(`openspec/schemas/${SCHEMA}/${relative}`, readFileSync(file, 'utf8'), relative === 'schema.yaml' ? PREVIOUS_SCHEMA_HASHES : undefined);
   }
   const agentDirs = agent === 'both' ? ['.agents', '.claude'] : agent === 'none' ? [] : [agent === 'codex' ? '.agents' : '.claude'];
-  const skillRoot = path.join(ROOT, 'skills/agent-spec');
   const runtime = `${JSON.stringify({ cli: path.join(ROOT, 'bin/genesis-edd.js') }, null, 2)}\n`;
+  const launcher = path.join(ROOT, 'skills/agent-spec/scripts');
   for (const directory of agentDirs) {
     const legacy = localPath(repo, `${directory}/skills/genesis-spec`);
     if (existsSync(legacy)) {
@@ -131,11 +136,17 @@ export function initProject(repo, mode, agent) {
       }
       legacySkills.push(legacy);
     }
-    for (const file of listFiles(skillRoot)) {
-      const relative = path.relative(skillRoot, file).split(path.sep).join('/');
-      add(`${directory}/skills/agent-spec/${relative}`, readFileSync(file, 'utf8'), PREVIOUS_SKILL_HASHES[relative]);
+    for (const skill of SKILLS) {
+      const skillRoot = path.join(ROOT, 'skills', skill);
+      const sources = listFiles(skillRoot).map((file) => [path.relative(skillRoot, file), file]);
+      // Every skill starts the CLI through the same launcher, kept once in agent-spec.
+      if (skill !== 'agent-spec') sources.push(...listFiles(launcher).map((file) => [path.join('scripts', path.relative(launcher, file)), file]));
+      for (const [relative, file] of sources) {
+        const target = relative.split(path.sep).join('/');
+        add(`${directory}/skills/${skill}/${target}`, readFileSync(file, 'utf8'), PREVIOUS_SKILL_HASHES[`${skill}/${target}`]);
+      }
+      add(`${directory}/skills/${skill}/scripts/runtime.json`, runtime);
     }
-    add(`${directory}/skills/agent-spec/scripts/runtime.json`, runtime);
   }
   // Check the entire install before writing anything; never replace custom files.
   for (const write of writes) {
@@ -174,19 +185,22 @@ export function changeDirectory(repo, name) {
   return localPath(repo, `openspec/changes/${name}`);
 }
 
-export function captureContext(repo, mode, mapFile) {
+// Commit and application files changed since it; null where Git cannot say.
+export function codeState(repo) {
   const git = (args) => {
-    const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', timeout: 10_000 });
+    const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 * 1024 });
     return result.status === 0 ? result.stdout.trim() : null;
   };
-  const head = git(['rev-parse', '--verify', 'HEAD']);
-  // Files Genesis itself writes are not changes to the application.
-  const generated = ['openspec/', '.genesis/', '.agents/skills/agent-spec/', '.claude/skills/agent-spec/'];
   const status = git(['-c', 'core.quotepath=off', 'status', '--porcelain', '--untracked-files=all']);
-  const workingTree = status === null ? null : status.split('\n')
-    .map((line) => line.trimStart().replace(/^\S{1,2}\s+/, '').split(' -> ').pop().replace(/^"/, ''))
-    .filter((file) => file && !generated.some((prefix) => file.startsWith(prefix)))
-    .join('\n');
+  const changed = status === null ? null : status.split('\n')
+    .map((line) => line.trimStart().replace(/^\S{1,2}\s+/, '').split(' -> ').pop().replace(/^"/, '').replace(/"$/, ''))
+    .filter((file) => file && !GENERATED.some((prefix) => file.startsWith(prefix)));
+  return { head: git(['rev-parse', '--verify', 'HEAD']), changed, git };
+}
+
+export function captureContext(repo, mode, mapFile) {
+  const { head, changed } = codeState(repo);
+  const workingTree = changed === null ? null : changed.join('\n');
   let map = { status: mode === 'new' ? 'not_applicable' : 'missing', reason: mode === 'new' ? 'new_project' : 'not_provided' };
   if (mapFile) {
     const file = path.resolve(repo, mapFile);
