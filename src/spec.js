@@ -114,11 +114,13 @@ function readImpact(repo, file, mapFlows, fail) {
     const [, target, line] = /^(.*?)(?::(\d+))?$/.exec(item.evidence.trim());
     const source = path.resolve(repo, target);
     let lines = null;
+    // Evidence is read from the working tree. Once the Spec is exported, the
+    // code may move on; frozenSpec decides what such a mismatch means then.
     try {
       if (!source.startsWith(`${repo}${path.sep}`)) throw new Error('outside the project');
       lines = readFileSync(source, 'utf8').split('\n').length;
-    } catch { fail(`${label} evidence does not point to a file in the project: ${item.evidence}`); }
-    if (lines !== null && line && (Number(line) < 1 || Number(line) > lines)) fail(`${label} evidence line is outside the file: ${item.evidence}`);
+    } catch { fail(`${label} evidence does not point to a file in the project: ${item.evidence}`, true); }
+    if (lines !== null && line && (Number(line) < 1 || Number(line) > lines)) fail(`${label} evidence line is outside the file: ${item.evidence}`, true);
     if (item.flow !== undefined && !nonempty(item.flow)) fail(`${label} flow must be a Map flow ID when given.`);
     else if (nonempty(item.flow) && mapFlows && !mapFlows.has(item.flow)) fail(`${label} flow is not in the recorded Map: ${item.flow}`);
     const flowName = nonempty(item.flow) ? mapFlows?.get(item.flow) : undefined;
@@ -292,7 +294,8 @@ export function validateSpec(repo, name) {
   }
   const impactFile = localPath(repo, `openspec/changes/${name}/impact.md`);
   if (existsSync(impactFile)) {
-    impact = readImpact(repo, impactFile, mapFlows, (message) => error('impact_invalid', `impact.md: ${message}`, { path: 'impact.md' }));
+    impact = readImpact(repo, impactFile, mapFlows, (message, workingTree) => error('impact_invalid', `impact.md: ${message}`,
+      { path: 'impact.md', ...(workingTree ? { working_tree: true } : {}) }));
   } else if (context.project_mode === 'existing') {
     warnings.push('No impact.md for an existing project: the entries and flows this request touches are not recorded.');
   }
@@ -337,10 +340,28 @@ export function handoffStatus({ file, handoff }) {
   catch { return 'invalid'; }
 }
 
+// impact.md evidence names files and lines of the code as it was when the Spec
+// was exported. Code written for the change may move or remove them; that does
+// not change the exported Spec. When nothing else is wrong and that exact
+// export exists, it stays usable, with a warning. A new export still needs
+// evidence that matches the working tree.
+function settledEvidence(repo, name, validation) {
+  const moved = validation.gaps.filter((gap) => gap.working_tree);
+  if (!moved.length || moved.length !== validation.gaps.length || validation.blockers.length) return { validation, moved: [] };
+  if (handoffStatus(specHandoff(repo, name, validation)) !== 'valid') return { validation, moved: [] };
+  const messages = new Set(moved.map((gap) => gap.message));
+  return {
+    moved: moved.map((gap) => gap.message),
+    validation: { ...validation, valid: true, ready_for_eval_design: true, gaps: [],
+      errors: validation.errors.filter((message) => !messages.has(message)),
+      warnings: [...validation.warnings, `The code moved since the Spec was exported: ${moved.map((gap) => gap.message).join(' ')} The export keeps the evidence as it was; a new export needs evidence that matches the code.`] },
+  };
+}
+
 // The Spec as later stages may read it: valid, with every business decision
 // settled, and exported unchanged. Anything short of that comes back as gaps.
 export function frozenSpec(repo, name, { exported = true } = {}) {
-  const validation = validateSpec(repo, name);
+  const { validation, moved } = settledEvidence(repo, name, validateSpec(repo, name));
   const gaps = [...validation.gaps];
   let handoff;
   if (validation.ready_for_eval_design) {
@@ -354,11 +375,11 @@ export function frozenSpec(repo, name, { exported = true } = {}) {
         message: 'Export the current validated Spec. Older exports do not represent the current draft.' });
     } else handoff = expected;
   }
-  return { validation, gaps, handoff };
+  return { validation, gaps, handoff, moved_evidence: moved };
 }
 
 export function exportSpec(repo, name) {
-  const result = validateSpec(repo, name);
+  const { validation: result } = settledEvidence(repo, name, validateSpec(repo, name));
   if (!result.ready_for_eval_design) {
     throw Object.assign(new Error(`Spec is not ready for Eval design: ${[...result.errors, ...result.blockers].join('; ')}`), {
       code: 'SPEC_INPUT_BLOCKED', gaps: result.gaps,

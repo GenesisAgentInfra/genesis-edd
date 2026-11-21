@@ -201,6 +201,43 @@ test('impact records touched flows and evidence, checked against the Map and the
   assert.match(validateSpec(repo, 'report-notifications').errors.join('\n'), /genesis_impact: 1/);
 });
 
+test('code that moves impact evidence after export keeps that export usable, not a new one', (t) => {
+  const repo = project(t, 'existing');
+  mkdirSync(path.join(repo, 'app'));
+  const source = path.join(repo, 'app/notify.py');
+  writeFileSync(source, 'def notify():\n    return True\n');
+  newSpec(repo, 'report-notifications');
+  writeSpec(repo);
+  const impactFile = path.join(repo, 'openspec/changes/report-notifications/impact.md');
+  const impact = '---\ngenesis_impact: 1\nentries:\n  - entry: notify()\n    effect: changes\n    evidence: app/notify.py:2\n---\n';
+  writeFileSync(impactFile, impact);
+  const exported = exportSpec(repo, 'report-notifications');
+
+  for (const move of [() => writeFileSync(source, 'pass'), () => rmSync(source)]) {
+    move();
+    const strict = validateSpec(repo, 'report-notifications');
+    assert.equal(strict.valid, false);
+    assert.equal(strict.gaps.find((gap) => gap.code === 'impact_invalid').working_tree, true);
+    const check = checkWorkflow(repo, 'write-eval', 'report-notifications');
+    assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
+    assert.equal(check.handoff.id, exported.id);
+    assert.match(check.warnings.join('\n'), /moved since the Spec was exported/);
+    assert.equal(exportSpec(repo, 'report-notifications').id, exported.id);
+  }
+
+  // A changed impact.md is a new export, and a new export needs current evidence.
+  writeFileSync(impactFile, impact.replace('effect: changes', 'effect: may_affect'));
+  const check = checkWorkflow(repo, 'write-eval', 'report-notifications');
+  assert.equal(check.status, 'blocked');
+  assert.ok(check.gaps.some((gap) => gap.code === 'impact_invalid'));
+  assert.throws(() => exportSpec(repo, 'report-notifications'), /does not point to a file/);
+
+  // Any other problem keeps the export blocked even when evidence also moved.
+  writeFileSync(impactFile, impact);
+  writeSpec(repo, fixture.replace('source: request', 'source: unknown'));
+  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').status, 'blocked');
+});
+
 test('confirmed interpretations need an actor and actual confirmation reference', (t) => {
   const { repo, file } = authored(t, fixture.replace('state: explicit', 'state: confirmed'));
   assert.equal(validateSpec(repo, 'report-notifications').valid, false);

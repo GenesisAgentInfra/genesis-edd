@@ -61,7 +61,10 @@ The expectation file is a JSON array. Keep it beside the packages, as
 
 - A baseline is the code before the change. Never rerun it on changed code, and
   never treat a first head run as one. If packages changed since the baseline,
-  the affected checks are reported as `head_only`.
+  the affected checks are reported as `head_only`. While a loop runs for the
+  Spec, head runs compare with the loop's baseline, and any base record,
+  `--unavailable` included, is refused on code other than the loop's starting
+  code.
 - Do not edit a check, an expectation or the Spec to produce a failing
   baseline or a passing head. A baseline that does not match its expectation is
   recorded as a mismatch and investigated.
@@ -76,6 +79,11 @@ The expectation file is a JSON array. Keep it beside the packages, as
 ## Recover gaps
 
 - `baseline_missing`: record the baseline first, as in step 2.
+- `baseline_after_change`: a loop for this Spec is running and the code is no
+  longer the code it started from. Do not record a baseline on it; see
+  `loop-and-implement`.
+- `loop_baseline_missing`: the loop's baseline run folder is gone. Restore it,
+  or record a baseline on the loop's starting code and restart the loop.
 - `harness_missing`: name the evaluated agent with `--agent`, or write
   `.genesis/edd/harness/harness.json`; see the write-eval environment reference.
 - `harbor_missing`, `docker_unavailable`: fix the machine, then rerun the

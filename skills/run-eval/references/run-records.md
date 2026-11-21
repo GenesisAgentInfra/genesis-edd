@@ -26,10 +26,11 @@ replace an earlier run.
 | Identity | `spec_snapshot` | The change and the exported handoff the packages were written for. |
 | Baseline | `is_baseline` | True only for a base run that actually executed. |
 | Baseline | `baseline` | The baseline run a head run is compared with, or `null`. |
+| Baseline | `base_run` | Head runs: the base record they were compared with, a baseline or the record of an unavailable one. While a loop runs, it is always the loop's baseline. |
 | Baseline | `baseline_unavailable_reason` | `no_implementation`, `execution_blocked` or `incompatible_tasks` when there is no usable baseline. |
-| Baseline | `baseline_expectations` | Base runs: the expected result of each check and the reason, fixed before the code changed. |
+| Baseline | `baseline_expectations` | Base runs that execute: the expected result of every declared check and the reason, fixed before the code changed, including packages that could not run yet. Empty for an unavailable baseline. |
 | Baseline | `baseline_mismatch` | Base runs: checks whose result differs from the expectation. |
-| Snapshot | `code_snapshot` | The commit, the application files that differ from it with their digests, a digest of it all, and `patch`: `code.patch` in the run folder holds those differences. The commit plus the patch restore the exact code. A file such as `.dockerignore` counts, because it changes what the image holds; `.genesis/`, `openspec/` and the installed skills do not. |
+| Snapshot | `code_snapshot` | The commit, the application files that differ from it with their digests, a digest of the code, and `patch`: `code.patch` in the run folder holds those differences. The commit plus the patch restore the exact code. The digest covers content only, every file the run saw, committed or not; `digest_of` is `content`. Committing the same code keeps the digest, so a commit alone is not a code change. A file such as `.dockerignore` counts, because it changes what the image holds; `.genesis/`, `openspec/` and the installed skills do not. Records without `digest_of` come from an earlier version whose digest included the commit: they compare by their commit when they had no uncommitted change, and otherwise not at all. |
 | Snapshot | `task_digest` | Digest of each package together with the project kit. Only identical ones are compared. |
 | Snapshot | `environment_ref` | Harbor version, agent, model, attempts and each case's dependencies with their mode. |
 | Snapshot | `map_ref` | The Map recorded with the Spec, or `null`. |
@@ -39,7 +40,10 @@ replace an earlier run.
 
 Each entry names `case`, `check`, `intent` and `role`, with `before` (the
 baseline result, or `null` with `before_unavailable_reason`), `after`, the
-`verdict` and the verifier's `evidence`.
+`verdict` and the verifier's `evidence`. `before_unavailable_reason` is the
+baseline's own reason when no baseline ran, `not_run_at_baseline` for a package
+the baseline did not run, and `incompatible_tasks` for a package that changed
+since. `base_run` names the base record, as in `run.json`.
 
 | Verdict | Meaning |
 | --- | --- |

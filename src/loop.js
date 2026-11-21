@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { codeState, readJSON, writeJSON } from './project.js';
+import { codeState, digest, isGenerated, readJSON } from './project.js';
 import { eddDirectory, validateEval } from './eval.js';
-import { codeSnapshot, ignoreRecords, readRuns, recordedBaseline } from './run.js';
+import { activeLoop, codeSnapshot, ignoreRecords, pinnedBase, readRuns, recordedBaseline, restoreHint, sameCode, savePatch, startCode } from './run.js';
 
 const TEMPLATE_MARK = 'GENESIS_EDD_TEMPLATE';
 const SECTIONS = ['Result', 'Cause', 'Changes', 'Next'];
@@ -19,16 +20,47 @@ function blocked(message, repo, name, gaps) {
 
 const loopFile = (repo, name) => path.join(eddDirectory(repo, name), 'loop.json');
 const reportFile = (repo, name, runId) => path.join(eddDirectory(repo, name), 'reports', `${runId}.md`);
+const acceptedFile = (repo, name) => path.join(eddDirectory(repo, name), 'accepted.json');
 
-// What the loop needs before it may change code. Read-only.
-export function loopInputs(repo, name) {
+// loop.json is replaced when a loop restarts or its budget is raised. A
+// restarted loop keeps the loops before it under previous.
+function saveLoop(repo, name, loop) {
+  const file = loopFile(repo, name);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, `${JSON.stringify(loop, null, 2)}\n`);
+}
+
+function budgetOptions(options) {
+  const iterations = options.iterations ?? 5;
+  const minutes = options.minutes ?? 60;
+  if (!Number.isInteger(iterations) || iterations < 1 || !(minutes > 0)) throw new Error('--max-iterations is a whole number of 1 or more and --max-minutes a number above 0.');
+  return { iterations, minutes };
+}
+
+const without = (value, key) => Object.fromEntries(Object.entries(value).filter(([entry]) => entry !== key));
+
+// An acceptance belongs to the loop it was given in: the same Spec, and the
+// same start. Records written before loops were named are matched by run.
+const acceptedIn = (record, loop, runs) => record?.spec?.sha256 === loop.spec
+  && (record.loop_started_at ? record.loop_started_at === loop.started_at : runs.some((run) => run.run_id === record.run_id));
+
+// What the loop needs before it may change code. Read-only. While a loop runs
+// for the Spec, its baseline is the one it pinned; latest asks for the
+// baseline a new or restarted loop would pin instead.
+export function loopInputs(repo, name, { latest = false } = {}) {
   const evals = validateEval(repo, name);
   // Packages still waiting for a connection are expected in a project with no
   // implementation yet: building that connection is part of the loop.
   const gaps = evals.gaps.filter((entry) => entry.code !== 'integration_pending');
-  const base = evals.spec ? recordedBaseline(repo, name, evals.spec) : null;
-  if (evals.spec && !base) {
-    gaps.push(gap('baseline_missing', 'run-eval', 'Record the baseline first: `run start --baseline --expect FILE`, or `--baseline --unavailable no_implementation` when nothing can run yet.'));
+  const loop = !latest && evals.spec ? activeLoop(repo, name, evals.spec) : null;
+  let base = null;
+  if (loop) {
+    const pinned = pinnedBase(repo, name, loop);
+    base = pinned.run;
+    if (pinned.gap) gaps.push(pinned.gap);
+  } else if (evals.spec) {
+    base = recordedBaseline(repo, name, evals.spec);
+    if (!base) gaps.push(gap('baseline_missing', 'run-eval', 'Record the baseline first: `run start --baseline --expect FILE`, or `--baseline --unavailable no_implementation` when nothing can run yet.'));
   }
   const code = codeState(repo);
   if (code.changed === null) {
@@ -43,28 +75,79 @@ const readLoop = (repo, name) => (existsSync(loopFile(repo, name)) ? readJSON(lo
 // it ran on, the packages as they were, and the budget the user agreed to.
 // Nothing has to be committed: every run keeps its code as commit plus patch.
 export function startLoop(repo, name, options = {}) {
-  const iterations = options.iterations ?? 5;
-  const minutes = options.minutes ?? 60;
-  if (!Number.isInteger(iterations) || iterations < 1 || !(minutes > 0)) throw new Error('--max-iterations is a whole number of 1 or more and --max-minutes a number above 0.');
-  const { evals, base, code, gaps } = loopInputs(repo, name);
+  const { iterations, minutes } = budgetOptions(options);
+  const { evals, base, code, gaps } = loopInputs(repo, name, { latest: true });
   const current = readLoop(repo, name);
-  if (current && current.spec === evals.spec && !options.restart) {
-    gaps.push(gap('loop_running', 'loop-and-implement', `A loop for this Spec started at ${current.started_at}. Continue it with \`loop status\`, or pass --restart to start over.`));
+  const same = Boolean(current && evals.spec && current.spec === evals.spec);
+  if (same && !options.restart) {
+    gaps.push(gap('loop_running', 'loop-and-implement', `A loop for this Spec started at ${current.started_at}. Continue it with \`loop status\`, raise its budget with \`loop extend\` once the user agrees, or pass --restart to start it over.`));
   }
-  // The baseline must be the code the loop starts from, or comparisons mislead.
-  if (base?.is_baseline && code.changed !== null && base.code_snapshot?.digest !== codeSnapshot(repo).snapshot.digest) {
-    gaps.push(gap('baseline_not_at_start', 'run-eval', `The code changed after the baseline ${base.run_id}. If the change only served the evals, such as .dockerignore, record the baseline again with the same --expect file. Otherwise restore the baseline's code first: its commit plus its code.patch.`));
+  const snapshot = code.changed === null ? null : codeSnapshot(repo).snapshot;
+  // A restart keeps the code before the change: the code the first loop of
+  // this Spec started from. A loop written before that was recorded started
+  // where its baseline ran, when one ran.
+  const pinned = same && !current.start_code ? readRuns(path.join(eddDirectory(repo, name), 'runs')).find((run) => run.run_id === current.baseline) : null;
+  const kept = same ? current.start_code ?? (pinned?.is_baseline ? startCode(current.base_commit ?? null, pinned.code_snapshot, repo) : null) : null;
+  if (base && snapshot) {
+    if (kept?.digest) {
+      // The baseline the loop already had was checked when it started; a newer
+      // one must have run on the same starting code.
+      if (base.run_id !== current.baseline && sameCode(base.code_snapshot, kept, repo) !== true) {
+        const before = readRuns(path.join(eddDirectory(repo, name), 'runs')).find((run) => run.run_id === current.baseline) ?? null;
+        gaps.push(gap('baseline_not_at_start', 'run-eval', `A restart keeps the loop's starting code, ${restoreHint(name, { start_code: kept }, before)}. The baseline ${base.run_id} ran on other code. Record the baseline on the starting code, then run this again. To go on from the current code instead, use \`loop status\`, or \`loop extend\` once the user agrees to more budget.`));
+      }
+    } else if (base.is_baseline && sameCode(base.code_snapshot, snapshot, repo) !== true) {
+      // The baseline must be the code the loop starts from, or comparisons mislead.
+      gaps.push(gap('baseline_not_at_start', 'run-eval', `The code changed after the baseline ${base.run_id}. If the change only served the evals, such as .dockerignore, record the baseline again with the same --expect file. Otherwise restore the baseline's code first: its commit plus its code.patch.`));
+    }
   }
   if (gaps.length) throw blocked(`The loop cannot start: ${gaps.map((entry) => entry.message).join(' ')}`, repo, name, gaps);
-  const loop = {
-    schema_version: '1.0', change: name, started_at: new Date().toISOString(),
-    spec: evals.spec, baseline: base.run_id, baseline_available: base.is_baseline === true,
-    base_commit: code.head, budget: { iterations, minutes },
-    task_digest: Object.fromEntries(evals.cases.map((item) => [item.id, item.task_digest])),
-  };
-  writeJSON(loopFile(repo, name), loop);
   ignoreRecords(repo);
+  let start = kept;
+  if (!start) {
+    // The starting code is kept as its commit plus a patch of what the commit
+    // does not hold, so it can be restored to record a baseline on it.
+    const file = path.join(eddDirectory(repo, name), 'loop-start.patch');
+    rmSync(file, { force: true });
+    const patch = savePatch(repo, snapshot, file);
+    start = startCode(code.head, snapshot, repo, patch);
+  }
+  const now = new Date().toISOString();
+  const loop = {
+    schema_version: '1.0', change: name, started_at: now,
+    spec: evals.spec, baseline: base.run_id, baseline_available: base.is_baseline === true,
+    base_commit: start.commit,
+    // The code before the change. While the loop runs, every base record must
+    // describe this code.
+    start_code: start,
+    budget: { iterations, minutes },
+    // The minutes of the budget count from here; raising the budget restarts them.
+    clock_started_at: now, extensions: [],
+    task_digest: Object.fromEntries(evals.cases.map((item) => [item.id, item.task_digest])),
+    ...(current ? { previous: [...(current.previous ?? []), without(current, 'previous')] } : {}),
+  };
+  saveLoop(repo, name, loop);
   return { loop, next: { action: 'loop_status', command: ['loop', 'status', name, '--repo', repo] } };
+}
+
+// Raises the budget of the running loop when the user agrees to go on: N more
+// full runs from now, and M minutes from now. Runs, reports and the baseline
+// stay as they are.
+export function extendLoop(repo, name, options = {}) {
+  const { iterations, minutes } = budgetOptions(options);
+  const status = loopStatus(repo, name);
+  if (['restart', 'repair_spec'].includes(status.next.action)) {
+    throw blocked(`The loop cannot be extended: ${status.next.message}`, repo, name, [gap('spec_changed', status.next.route, status.next.message, status.next.owner ?? 'agent')]);
+  }
+  const loop = readLoop(repo, name);
+  const now = new Date().toISOString();
+  const used = status.loop.used.iterations;
+  const extended = {
+    ...loop, budget: { iterations: used + iterations, minutes }, clock_started_at: now,
+    extensions: [...(loop.extensions ?? []), { at: now, runs_used: used, iterations, minutes }],
+  };
+  saveLoop(repo, name, extended);
+  return { loop: extended, next: { action: 'loop_status', command: ['loop', 'status', name, '--repo', repo] } };
 }
 
 const compareOf = (runs, run) => {
@@ -101,7 +184,8 @@ export function loopStatus(repo, name) {
   const runs = ours.filter((run) => (run.scope ?? 'full') === 'full');
   const latest = runs.at(-1) ?? null;
   const previous = runs.at(-2) ?? null;
-  const warnings = [];
+  const warnings = [...evals.warnings];
+  if (!base) warnings.push(`The loop's baseline ${loop.baseline} is no longer in runs/. Head runs are refused until it is restored or the loop restarts.`);
 
   // Each check through the loop: the baseline, then every full run.
   const results = runs.map((run) => new Map(compareOf(runsDirectory, run).map((entry) => [`${entry.case}\n${entry.check}`, entry])));
@@ -118,9 +202,16 @@ export function loopStatus(repo, name) {
       } catch { /* no evidence */ }
     }
   }
+  // A baseline result says something about a run only for a package that ran
+  // in the baseline exactly as it ran then. A fixed verifier or kit makes it a
+  // different package.
+  const current = new Map(evals.cases.map((item) => [item.id, item.task_digest]));
+  const ranAtBase = (id) => base?.is_baseline === true && (base.cases ?? []).some((item) => item.id === id);
+  const comparable = (id, digestOf) => ranAtBase(id) && base.task_digest?.[id] !== undefined && base.task_digest[id] === digestOf;
   const checks = keys.map((key) => {
     const id = `${key.case}\n${key.check}`;
-    return { ...key, baseline: baseResults.get(id) ?? null, runs: results.map((map) => map.get(id)?.after ?? null),
+    return { ...key, baseline: baseResults.get(id) ?? null, baseline_comparable: comparable(key.case, current.get(key.case)),
+      runs: results.map((map) => map.get(id)?.after ?? null),
       verdict: results.at(-1)?.get(id)?.verdict ?? null, evidence: results.at(-1)?.get(id)?.evidence ?? null };
   });
   const failing = (index) => checks.filter((entry) => entry.role === 'gating' && entry.runs[index] !== 'pass')
@@ -128,30 +219,61 @@ export function loopStatus(repo, name) {
   // A regression breaks what worked before the change: a gating check that
   // passed in the baseline, or in the run before when there is no baseline
   // result, fails now. A check that only passed during the loop and fails
-  // again is lost progress: worth a look, not a reason to unwind.
+  // again is lost progress: worth a look, not a reason to unwind. Either
+  // compares only results of the same package.
   const brief = ({ case: id, check, intent }) => ({ case: id, check, intent });
   const fails = (entry) => entry.role === 'gating' && entry.runs.at(-1) === 'fail';
-  const regressions = latest ? checks.filter((entry) => fails(entry)
-    && (entry.baseline === 'pass' || (entry.baseline === null && entry.runs.at(-2) === 'pass'))).map(brief) : [];
-  const lost = latest ? checks.filter((entry) => fails(entry) && entry.baseline === 'fail' && entry.runs.at(-2) === 'pass').map(brief) : [];
+  const change = (entry) => {
+    if (!latest || !fails(entry)) return null;
+    const baseline = comparable(entry.case, latest.task_digest?.[entry.case]) && ['pass', 'fail'].includes(entry.baseline) ? entry.baseline : null;
+    const before = previous && previous.task_digest?.[entry.case] === latest.task_digest?.[entry.case] ? entry.runs.at(-2) : null;
+    if (baseline === 'pass' || (baseline === null && before === 'pass')) return 'regression';
+    return baseline === 'fail' && before === 'pass' ? 'lost' : null;
+  };
+  const regressions = checks.filter((entry) => change(entry) === 'regression').map(brief);
+  const lost = checks.filter((entry) => change(entry) === 'lost').map(brief);
   if (lost.length) warnings.push(`Passed in the run before and fails again: ${lost.map((entry) => `${entry.case}/${entry.check}`).join(', ')}. Compare the two commits.`);
-  const sameCode = latest && previous && latest.code_snapshot?.digest === previous.code_snapshot?.digest;
-  const stuck = Boolean(latest && previous && !sameCode && latest.verdict !== 'pass'
+  const repeated = latest && previous ? sameCode(latest.code_snapshot, previous.code_snapshot, repo) : null;
+  const stuck = Boolean(latest && previous && repeated !== true && latest.verdict !== 'pass'
     && failing(runs.length - 1).length && failing(runs.length - 1).join() === failing(runs.length - 2).join());
-  if (sameCode) warnings.push('The last two runs used the same code. Running again without a change shows nothing new.');
+  if (repeated) warnings.push('The last two runs used the same code. Running again without a change shows nothing new.');
 
-  const used = { iterations: runs.length, minutes: Math.round((Date.now() - Date.parse(loop.started_at)) / 60_000) };
+  // Minutes count from the start of the loop or from the last time the user
+  // raised the budget, so a wait for the user is not spent twice.
+  const clock = loop.clock_started_at ?? loop.started_at;
+  const used = { iterations: runs.length, minutes: Math.round((Date.now() - Date.parse(clock)) / 60_000) };
   const exhausted = used.iterations >= loop.budget.iterations || used.minutes >= loop.budget.minutes;
   const changedPackages = evals.cases.filter((item) => loop.task_digest[item.id] !== item.task_digest).map((item) => item.id);
   if (changedPackages.length) warnings.push(`Changed since the loop started: ${changedPackages.join(', ')}. Their checks now compare with no baseline result (head_only). Say why in the report's Cause.`);
   const reports = Object.fromEntries(runs.map((run) => [run.run_id, reportGaps(repo, name, run)]));
+  let accepted = null;
+  try { accepted = existsSync(acceptedFile(repo, name)) ? readJSON(acceptedFile(repo, name)) : null; } catch {
+    warnings.push('accepted.json cannot be read. Restore it; it records the user\'s acceptance.');
+  }
+  if (!acceptedIn(accepted, loop, runs)) accepted = null;
+  const acceptedCode = accepted && (runs.find((run) => run.run_id === accepted.run_id)?.code_snapshot ?? { digest: accepted.code_digest });
+  if (accepted && sameCode(acceptedCode, codeSnapshot(repo).snapshot, repo) === false) warnings.push(`The code changed after the accepted run ${accepted.run_id}. The acceptance covers that run's code only.`);
 
   const command = (...words) => [...words, name, '--repo', repo];
+  const stopBudget = (detail) => ({ action: 'stop_budget', owner: 'user',
+    command: [...command('loop', 'extend'), '--max-iterations', '<N>', '--max-minutes', '<M>'],
+    message: `The budget is used up (${used.iterations} of ${loop.budget.iterations} runs, ${used.minutes} of ${loop.budget.minutes} minutes).${detail ? ` ${detail}` : ''} Stop and report what still fails. Go on only if the user raises the budget: \`loop extend\`.` });
   let next;
-  if (evals.spec !== loop.spec) {
+  if (!evals.spec) {
+    // The Spec no longer matches the export this loop started from. That is
+    // not a new export: nothing is restarted until the cause is known.
+    const edited = evals.gaps.some((entry) => entry.code === 'handoff_missing');
+    const owner = evals.gaps.some((entry) => entry.owner === 'agent') || edited ? 'agent' : 'user';
+    next = { action: 'repair_spec', owner, route: 'agent-spec',
+      message: `${edited ? `The Spec files differ from the export this loop started from (${loop.spec.slice(7, 19)}).`
+        : `The Spec this loop started from no longer validates: ${evals.gaps.map((entry) => entry.message).join(' ')}`} A loop never changes the Spec: restore what changed. If a requirement itself has to change, that is the user's decision through agent-spec, then a new export and a new loop.` };
+  } else if (evals.spec !== loop.spec) {
     next = { action: 'restart', route: 'write-eval', message: 'The Spec was exported again. Bring the packages in line with write-eval, record a baseline for the new Spec, then `loop start --restart`. Expected results never change inside a loop.' };
+  } else if (accepted) {
+    next = { action: 'done', message: `${accepted.accepted?.by ?? 'The user'} accepted run ${accepted.run_id} (${accepted.accepted?.ref ?? 'no reference'}). The loop is finished. Offer to commit the change, merge it or open a pull request; do none of them without the user.` };
   } else if (latest && latest.execution_status !== 'completed') {
-    next = { action: 'repair_execution', route: 'write-eval', message: `${latest.run_id} did not complete. Read cases[].execution.reason and each logs/harbor.log. An adapter or environment fault goes to write-eval; a build or timeout fault is rerun. Neither is a result of the code.` };
+    next = exhausted ? stopBudget(`The last run, ${latest.run_id}, did not complete.`)
+      : { action: 'repair_execution', route: 'write-eval', message: `${latest.run_id} did not complete. Read cases[].execution.reason and each logs/harbor.log. An adapter or environment fault goes to write-eval; a build or timeout fault is rerun. Neither is a result of the code.` };
   } else if (latest && reports[latest.run_id].length && !(latest.verdict === 'pass' && reports[latest.run_id].every((entry) => entry === 'section Review is empty'))) {
     next = { action: 'write_report', command: command('loop', 'report'), message: `Write the report for ${latest.run_id} before anything else: ${reports[latest.run_id].join('; ')}.` };
   } else if (latest?.verdict === 'pass' && reports[latest.run_id].length) {
@@ -159,12 +281,13 @@ export function loopStatus(repo, name) {
   } else if (latest?.verdict === 'pass') {
     next = { action: 'ask_acceptance', owner: 'user', command: [...command('loop', 'accept'), '--run', latest.run_id, '--by', '<user>', '--ref', '<where they said so>'],
       message: 'Show the user the per-check comparison and the report. Record acceptance only with their own words; a pass is not acceptance.' };
+  } else if (exhausted) {
+    next = stopBudget([regressions.length ? `A check that passed now fails: ${regressions.map((entry) => `${entry.case}/${entry.check}`).join(', ')}.` : '',
+      stuck ? 'The same gating checks failed in the last two runs on different code.' : ''].filter(Boolean).join(' '));
   } else if (regressions.length) {
     next = { action: 'split_changes', message: `A check that passed now fails: ${regressions.map((entry) => `${entry.case}/${entry.check}`).join(', ')}. Restore the code of the last run where it passed (its commit, then \`git apply\` its code.patch) and reapply the changes one at a time to find the one that breaks it.` };
   } else if (stuck) {
     next = { action: 'stop_stuck', owner: 'user', message: `The same gating checks failed in the last two runs on different code: ${failing(runs.length - 1).join(', ')}. Stop, report what was tried, and ask the user how to proceed.` };
-  } else if (exhausted) {
-    next = { action: 'stop_budget', owner: 'user', message: `The budget is used up (${used.iterations} of ${loop.budget.iterations} runs, ${used.minutes} of ${loop.budget.minutes} minutes). Stop and report what still fails.` };
   } else {
     const open = latest ? failing(runs.length - 1) : checks.filter((entry) => entry.role === 'gating' && entry.baseline !== 'pass').map((entry) => `${entry.case}/${entry.check}=${entry.baseline ?? 'no baseline'}`);
     next = { action: 'iterate', message: `Classify, then change the right layer, commit, and run again. Open: ${open.join(', ') || 'none recorded'}.`,
@@ -173,22 +296,42 @@ export function loopStatus(repo, name) {
   return {
     change: name,
     loop: { started_at: loop.started_at, base_commit: loop.base_commit, baseline: loop.baseline,
-      baseline_available: loop.baseline_available, budget: loop.budget, used },
+      baseline_available: loop.baseline_available, budget: loop.budget, clock_started_at: clock,
+      extensions: loop.extensions ?? [], used },
     runs: runs.map((run) => ({ run_id: run.run_id, commit: run.code_snapshot?.commit ?? null, patch: run.code_snapshot?.patch ?? null, execution_status: run.execution_status,
       verdict: run.verdict, report: reports[run.run_id].length ? 'incomplete' : 'complete' })),
-    partial_runs: ours.length - runs.length, checks, regressions, lost_progress: lost, stuck, changed_packages: changedPackages, warnings, next,
+    partial_runs: ours.length - runs.length, checks, regressions, lost_progress: lost, stuck, changed_packages: changedPackages,
+    accepted: accepted ? { run_id: accepted.run_id, by: accepted.accepted?.by ?? null, ref: accepted.accepted?.ref ?? null, at: accepted.accepted?.at ?? null } : null,
+    warnings, next,
   };
 }
 
-// Application files whose content differs between the code of two runs, each
-// recorded as a commit plus the digests of the files that commit does not hold.
-function changedFiles(git, before, after) {
+// Application files whose content differs between the code of two runs. Each
+// run's code is its commit plus the digests of the files that commit does not
+// hold, so a file is compared by its content in each, wherever it lives.
+function changedFiles(repo, before, after) {
   if (!before || !after) return [];
-  const committed = before.commit && after.commit && before.commit !== after.commit
-    ? (git(['-c', 'core.quotepath=off', 'diff', '--name-only', before.commit, after.commit]) ?? '').split('\n') : [];
-  const loose = [...new Set([...Object.keys(before.file_digests ?? {}), ...Object.keys(after.file_digests ?? {})])]
-    .filter((file) => (before.file_digests ?? {})[file] !== (after.file_digests ?? {})[file]);
-  return [...new Set([...committed, ...loose])].filter((file) => file && !file.startsWith('.genesis/') && !file.startsWith('openspec/')).sort();
+  const git = (args, encoding = 'utf8') => spawnSync('git', ['-C', repo, ...args], { encoding, maxBuffer: 256 * 1024 * 1024 });
+  const names = (args) => (git(args).stdout ?? '').split('\0').filter(Boolean);
+  const candidates = new Set([...Object.keys(before.file_digests ?? {}), ...Object.keys(after.file_digests ?? {})]);
+  if (before.commit !== after.commit) {
+    const listed = before.commit && after.commit ? names(['diff', '--no-renames', '--no-ext-diff', '--name-only', '-z', before.commit, after.commit])
+      : [before.commit, after.commit].filter(Boolean).flatMap((commit) => names(['ls-tree', '-r', '--name-only', '-z', commit]));
+    for (const file of listed) candidates.add(file);
+  }
+  // A committed file is read as it would be checked out, so line-ending and
+  // other filters do not count as changes; a submodule is its commit.
+  const content = (snapshot, file) => {
+    if (snapshot.file_digests && file in snapshot.file_digests) return snapshot.file_digests[file];
+    if (!snapshot.commit) return 'deleted';
+    const entry = (git(['--literal-pathspecs', 'ls-tree', '-z', snapshot.commit, '--', file]).stdout ?? '').split('\0')[0];
+    if (!entry) return 'deleted';
+    const [mode, , object] = entry.split(/\s/);
+    if (mode === '160000') return `submodule ${object}`;
+    const shown = git(['cat-file', '--filters', `${snapshot.commit}:${file}`], 'buffer');
+    return shown.status === 0 ? digest(shown.stdout) : 'deleted';
+  };
+  return [...candidates].filter((file) => file && !isGenerated(file) && content(before, file) !== content(after, file)).sort();
 }
 
 // Writes the report skeleton of a full run, with Result taken from the records.
@@ -205,7 +348,7 @@ export function writeReport(repo, name, options = {}) {
   const compare = compareOf(runsDirectory, run);
   const before = index ? readJSON(path.join(runsDirectory, status.runs[index - 1].run_id, 'run.json'))
     : readRuns(runsDirectory).find((entry) => entry.run_id === status.loop.baseline);
-  const files = changedFiles(codeState(repo).git, before?.code_snapshot, run.code_snapshot);
+  const files = changedFiles(repo, before?.code_snapshot, run.code_snapshot);
   const from = index ? `run ${status.runs[index - 1].run_id}` : `the baseline ${status.loop.baseline}`;
   const baseline = run.baseline ?? `unavailable (${run.baseline_unavailable_reason})`;
   const open = compare.filter((entry) => entry.verdict !== 'holds');
@@ -254,27 +397,39 @@ export function acceptLoop(repo, name, options = {}) {
   if (!listed) gaps.push(gap('run_unknown', 'loop-and-implement', `${options.run ?? 'No run'} is not a full run of this loop.`));
   const run = listed ? readJSON(path.join(runsDirectory, listed.run_id, 'run.json')) : null;
   if (run && (run.verdict !== 'pass' || run.execution_status !== 'completed')) gaps.push(gap('not_passing', 'loop-and-implement', `${run.run_id} has verdict ${run.verdict}; only a passing run can be accepted.`));
-  if (status.next.action === 'restart') gaps.push(gap('spec_changed', 'write-eval', status.next.message));
+  if (['restart', 'repair_spec'].includes(status.next.action)) gaps.push(gap('spec_changed', status.next.route, status.next.message, status.next.owner ?? 'agent'));
   if (run) {
     const missing = reportGaps(repo, name, run);
     if (missing.length) gaps.push(gap('report_incomplete', 'loop-and-implement', `The report for ${run.run_id} is incomplete: ${missing.join('; ')}.`));
-    if (codeSnapshot(repo).snapshot.digest !== run.code_snapshot?.digest) {
+    if (sameCode(codeSnapshot(repo).snapshot, run.code_snapshot, repo) !== true) {
       gaps.push(gap('code_changed', 'run-eval', `The code changed after ${run.run_id}. Run again and accept that run.`));
     }
   }
-  const accepted = path.join(eddDirectory(repo, name), 'accepted.json');
-  if (existsSync(accepted)) gaps.push(gap('already_accepted', 'loop-and-implement', `This change was already accepted: ${path.relative(repo, accepted)}.`));
+  const accepted = acceptedFile(repo, name);
+  if (status.accepted) gaps.push(gap('already_accepted', 'loop-and-implement', `This loop was already accepted: run ${status.accepted.run_id}, in ${path.relative(repo, accepted)}.`));
+  // An acceptance from an earlier loop of this change stays in the record.
+  let earlier = [];
+  if (existsSync(accepted)) {
+    try {
+      const previous = readJSON(accepted);
+      earlier = [...(previous.earlier ?? []), without(previous, 'earlier')];
+    } catch {
+      gaps.push(gap('accepted_unreadable', 'loop-and-implement', `${path.relative(repo, accepted)} cannot be read. Restore it before recording a new acceptance; it holds an earlier one.`));
+    }
+  }
   if (gaps.length) throw blocked(`Cannot record acceptance: ${gaps.map((entry) => entry.message).join(' ')}`, repo, name, gaps);
   const compare = compareOf(runsDirectory, run);
   const record = {
-    schema_version: '1.0', change: name, run_id: run.run_id, spec: run.spec_snapshot, baseline: run.baseline,
+    schema_version: '1.0', change: name, run_id: run.run_id, loop_started_at: status.loop.started_at,
+    spec: run.spec_snapshot, baseline: run.baseline,
     baseline_unavailable_reason: run.baseline_unavailable_reason, commit: run.code_snapshot.commit,
     uncommitted_files: run.code_snapshot.changed_files ?? [], code_digest: run.code_snapshot.digest,
     checks: compare.map(({ case: id, check, intent, before, after, verdict }) => ({ case: id, check, intent, before, after, verdict })),
     changed_packages: status.changed_packages,
     accepted: { by: options.by.trim(), ref: options.ref.trim(), at: new Date().toISOString() },
+    ...(earlier.length ? { earlier } : {}),
   };
-  writeJSON(accepted, record);
+  writeFileSync(accepted, `${JSON.stringify(record, null, 2)}\n`);
   return { file: accepted, accepted: record,
     next: 'Acceptance is recorded. Offer to commit the change, merge it or open a pull request; do none of them without the user.' };
 }

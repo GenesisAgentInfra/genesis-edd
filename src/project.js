@@ -35,7 +35,14 @@ const PREVIOUS_SKILL_HASHES = {
   'run-eval/SKILL.md': [
     'sha256:ffb9e10f3f25bffc007ed9381df23cb3d1e31b64dc8088352302158215f75ba7',
     'sha256:0f46f119fcc49a84dff2fd55274aee5ae5c80c9b4c7c99b5d3bc4999d01bded8',
+    'sha256:8559cf63ec10a5d6323d1e620ab163f6c0619018536ec5653efb4507c070d021',
   ],
+  'run-eval/references/run-records.md': [
+    'sha256:0f2bafd0cf20299e5ab7d0f28ffbdbc657450d986d56cd708352ec1e761c5c61',
+    'sha256:389a8ae7e97bd9e0ef6716f17c15fbddaf193a27f65bd4799cd825ef5ecd3024',
+  ],
+  'write-eval/references/harbor.md': ['sha256:560385a1e4ac0c91e0a1699c52b15ef5038181ec6cc9cf3e47bedaedebbabbfa'],
+  'loop-and-implement/SKILL.md': ['sha256:02d47d51ad3bcb6f8899622e70526fbf750a5047ce98661fd4df55e034356921'],
   'agent-spec/references/spec-format.md': [
     'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
     'sha256:99a3389ea7a87d2c61077a5f81252d39f594d6e86d5ad21f939c779020b56619',
@@ -43,6 +50,7 @@ const PREVIOUS_SKILL_HASHES = {
 };
 // Files Genesis itself writes are not changes to the application.
 const GENERATED = ['openspec/', '.genesis/', ...SKILLS.flatMap((skill) => [`.agents/skills/${skill}/`, `.claude/skills/${skill}/`])];
+export const isGenerated = (file) => GENERATED.some((prefix) => file.startsWith(prefix));
 export const digest = (value) => `sha256:${createHash('sha256').update(value).digest('hex')}`;
 export const readJSON = (file) => JSON.parse(readFileSync(file, 'utf8'));
 
@@ -197,10 +205,29 @@ export function codeState(repo) {
     const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 * 1024 });
     return result.status === 0 ? result.stdout.trim() : null;
   };
-  const status = git(['-c', 'core.quotepath=off', 'status', '--porcelain', '--untracked-files=all']);
-  const changed = status === null ? null : status.split('\n')
-    .map((line) => line.trimStart().replace(/^\S{1,2}\s+/, '').split(' -> ').pop().replace(/^"/, '').replace(/"$/, ''))
-    .filter((file) => file && !GENERATED.some((prefix) => file.startsWith(prefix)));
+  // -z gives every path as it is, without the quoting Git applies to names
+  // with quotes, backslashes or control characters.
+  const status = spawnSync('git', ['-C', repo, 'status', '--porcelain', '-z', '--untracked-files=all'],
+    { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 * 1024 });
+  let changed = null;
+  if (status.status === 0) {
+    const entries = status.stdout.split('\0');
+    const files = [];
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (entry.length < 4) continue;
+      const code = entry.slice(0, 2);
+      files.push(entry.slice(3));
+      // A rename or copy is followed by its source path. A renamed file is
+      // gone from its old place, which is a change too.
+      if (/[RC]/.test(code)) {
+        index += 1;
+        if (code.includes('R') && entries[index]) files.push(entries[index]);
+      }
+    }
+    // Sorted, so the identity of the code does not depend on what is staged.
+    changed = [...new Set(files)].filter((file) => !isGenerated(file)).sort();
+  }
   return { head: git(['rev-parse', '--verify', 'HEAD']), changed, git };
 }
 
