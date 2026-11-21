@@ -316,9 +316,10 @@ function validateCase(item, handoff, name, dockerignore, kit, fail) {
 // faithful to the Spec and whether a verifier is sound stay with the author.
 export function validateEval(repo, name) {
   const root = path.join(eddDirectory(repo, name), 'evals');
-  const { gaps: specGaps, handoff } = frozenSpec(repo, name);
+  const { gaps: specGaps, handoff, moved_evidence: moved } = frozenSpec(repo, name);
   const gaps = [...specGaps];
-  const warnings = [];
+  const warnings = moved?.length
+    ? [`impact.md evidence no longer matches the code: ${moved.join(' ')} The exported Spec keeps it as it was.`] : [];
   const report = (cases = [], coverage = null) => {
     const structural = gaps.filter((gap) => gap.kind !== 'business' && gap.code !== 'integration_pending');
     const runnable = cases.filter((item) => item.integration?.state === 'ready' && item.status === 'confirmed' && !item.errors.length);

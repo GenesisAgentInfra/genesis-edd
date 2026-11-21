@@ -1,7 +1,7 @@
 import { changeDirectory } from './project.js';
 import { frozenSpec } from './spec.js';
 import { validateEval } from './eval.js';
-import { recordedBaseline, runTools } from './run.js';
+import { activeLoop, pinnedBase, recordedBaseline, runTools } from './run.js';
 import { hasLoop, loopInputs } from './loop.js';
 
 const stages = ['spec-export', 'write-eval', 'run-eval', 'loop-and-implement'];
@@ -30,6 +30,10 @@ export function checkWorkflow(repo, stage, name) {
       gaps.push({ code: 'no_runnable_case', kind: 'artifact', owner: 'agent', route: 'write-eval',
         message: 'No package is ready to run. `eval validate` lists what each one still needs and `eval check` proves a finished one; a project without an implementation records an unavailable baseline instead.' });
     }
+    // While a loop runs, head runs need the baseline it pinned.
+    const loop = evals.spec ? activeLoop(repo, name, evals.spec) : null;
+    const pinned = loop ? pinnedBase(repo, name, loop).gap : null;
+    if (pinned) gaps.push(pinned);
     if (!gaps.length) gaps.push(...runTools().gaps);
     inputsReady = gaps.length === 0;
   } else if (stage === 'loop-and-implement') {
@@ -43,8 +47,9 @@ export function checkWorkflow(repo, stage, name) {
   const proceed = {
     'spec-export': { action: 'export_spec', command: ['spec', 'export', name, '--repo', repo] },
     'write-eval': { action: 'write_eval', command: ['eval', 'new', name, '--repo', repo] },
-    // The first run of a Spec export is its baseline; a head run would be refused.
-    'run-eval': evals?.spec && !recordedBaseline(repo, name, evals.spec)
+    // The first run of a Spec export is its baseline; a head run would be
+    // refused. A running loop has pinned its baseline already.
+    'run-eval': evals?.spec && !activeLoop(repo, name, evals.spec) && !recordedBaseline(repo, name, evals.spec)
       ? { action: 'record_baseline', command: ['run', 'start', name, '--repo', repo, '--baseline'],
         note: 'Add --expect FILE with the expected baseline result of each check, or --unavailable no_implementation when nothing can run yet.' }
       : { action: 'run_eval', command: ['run', 'start', name, '--repo', repo] },

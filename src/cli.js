@@ -3,7 +3,7 @@ import { initProject, projectRoot } from './project.js';
 import { exportSpec, newSpec, specInstructions, specStatus, validateSpec } from './spec.js';
 import { newEval, validateEval } from './eval.js';
 import { checkEval, startRun } from './run.js';
-import { acceptLoop, loopStatus, startLoop, writeReport } from './loop.js';
+import { acceptLoop, extendLoop, loopStatus, startLoop, writeReport } from './loop.js';
 import { checkWorkflow } from './workflow.js';
 
 const help = `Genesis EDD 0.1.0 — requirements and evals for evaluation-driven development
@@ -22,6 +22,7 @@ genesis-edd run start NAME --repo PATH [--baseline [--unavailable REASON] [--exp
                            [--model MODEL] [--timeout MINUTES] [--yes]
 genesis-edd loop start NAME --repo PATH [--max-iterations N] [--max-minutes M] [--restart]
 genesis-edd loop status NAME --repo PATH
+genesis-edd loop extend NAME --repo PATH [--max-iterations N] [--max-minutes M]
 genesis-edd loop report NAME --repo PATH [--run RUN_ID]
 genesis-edd loop accept NAME --repo PATH --run RUN_ID --by NAME --ref REF
 genesis-edd workflow check STAGE NAME --repo PATH
@@ -32,6 +33,8 @@ CLI model.
 validate exits 1 for malformed specs; valid drafts report ready_for_eval_design=false.
 It rejects more explicit requirements than their quoted source states.
 It checks impact.md, when present, against the recorded Map and the project files.
+Once a Spec is exported, code that moves that evidence is a warning for later
+stages; a new export needs evidence that matches the code.
 export requires a valid spec with no proposed requirements or open questions and
 returns a review of each requirement beside the words and outcomes it rests on.
 The handoff carries structured requirements and impact for later stages.
@@ -48,7 +51,9 @@ run start runs the ready packages with Harbor in local Docker and writes one
 immutable record under .genesis/edd/NAME/runs/. --baseline records the code
 before a change; --unavailable (no_implementation, execution_blocked or
 incompatible_tasks) records why no baseline could run instead of inventing one.
-Later runs are compared with that baseline check by check. run start exits 1
+Later runs are compared with that baseline check by check; while a loop runs,
+with the loop's baseline, and a base record is refused on code other than the
+loop's starting code. run start exits 1
 when execution was blocked or failed; a failing business check is a result.
 --case runs only the named packages: a quick look that never passes.
 --attempts runs each package N times; a check fails if any attempt fails.
@@ -59,10 +64,15 @@ needs a Git repository; nothing has to be committed, because every run stores
 its code as the commit it started from plus code.patch. loop status is
 read-only: it follows every check through the loop's runs and names the next
 step: iterate, write the report, split changes after a regression, stop when
-stuck or out of budget, review, or ask the user to accept. loop report writes a
+stuck or out of budget, review, or ask the user to accept; after acceptance it
+reports done. loop extend raises the budget once the user agrees: N more full
+runs and M minutes from now (default 5 and 60), keeping runs and the baseline.
+loop start --restart starts the loop over, keeping its starting code; while a
+loop runs, every base record must be on that code. loop report writes a
 run's report skeleton under .genesis/edd/NAME/reports/ and never overwrites
 one. loop accept records the user's acceptance of a passing run whose report
-is complete, for the code that ran.
+is complete, for the code that ran. An earlier loop's acceptance is kept in the
+record under earlier.
 workflow check is read-only and returns gaps, repair routes and a resume command.
 Stages: spec-export, write-eval, run-eval, loop-and-implement. Blocked checks
 exit 1. No stage is executed by a check.
@@ -96,7 +106,7 @@ export function main(argv) {
   }
   const init = command === 'init';
   const actions = { spec: ['new', 'instructions', 'status', 'validate', 'export'], eval: ['new', 'validate', 'check'], run: ['start'],
-    loop: ['start', 'status', 'report', 'accept'] }[command];
+    loop: ['start', 'status', 'extend', 'report', 'accept'] }[command];
   if (!init && (!actions?.includes(action) || !name || name.startsWith('-'))) {
     throw new Error('Unknown command. Run genesis-edd --help.');
   }
@@ -115,6 +125,7 @@ export function main(argv) {
   if (command === 'loop') {
     Object.assign(options, {
       start: { 'max-iterations': { type: 'string' }, 'max-minutes': { type: 'string' }, restart: { type: 'boolean' } },
+      extend: { 'max-iterations': { type: 'string' }, 'max-minutes': { type: 'string' } },
       status: {}, report: { run: { type: 'string' } },
       accept: { run: { type: 'string' }, by: { type: 'string' }, ref: { type: 'string' } },
     }[action]);
@@ -133,6 +144,7 @@ export function main(argv) {
   if (command === 'loop') {
     const number = (value) => (value === undefined ? undefined : Number(value));
     if (action === 'start') return startLoop(repo, name, { iterations: number(values['max-iterations']), minutes: number(values['max-minutes']), restart: values.restart });
+    if (action === 'extend') return extendLoop(repo, name, { iterations: number(values['max-iterations']), minutes: number(values['max-minutes']) });
     if (action === 'report') return writeReport(repo, name, values);
     if (action === 'accept') return acceptLoop(repo, name, values);
     return loopStatus(repo, name);

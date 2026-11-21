@@ -157,7 +157,7 @@ project install), or type `$` in Codex and pick the skill.
 | `.genesis/edd/<change>/checks/` | proofs that each package's checks work | no |
 | `.genesis/edd/<change>/runs/` | run records and before/after comparisons | no |
 | `.genesis/edd/<change>/reports/` | one report per run of the implementation loop | yes |
-| `.genesis/edd/<change>/accepted.json` | the user's acceptance of a passing run | yes |
+| `.genesis/edd/<change>/accepted.json` | the user's acceptance of a passing run, with earlier ones | yes |
 
 ## Skills
 

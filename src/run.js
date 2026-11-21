@@ -1,8 +1,9 @@
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { ROOT, codeState, digest, localPath, readJSON, writeJSON } from './project.js';
+import { ROOT, codeState, digest, isGenerated, localPath, readJSON, writeJSON } from './project.js';
 import { eddDirectory, kitDirectory, validateEval } from './eval.js';
 
 const UNAVAILABLE = ['no_implementation', 'execution_blocked', 'incompatible_tasks'];
@@ -47,8 +48,10 @@ function blocked(message, repo, name, gaps) {
   });
 }
 
-// Identity of the code a run executes. A digest names the working tree; it is
-// not a stored copy, so uncommitted code cannot be restored from a run record.
+// Identity of the code a run executes. The digest covers content only: the
+// path, mode and Git object of every file the run sees, committed or not, so
+// committing the same code keeps it. The commit and the changed files say
+// where the code came from, and the patch beside a run restores it.
 export function codeSnapshot(repo) {
   const { head, changed } = codeState(repo);
   if (changed === null) {
@@ -57,34 +60,96 @@ export function codeSnapshot(repo) {
   const files = Object.fromEntries(changed.map((file) => {
     try { return [file, digest(readFileSync(path.join(repo, file)))]; } catch { return [file, 'deleted']; }
   }));
+  const content = contentDigest(repo, head, changed);
   return {
     version: head && !changed.length ? head : head || changed.length ? 'uncommitted' : 'empty',
-    snapshot: { commit: head, changed_files: changed, file_digests: files,
-      digest: digest([head ?? '', ...changed.map((file) => `${file}\n${files[file]}`)].join('\n')) },
+    snapshot: { commit: head, changed_files: changed, file_digests: files, digest: content, ...(content ? { digest_of: 'content' } : {}) },
   };
 }
 
+// The commit's files with the changed paths as they are on disk, listed from a
+// scratch index. --info-only hashes each file through the project's Git
+// filters, as a commit of it would, without writing objects. Generated files,
+// such as the evals and the Spec, are not code.
+function contentDigest(repo, commit, changed) {
+  const scratch = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-index-'));
+  const env = { ...process.env, GIT_INDEX_FILE: path.join(scratch, 'index') };
+  const git = (args, input) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', env, input, maxBuffer: 256 * 1024 * 1024 });
+  try {
+    if (git(['read-tree', ...(commit ? [commit] : ['--empty'])]).status !== 0) return null;
+    // Git lists a repository inside the project with a trailing slash; the
+    // index records it as a link to its commit.
+    const paths = changed.map((file) => file.replace(/\/$/, ''));
+    if (paths.length && git(['update-index', '--add', '--remove', '--info-only', '-z', '--stdin'], paths.join('\0')).status !== 0) return null;
+    const listed = git(['ls-files', '--stage', '-z']);
+    if (listed.status !== 0) return null;
+    const entries = listed.stdout.split('\0').filter((entry) => entry && !isGenerated(entry.slice(entry.indexOf('\t') + 1)));
+    return digest(entries.join('\0'));
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+// The content digest of a record's code, or null when it cannot be known.
+// Records written before the digest left the commit out have one only when
+// they had no uncommitted change: then their code is the commit's.
+function codeIdentity(snapshot, repo) {
+  if (!snapshot?.digest) return null;
+  if (snapshot.digest_of === 'content') return snapshot.digest;
+  return repo && snapshot.commit && Array.isArray(snapshot.changed_files) && !snapshot.changed_files.length
+    ? contentDigest(repo, snapshot.commit, []) : null;
+}
+
+// Whether two records describe the same code: true, false, or null when one
+// of them cannot tell. A refusal treats null as different; a hint says nothing.
+export function sameCode(a, b, repo) {
+  const first = codeIdentity(a, repo);
+  const second = codeIdentity(b, repo);
+  return first && second ? first === second : null;
+}
+
+// The starting code of a loop as loop.json keeps it.
+export function startCode(commit, snapshot, repo, patch) {
+  const identity = codeIdentity(snapshot, repo);
+  return { commit, digest: identity, ...(identity ? { digest_of: 'content' } : {}), ...(patch ? { patch } : {}) };
+}
+
+// Git's diff output follows the user's configuration. A patch that has to
+// apply anywhere is written with fixed options.
+const PATCH_CONFIG = ['-c', 'core.quotepath=off', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicPrefix=false',
+  '-c', 'diff.relative=false', '-c', 'color.ui=never'];
+
 // Everything the commit does not hold, as a patch Git can apply on top of it.
 // With the commit, it restores the exact code a run used, so nothing has to be
-// committed for a run to be restorable.
-function savePatch(repo, snapshot, file) {
+// committed for a run to be restorable. A scratch index holds the commit and
+// then every changed path as it is on disk, so the patch is exactly their
+// difference, whatever the real index says.
+export function savePatch(repo, snapshot, file) {
   if (!snapshot.changed_files?.length) return null;
-  const git = (args) => spawnSync('git', ['-C', repo, '-c', 'core.quotepath=off', ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
-  const untracked = new Set((git(['ls-files', '--others', '--exclude-standard']).stdout ?? '').split('\n').filter(Boolean));
-  const tracked = snapshot.commit ? snapshot.changed_files.filter((entry) => !untracked.has(entry)) : [];
-  const fresh = snapshot.changed_files.filter((entry) => !tracked.includes(entry) && existsSync(path.join(repo, entry)));
-  const parts = [tracked.length ? git(['diff', '--binary', snapshot.commit, '--', ...tracked]).stdout : '',
-    ...fresh.map((entry) => git(['diff', '--binary', '--no-index', '--', '/dev/null', entry]).stdout)];
-  const text = parts.join('');
-  if (!text) return null;
-  writeFileSync(file, text);
-  return path.basename(file);
+  const scratch = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-index-'));
+  const env = { ...process.env, GIT_INDEX_FILE: path.join(scratch, 'index') };
+  const git = (args, options = {}) => spawnSync('git', ['-C', repo, ...PATCH_CONFIG, ...args],
+    { encoding: 'utf8', env, maxBuffer: 256 * 1024 * 1024, ...options });
+  try {
+    if (git(['read-tree', ...(snapshot.commit ? [snapshot.commit] : ['--empty'])]).status !== 0) return null;
+    const added = git(['--literal-pathspecs', 'add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'],
+      { input: snapshot.changed_files.join('\0') });
+    if (added.status !== 0) return null;
+    const base = snapshot.commit ?? git(['hash-object', '-t', 'tree', '/dev/null']).stdout.trim();
+    const diff = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames',
+      '--src-prefix=a/', '--dst-prefix=b/', base], { encoding: 'buffer' });
+    if (diff.status !== 0 || !diff.stdout.length) return null;
+    writeFileSync(file, diff.stdout);
+    return path.basename(file);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 }
 
 // Run and check records are evidence of this machine, not source.
 export function ignoreRecords(repo) {
   const file = localPath(repo, '.genesis/edd/.gitignore');
-  const wanted = '/*/runs/\n/*/checks/\n/*/loop.json\n__pycache__/\n';
+  const wanted = '/*/runs/\n/*/checks/\n/*/loop.json\n/*/loop-start.patch\n__pycache__/\n';
   if (!existsSync(file) || readFileSync(file, 'utf8') !== wanted) writeFileSync(file, wanted);
 }
 
@@ -155,7 +220,7 @@ function runCase(harbor, item, checks, target, options) {
     execution = { status: 'error', reason: result.error?.code === 'ETIMEDOUT' ? `Harbor did not finish within ${options.timeout * attempts} minutes.`
       : `Harbor produced ${trials.length} of ${attempts} trial results (exit ${result.status}). See logs/harbor.log.` };
   }
-  const warnings = [];
+  const warnings = new Set();
   const recorded = trials.map((trial) => {
     const outcome = readJSON(path.join(trial, 'result.json'));
     if (outcome.exception_info && execution.status === 'completed') {
@@ -173,11 +238,13 @@ function runCase(harbor, item, checks, target, options) {
       const gating = checks.filter((check) => check.role === 'gating');
       const expected = gating.every((check) => results.find((entry) => entry?.id === check.id)?.result === 'pass') ? 1 : 0;
       if (value !== expected) {
-        warnings.push(`${item.id}: the verifier wrote reward ${value}, but its gating results give ${expected}. Check that tests/test.sh uses gate and note as checks.json declares.`);
+        warnings.add(`${item.id}: the verifier wrote reward ${value}, but its gating results give ${expected}. Check that tests/test.sh uses gate and note as checks.json declares.`);
       }
     }
     return results;
   });
+  // An attempt Harbor left no trial for is an attempt without evidence.
+  while (recorded.length < attempts) recorded.push([]);
   if (recorded.some((results) => results.length)) {
     const combined = combine(checks, recorded);
     writeJSON(path.join(target, 'check-results.json'), { results: combined });
@@ -187,8 +254,8 @@ function runCase(harbor, item, checks, target, options) {
   const results = readResults(target, checks);
   const count = (value) => results.filter((entry) => entry.role === 'gating' && entry.result === value).length;
   const flaky = results.filter((entry) => entry.flaky).map((entry) => entry.id);
-  if (flaky.length) warnings.push(`${item.id}: ${flaky.join(', ')} gave different results across attempts.`);
-  return { id: item.id, execution, results, warnings,
+  if (flaky.length) warnings.add(`${item.id}: ${flaky.join(', ')} gave different results across attempts.`);
+  return { id: item.id, execution, results, warnings: [...warnings],
     summary: { id: item.id, execution, gating: { pass: count('pass'), fail: count('fail'), unknown: count('unknown') } } };
 }
 
@@ -209,6 +276,34 @@ export function recordedBaseline(repo, name, spec) {
   const base = readRuns(path.join(eddDirectory(repo, name), 'runs'))
     .filter((run) => run.spec_snapshot?.sha256 === spec && run.side === 'base').pop() ?? null;
   return base && (base.is_baseline || base.execution_status === 'not_run') ? base : null;
+}
+
+// How to get back to the code a loop started from, for a message.
+export function restoreHint(name, loop, pinned) {
+  const start = loop.start_code ?? {};
+  const head = start.commit ?? loop.base_commit;
+  const commit = head ? `commit ${head}` : 'no commit';
+  const patch = start.patch ? `.genesis/edd/${name}/${start.patch}`
+    : pinned?.code_snapshot?.patch && sameCode(pinned.code_snapshot, start) ? `.genesis/edd/${name}/runs/${pinned.run_id}/code.patch` : null;
+  return patch ? `${commit} plus \`git apply\` ${patch}` : commit;
+}
+
+// The run a loop pinned as its baseline, or the gap that says it is gone.
+export function pinnedBase(repo, name, loop) {
+  const run = readRuns(path.join(eddDirectory(repo, name), 'runs')).find((entry) => entry.run_id === loop.baseline && entry.side === 'base') ?? null;
+  return { run, gap: run ? null : { code: 'loop_baseline_missing', kind: 'artifact', owner: 'agent', route: 'run-eval',
+    message: `The loop for this Spec compares every run with ${loop.baseline}, which is no longer in runs/. Restore that run folder, or record a baseline on the loop's starting code (${restoreHint(name, loop, null)}) and run \`loop start --restart\`.` } };
+}
+
+// The implementation loop of this change, when it was started for this Spec.
+// While it runs, its baseline is the one every head run is compared with.
+export function activeLoop(repo, name, spec) {
+  const file = path.join(eddDirectory(repo, name), 'loop.json');
+  if (!spec || !existsSync(file)) return null;
+  try {
+    const loop = readJSON(file);
+    return loop?.spec === spec ? loop : null;
+  } catch { return null; }
 }
 
 // Proves each finished package's verifier before any real run: every fixture
@@ -276,10 +371,25 @@ export function startRun(repo, name, options = {}) {
   const spec = { id: name, sha256: evals.spec };
   const earlier = readRuns(runs).filter((run) => run.spec_snapshot?.sha256 === spec.sha256);
   const attempt = earlier.filter((run) => run.side === 'base').pop() ?? null;
-  const base = attempt && (attempt.is_baseline || attempt.execution_status === 'not_run') ? attempt : null;
+  const loop = activeLoop(repo, name, spec.sha256);
+  // A running loop pins its baseline: a later base run must not move the
+  // reference every head run of that loop is compared with.
+  const pinned = loop ? earlier.find((run) => run.run_id === loop.baseline && run.side === 'base') ?? null : null;
+  const base = loop ? pinned
+    : attempt && (attempt.is_baseline || attempt.execution_status === 'not_run') ? attempt : null;
+  if (side === 'head' && loop && !pinned) {
+    throw blocked(`The loop's baseline ${loop.baseline} is not in runs/.`, repo, name, [pinnedBase(repo, name, loop).gap]);
+  }
   if (side === 'head' && !base) {
     throw blocked('No baseline is recorded for this Spec.', repo, name, [{ code: 'baseline_missing', kind: 'artifact', owner: 'agent', route: 'run-eval',
       message: `${attempt ? `The last baseline attempt, ${attempt.run_id}, did not run; fix the cause and record it again. ` : ''}Record the baseline before changing code: \`run start --baseline\`, or \`--baseline --unavailable no_implementation\` when nothing can run yet. A head run is never promoted to a baseline.` }]);
+  }
+  // Inside a loop the code before the change is known. Every base record,
+  // one that runs or one that declares a baseline unavailable, describes that
+  // code, never code the loop has already changed.
+  if (side === 'base' && loop?.start_code?.digest && sameCode(codeSnapshot(repo).snapshot, loop.start_code, repo) !== true) {
+    throw blocked('The code changed since the loop for this Spec started.', repo, name, [{ code: 'baseline_after_change', kind: 'artifact', owner: 'agent', route: 'run-eval',
+      message: `A loop for this Spec started on ${restoreHint(name, loop, pinned)} and compares every run with ${loop.baseline}. A base record on other code would describe the change, not the code before it. To record the baseline again, keep your changes aside, restore that code, record it there, then return to your changes and run \`loop start --restart\`. Files added for the evals during the loop, such as .dockerignore, cannot join this Spec's baseline: the checks of a package that changed stay head_only.` }]);
   }
   const cases = evals.cases.map((item) => ({ ...item, directory: path.join(root, 'evals', item.id),
     ...readJSON(path.join(root, 'evals', item.id, 'tests/checks.json')) }));
@@ -307,9 +417,15 @@ export function startRun(repo, name, options = {}) {
     if (tools.gaps.length) throw blocked(tools.gaps.map((gap) => gap.message).join(' '), repo, name, tools.gaps);
   }
   const started = new Date();
-  const runId = `${started.toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)}-${randomBytes(2).toString('hex')}`;
-  const directory = path.join(runs, runId);
-  mkdirSync(directory, { recursive: true });
+  // Each run gets a folder of its own; two runs in the same second never share one.
+  mkdirSync(runs, { recursive: true });
+  let runId;
+  let directory;
+  for (let tries = 0; ; tries += 1) {
+    runId = `${started.toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)}-${randomBytes(2).toString('hex')}`;
+    directory = path.join(runs, runId);
+    try { mkdirSync(directory); break; } catch (error) { if (error.code !== 'EEXIST' || tries > 50) throw error; }
+  }
   ignoreRecords(repo);
   const code = codeSnapshot(repo);
   const patch = savePatch(repo, code.snapshot, path.join(directory, 'code.patch'));
@@ -327,6 +443,9 @@ export function startRun(repo, name, options = {}) {
     code_version: code.version, spec_snapshot: spec,
     is_baseline: side === 'base' && status === 'completed',
     baseline: side === 'head' && base.is_baseline ? base.run_id : null,
+    // The base record a head run was compared with, also when it records an
+    // unavailable baseline.
+    base_run: side === 'head' ? base.run_id : null,
     baseline_unavailable_reason: null,
     code_snapshot: { ...code.snapshot, ...(patch ? { patch } : {}) }, task_digest: digests,
     environment_ref: { harbor: tools.harbor, agent: executes ? agent : null, model: executes ? model ?? null : null, attempts,
@@ -337,23 +456,30 @@ export function startRun(repo, name, options = {}) {
   let comparison = null;
   if (side === 'base') {
     record.baseline_unavailable_reason = options.unavailable ?? (status === 'completed' ? null : 'execution_blocked');
-    record.baseline_expectations = outcomes.flatMap((outcome) => outcome.results.map((entry) => declared
-      .find((item) => item.case === outcome.id && item.check === entry.id)
-      ?? { case: outcome.id, check: entry.id, expected: 'any', reason: 'No expectation was declared before the baseline ran.' }));
+    // Every declared check, including packages not connected yet: what the
+    // change is expected to do is fixed before the code changes, whether or
+    // not the package could run.
+    record.baseline_expectations = options.unavailable ? [] : cases.flatMap((item) => item.checks.map((check) => declared
+      .find((entry) => entry.case === item.id && entry.check === check.id)
+      ?? { case: item.id, check: check.id, expected: 'any', reason: 'No expectation was declared before the baseline ran.' }));
     record.baseline_mismatch = outcomes.flatMap((outcome) => outcome.results.flatMap((entry) => {
       const expected = declared.find((item) => item.case === outcome.id && item.check === entry.id)?.expected ?? 'any';
       return expected !== 'any' && entry.result !== 'unknown' && entry.result !== expected
         ? [{ case: outcome.id, check: entry.id, expected, got: entry.result }] : [];
     }));
-    if (earlier.some((run) => run.side === 'base' && run.is_baseline && run.code_snapshot?.digest !== code.snapshot.digest)) {
+    if (earlier.some((run) => run.side === 'base' && run.is_baseline && sameCode(run.code_snapshot, code.snapshot, repo) === false)) {
       warnings.push('An earlier baseline for this Spec ran on different code. A baseline must be the code before the change.');
     }
+    if (loop) warnings.push(`The loop for this Spec keeps comparing with ${loop.baseline} until \`loop start --restart\`.`);
   } else {
     record.baseline_unavailable_reason = base.is_baseline ? null : base.baseline_unavailable_reason ?? 'execution_blocked';
     const results = outcomes.flatMap((outcome) => {
-      const comparable = base.is_baseline && base.task_digest?.[outcome.id] === digests[outcome.id]
-        && base.cases.some((item) => item.id === outcome.id);
+      // A package that did not run in the baseline has no result to compare;
+      // one that changed since has a result for a different package.
+      const ranAtBase = base.is_baseline && (base.cases ?? []).some((item) => item.id === outcome.id);
+      const comparable = ranAtBase && base.task_digest?.[outcome.id] === digests[outcome.id];
       const before = comparable ? readResults(path.join(runs, base.run_id, outcome.id), cases.find((item) => item.id === outcome.id).checks) : null;
+      const reason = !base.is_baseline ? record.baseline_unavailable_reason : ranAtBase ? 'incompatible_tasks' : 'not_run_at_baseline';
       return outcome.results.map((entry) => {
         const earlierResult = before?.find((item) => item.id === entry.id).result ?? null;
         const expected = base.baseline_expectations?.find((item) => item.case === outcome.id && item.check === entry.id)?.expected ?? 'any';
@@ -361,14 +487,15 @@ export function startRun(repo, name, options = {}) {
           : earlierResult === null ? 'head_only' : earlierResult === 'unknown' ? 'unverified'
             : expected !== 'any' && earlierResult !== expected ? 'base_mismatch' : 'holds';
         return { case: outcome.id, check: entry.id, intent: entry.intent, role: entry.role, before: earlierResult,
-          ...(earlierResult === null ? { before_unavailable_reason: base.is_baseline ? 'incompatible_tasks' : record.baseline_unavailable_reason } : {}),
+          ...(earlierResult === null ? { before_unavailable_reason: reason } : {}),
           after: entry.result, verdict, evidence: entry.evidence, ...(entry.flaky ? { flaky: true } : {}) };
       });
     });
     const gating = results.filter((entry) => entry.role === 'gating');
+    // A partial run never passes, even when it names every package.
     record.verdict = gating.some((entry) => entry.after === 'fail') ? 'fail'
-      : status === 'completed' && !skipped.length && gating.length && gating.every((entry) => entry.after === 'pass') ? 'pass' : 'unverified';
-    comparison = { schema_version: '1.0', run_id: runId, baseline: record.baseline, results };
+      : record.scope === 'full' && status === 'completed' && !skipped.length && gating.length && gating.every((entry) => entry.after === 'pass') ? 'pass' : 'unverified';
+    comparison = { schema_version: '1.0', run_id: runId, baseline: record.baseline, base_run: record.base_run, results };
     writeJSON(path.join(directory, 'compare.json'), comparison);
   }
   writeJSON(path.join(directory, 'run.json'), record);
@@ -384,7 +511,8 @@ export function startRun(repo, name, options = {}) {
       : side === 'base'
         ? record.baseline_mismatch?.length
           ? 'The baseline did not behave as declared (baseline_mismatch). Before changing code, find out why: this is not the code before the change, the expectation is wrong, or the check cannot tell the two apart. Then run the baseline again.'
-          : 'Change the code, then run `run start` again; later runs are compared with this baseline.'
+          : loop ? `The loop for this Spec still compares every run with ${loop.baseline}. \`loop start --restart\` starts it over with this baseline.`
+            : 'Change the code, then run `run start` again; later runs are compared with this baseline.'
         : record.scope === 'partial' ? 'A partial run is a quick look and never counts as passing. Run every package before saying the change works.'
         : record.verdict !== 'pass' ? 'Read compare.json and each case\'s logs/ before changing anything; classify the cause first.'
           : tally('base_mismatch') || tally('head_only')
