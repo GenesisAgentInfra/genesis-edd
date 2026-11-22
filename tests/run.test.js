@@ -1121,3 +1121,65 @@ test('code.patch applies whatever the user\'s diff settings are, including for a
   git(clone, ['apply', path.join(run.directory, 'code.patch')]);
   assert.deepEqual(tree(path.join(clone, 'app')), tree(path.join(repo, 'app')));
 });
+
+test('eval check skips packages whose record still matches, proves the changed one, and proves a named one again', (t) => {
+  const { repo, root, tools } = readyProject(t);
+  const proved = (id) => readJSON(path.join(root, 'checks', id, 'check.json')).checked_at;
+  const before = { [FAILURE]: proved(FAILURE), [SUCCESS]: proved(SUCCESS) };
+  let calls = tools.runs().length;
+
+  // Nothing changed: nothing runs, and the command still passes.
+  const again = checkEval(repo, CHANGE);
+  assert.equal(again.passed, true);
+  assert.deepEqual(again.cases, []);
+  assert.deepEqual(again.already_proved, [FAILURE, SUCCESS]);
+  assert.match(again.next, /proved already/);
+  assert.equal(tools.runs().length, calls);
+  const shown = cli(['eval', 'check', CHANGE, '--repo', repo]);
+  assert.equal(shown.status, 0, shown.stderr);
+  assert.deepEqual(shown.json.already_proved, [FAILURE, SUCCESS]);
+
+  // A changed package is proved again; the other one is left as it is.
+  const file = path.join(root, 'evals', SUCCESS, 'environment/Dockerfile');
+  writeFileSync(file, `${readFileSync(file, 'utf8')}RUN true\n`);
+  const changed = checkEval(repo, CHANGE);
+  assert.equal(changed.passed, true);
+  assert.deepEqual(changed.cases.map((item) => item.case), [SUCCESS]);
+  assert.deepEqual(changed.already_proved, [FAILURE]);
+  assert.ok(tools.runs().slice(calls).every((call) => valueOf(call.argv, '-p').endsWith(SUCCESS)));
+  assert.equal(proved(FAILURE), before[FAILURE]);
+  calls = tools.runs().length;
+
+  // --case proves a package again even when its record matches.
+  const named = checkEval(repo, CHANGE, { case: FAILURE });
+  assert.deepEqual(named.cases.map((item) => item.case), [FAILURE]);
+  assert.deepEqual(named.already_proved, []);
+  assert.ok(tools.runs().length > calls);
+  assert.notEqual(proved(FAILURE), before[FAILURE]);
+});
+
+test('eval check proves again a package whose last proof failed, and a failed proof fails the command beside a proved package', (t) => {
+  const { repo, root, tools } = readyProject(t);
+  const file = path.join(root, 'evals', SUCCESS, 'environment/Dockerfile');
+  writeFileSync(file, `${readFileSync(file, 'utf8')}RUN true\n`);
+  // A Harbor that answers --version but fails every run: the proof fails.
+  const fake = process.env.GENESIS_EDD_HARBOR;
+  process.env.GENESIS_EDD_HARBOR = JSON.stringify([process.execPath, '-e',
+    "if (process.argv[1] === '--version') console.log('harbor 0.0.0 (broken)'); else process.exit(1);"]);
+  let failed;
+  try { failed = checkEval(repo, CHANGE); } finally { process.env.GENESIS_EDD_HARBOR = fake; }
+  assert.equal(failed.passed, false);
+  assert.deepEqual(failed.cases.map((item) => [item.case, item.passed]), [[SUCCESS, false]]);
+  assert.deepEqual(failed.already_proved, [FAILURE]);
+  assert.match(failed.next, /did not get the result it expects/);
+
+  // The failed record matches the package, but it proves nothing: it runs again.
+  const missing = validateEval(repo, CHANGE).cases.find((item) => item.id === SUCCESS).integration.missing;
+  assert.deepEqual(missing, ['check']);
+  const calls = tools.runs().length;
+  const again = checkEval(repo, CHANGE);
+  assert.equal(again.passed, true);
+  assert.deepEqual(again.cases.map((item) => item.case), [SUCCESS]);
+  assert.deepEqual(again.already_proved, [FAILURE]);
+  assert.ok(tools.runs().length > calls);
+});

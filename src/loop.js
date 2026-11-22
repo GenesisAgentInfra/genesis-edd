@@ -44,6 +44,26 @@ const without = (value, key) => Object.fromEntries(Object.entries(value).filter(
 const acceptedIn = (record, loop, runs) => record?.spec?.sha256 === loop.spec
   && (record.loop_started_at ? record.loop_started_at === loop.started_at : runs.some((run) => run.run_id === record.run_id));
 
+// The head runs of one loop: its Spec, from its start. Full runs count toward
+// the budget and can be accepted; partial ones are a quick look.
+const loopRuns = (all, loop) => all.filter((run) => run.side === 'head' && run.spec_snapshot?.sha256 === loop.spec && run.started_at >= loop.started_at);
+const fullRuns = (runs) => runs.filter((run) => (run.scope ?? 'full') === 'full');
+
+// The code an acceptance covers, as accepted.json keeps it, for when the
+// accepted run's folder is gone. Records written before the digest named its
+// kind compare by their commit when nothing was uncommitted.
+const acceptedSnapshot = (record) => ({ commit: record.commit ?? null, changed_files: record.uncommitted_files ?? null,
+  digest: record.code_digest ?? null, ...(record.code_digest_of ? { digest_of: record.code_digest_of } : {}) });
+
+// The user's acceptance of the loop running for this Spec, or null. Read-only.
+export function loopAcceptance(repo, name, spec) {
+  const loop = readLoop(repo, name);
+  if (!loop || loop.spec !== spec || !existsSync(acceptedFile(repo, name))) return null;
+  let record = null;
+  try { record = readJSON(acceptedFile(repo, name)); } catch { return null; }
+  return acceptedIn(record, loop, fullRuns(loopRuns(readRuns(path.join(eddDirectory(repo, name), 'runs')), loop))) ? record : null;
+}
+
 // What the loop needs before it may change code. Read-only. While a loop runs
 // for the Spec, its baseline is the one it pinned; latest asks for the
 // baseline a new or restarted loop would pin instead.
@@ -180,8 +200,8 @@ export function loopStatus(repo, name) {
   const runsDirectory = path.join(eddDirectory(repo, name), 'runs');
   const all = readRuns(runsDirectory);
   const base = all.find((run) => run.run_id === loop.baseline) ?? null;
-  const ours = all.filter((run) => run.side === 'head' && run.spec_snapshot?.sha256 === loop.spec && run.started_at >= loop.started_at);
-  const runs = ours.filter((run) => (run.scope ?? 'full') === 'full');
+  const ours = loopRuns(all, loop);
+  const runs = fullRuns(ours);
   const latest = runs.at(-1) ?? null;
   const previous = runs.at(-2) ?? null;
   const warnings = [...evals.warnings];
@@ -238,21 +258,27 @@ export function loopStatus(repo, name) {
     && failing(runs.length - 1).length && failing(runs.length - 1).join() === failing(runs.length - 2).join());
   if (repeated) warnings.push('The last two runs used the same code. Running again without a change shows nothing new.');
 
-  // Minutes count from the start of the loop or from the last time the user
-  // raised the budget, so a wait for the user is not spent twice.
-  const clock = loop.clock_started_at ?? loop.started_at;
-  const used = { iterations: runs.length, minutes: Math.round((Date.now() - Date.parse(clock)) / 60_000) };
-  const exhausted = used.iterations >= loop.budget.iterations || used.minutes >= loop.budget.minutes;
-  const changedPackages = evals.cases.filter((item) => loop.task_digest[item.id] !== item.task_digest).map((item) => item.id);
-  if (changedPackages.length) warnings.push(`Changed since the loop started: ${changedPackages.join(', ')}. Their checks now compare with no baseline result (head_only). Say why in the report's Cause.`);
-  const reports = Object.fromEntries(runs.map((run) => [run.run_id, reportGaps(repo, name, run)]));
   let accepted = null;
   try { accepted = existsSync(acceptedFile(repo, name)) ? readJSON(acceptedFile(repo, name)) : null; } catch {
     warnings.push('accepted.json cannot be read. Restore it; it records the user\'s acceptance.');
   }
   if (!acceptedIn(accepted, loop, runs)) accepted = null;
-  const acceptedCode = accepted && (runs.find((run) => run.run_id === accepted.run_id)?.code_snapshot ?? { digest: accepted.code_digest });
-  if (accepted && sameCode(acceptedCode, codeSnapshot(repo).snapshot, repo) === false) warnings.push(`The code changed after the accepted run ${accepted.run_id}. The acceptance covers that run's code only.`);
+  // Minutes count from the start of the loop or from the last time the user
+  // raised the budget, so a wait for the user is not spent twice. They stop
+  // when the user accepts: a finished loop spends no more budget.
+  const clock = loop.clock_started_at ?? loop.started_at;
+  const stopped = accepted ? Date.parse(accepted.accepted?.at) : Number.NaN;
+  const used = { iterations: runs.length, minutes: Math.max(0, Math.round(((Number.isFinite(stopped) ? stopped : Date.now()) - Date.parse(clock)) / 60_000)) };
+  const exhausted = used.iterations >= loop.budget.iterations || used.minutes >= loop.budget.minutes;
+  const changedPackages = evals.cases.filter((item) => loop.task_digest[item.id] !== item.task_digest).map((item) => item.id);
+  if (changedPackages.length) warnings.push(`Changed since the loop started: ${changedPackages.join(', ')}. Their checks now compare with no baseline result (head_only). Say why in the report's Cause.`);
+  const reports = Object.fromEntries(runs.map((run) => [run.run_id, reportGaps(repo, name, run)]));
+  const acceptedCode = accepted && (runs.find((run) => run.run_id === accepted.run_id)?.code_snapshot ?? acceptedSnapshot(accepted));
+  const now = accepted ? codeSnapshot(repo).snapshot : null;
+  const keeps = accepted ? sameCode(acceptedCode, now, repo) : null;
+  if (keeps === false) warnings.push(`The code changed after the accepted run ${accepted.run_id}. The acceptance covers that run's code only.`);
+  // The accepted code is committed when the commit holds all of it.
+  const committed = keeps === true && Array.isArray(now.changed_files) && !now.changed_files.length ? now.commit : null;
 
   const command = (...words) => [...words, name, '--repo', repo];
   const stopBudget = (detail) => ({ action: 'stop_budget', owner: 'user',
@@ -270,7 +296,10 @@ export function loopStatus(repo, name) {
   } else if (evals.spec !== loop.spec) {
     next = { action: 'restart', route: 'write-eval', message: 'The Spec was exported again. Bring the packages in line with write-eval, record a baseline for the new Spec, then `loop start --restart`. Expected results never change inside a loop.' };
   } else if (accepted) {
-    next = { action: 'done', message: `${accepted.accepted?.by ?? 'The user'} accepted run ${accepted.run_id} (${accepted.accepted?.ref ?? 'no reference'}). The loop is finished. Offer to commit the change, merge it or open a pull request; do none of them without the user.` };
+    next = { action: 'done', ...(committed ? { commit: committed } : {}),
+      message: `${accepted.accepted?.by ?? 'The user'} accepted run ${accepted.run_id} (${accepted.accepted?.ref ?? 'no reference'}). The loop is finished. ${committed
+        ? `The accepted code is committed in ${short(committed)}. Offer to merge it or open a pull request; do neither without the user.`
+        : 'Offer to commit the change, merge it or open a pull request; do none of them without the user.'}` };
   } else if (latest && latest.execution_status !== 'completed') {
     next = exhausted ? stopBudget(`The last run, ${latest.run_id}, did not complete.`)
       : { action: 'repair_execution', route: 'write-eval', message: `${latest.run_id} did not complete. Read cases[].execution.reason and each logs/harbor.log. An adapter or environment fault goes to write-eval; a build or timeout fault is rerun. Neither is a result of the code.` };
@@ -290,7 +319,7 @@ export function loopStatus(repo, name) {
     next = { action: 'stop_stuck', owner: 'user', message: `The same gating checks failed in the last two runs on different code: ${failing(runs.length - 1).join(', ')}. Stop, report what was tried, and ask the user how to proceed.` };
   } else {
     const open = latest ? failing(runs.length - 1) : checks.filter((entry) => entry.role === 'gating' && entry.baseline !== 'pass').map((entry) => `${entry.case}/${entry.check}=${entry.baseline ?? 'no baseline'}`);
-    next = { action: 'iterate', message: `Classify, then change the right layer, commit, and run again. Open: ${open.join(', ') || 'none recorded'}.`,
+    next = { action: 'iterate', message: `Classify, then change the right layer and run again; nothing has to be committed. Open: ${open.join(', ') || 'none recorded'}.`,
       pending_packages: evals.cases.filter((item) => item.integration?.state !== 'ready').map((item) => item.id) };
   }
   return {
@@ -359,9 +388,11 @@ Code \`${short(run.code_snapshot?.commit)}\`${run.code_snapshot?.patch ? ' + cod
 
 ## Result
 
-| Case | Check | Requirement | Before | After | Verdict |
-| --- | --- | --- | --- | --- | --- |
-${compare.map((entry) => `| ${entry.case} | ${entry.check} | ${entry.intent} | ${entry.before ?? '—'} | ${entry.after} | ${entry.verdict}${entry.flaky ? ' (varied)' : ''} |`).join('\n')}
+Only gating checks decide the verdict; a diagnostic result is shown for reference.
+
+| Case | Check | Requirement | Role | Before | After | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+${compare.map((entry) => `| ${entry.case} | ${entry.check} | ${entry.intent} | ${entry.role ?? '—'} | ${entry.before ?? '—'} | ${entry.after} | ${entry.verdict}${entry.flaky ? ' (varied)' : ''} |`).join('\n')}
 
 ## Cause
 
@@ -398,10 +429,11 @@ export function acceptLoop(repo, name, options = {}) {
   const run = listed ? readJSON(path.join(runsDirectory, listed.run_id, 'run.json')) : null;
   if (run && (run.verdict !== 'pass' || run.execution_status !== 'completed')) gaps.push(gap('not_passing', 'loop-and-implement', `${run.run_id} has verdict ${run.verdict}; only a passing run can be accepted.`));
   if (['restart', 'repair_spec'].includes(status.next.action)) gaps.push(gap('spec_changed', status.next.route, status.next.message, status.next.owner ?? 'agent'));
+  const now = codeSnapshot(repo).snapshot;
   if (run) {
     const missing = reportGaps(repo, name, run);
     if (missing.length) gaps.push(gap('report_incomplete', 'loop-and-implement', `The report for ${run.run_id} is incomplete: ${missing.join('; ')}.`));
-    if (sameCode(codeSnapshot(repo).snapshot, run.code_snapshot, repo) !== true) {
+    if (sameCode(now, run.code_snapshot, repo) !== true) {
       gaps.push(gap('code_changed', 'run-eval', `The code changed after ${run.run_id}. Run again and accept that run.`));
     }
   }
@@ -424,14 +456,18 @@ export function acceptLoop(repo, name, options = {}) {
     spec: run.spec_snapshot, baseline: run.baseline,
     baseline_unavailable_reason: run.baseline_unavailable_reason, commit: run.code_snapshot.commit,
     uncommitted_files: run.code_snapshot.changed_files ?? [], code_digest: run.code_snapshot.digest,
-    checks: compare.map(({ case: id, check, intent, before, after, verdict }) => ({ case: id, check, intent, before, after, verdict })),
+    ...(run.code_snapshot.digest_of ? { code_digest_of: run.code_snapshot.digest_of } : {}),
+    checks: compare.map(({ case: id, check, intent, role, before, after, verdict }) => ({ case: id, check, intent, role, before, after, verdict })),
     changed_packages: status.changed_packages,
     accepted: { by: options.by.trim(), ref: options.ref.trim(), at: new Date().toISOString() },
     ...(earlier.length ? { earlier } : {}),
   };
   writeFileSync(accepted, `${JSON.stringify(record, null, 2)}\n`);
-  return { file: accepted, accepted: record,
-    next: 'Acceptance is recorded. Offer to commit the change, merge it or open a pull request; do none of them without the user.' };
+  // The code now is the accepted code; it is committed when the commit holds all of it.
+  const committed = Array.isArray(now.changed_files) && !now.changed_files.length ? now.commit : null;
+  return { file: accepted, accepted: record, ...(committed ? { commit: committed } : {}),
+    next: committed ? `Acceptance is recorded. The accepted code is committed in ${short(committed)}. Offer to merge it or open a pull request; do neither without the user.`
+      : 'Acceptance is recorded. Offer to commit the change, merge it or open a pull request; do none of them without the user.' };
 }
 
 export const hasLoop = (repo, name, spec) => readLoop(repo, name)?.spec === spec;

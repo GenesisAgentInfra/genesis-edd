@@ -316,8 +316,12 @@ export function checkEval(repo, name, options = {}) {
   if (options.case && !evals.cases.some((item) => item.id === options.case)) throw new Error(`No package named ${options.case}.`);
   const root = eddDirectory(repo, name);
   const chosen = evals.cases.filter((item) => !options.case || item.id === options.case);
-  const finished = chosen.filter((item) => item.integration.missing.every((entry) => entry === 'check'));
-  const skipped = chosen.filter((item) => !finished.includes(item)).map((item) => ({ case: item.id, missing: item.integration.missing, detail: item.integration.detail }));
+  // A package whose record still matches it is proved already. Naming it with
+  // --case proves it again.
+  const current = options.case ? [] : chosen.filter((item) => !item.integration.missing.length).map((item) => item.id);
+  const finished = chosen.filter((item) => !current.includes(item.id) && item.integration.missing.every((entry) => entry === 'check'));
+  const skipped = chosen.filter((item) => !finished.includes(item) && !current.includes(item.id))
+    .map((item) => ({ case: item.id, missing: item.integration.missing, detail: item.integration.detail }));
   if (finished.length) {
     const tools = runTools();
     if (tools.gaps.length) throw blocked(tools.gaps.map((gap) => gap.message).join(' '), repo, name, tools.gaps);
@@ -342,10 +346,11 @@ export function checkEval(repo, name, options = {}) {
     writeJSON(path.join(target, 'check.json'), summary);
     return summary;
   });
-  const passed = cases.length > 0 && cases.every((item) => item.passed);
+  const passed = (cases.length > 0 || current.length > 0) && cases.every((item) => item.passed);
   return {
-    change: name, passed, cases, skipped,
-    next: !cases.length ? 'No package is finished enough to check. `eval validate` lists what each one still needs.'
+    change: name, passed, cases, already_proved: current, skipped,
+    next: !cases.length && current.length ? `Every finished package is proved already: ${current.join(', ')}. Name one with --case to prove it again.`
+      : !cases.length ? 'No package is finished enough to check. `eval validate` lists what each one still needs.'
       : passed ? 'Every checked verifier told its fixtures apart. Those packages are ready; record the baseline next.'
         : 'A fixture did not get the result it expects. Read checks/<case>/<fixture>/logs, then fix the verifier, the environment or the fixture; do not change an expectation to make it pass.',
   };
@@ -499,13 +504,16 @@ export function startRun(repo, name, options = {}) {
     writeJSON(path.join(directory, 'compare.json'), comparison);
   }
   writeJSON(path.join(directory, 'run.json'), record);
-  const tally = (key) => comparison?.results.filter((entry) => entry.verdict === key).length;
+  const tally = (key, role) => comparison?.results.filter((entry) => entry.verdict === key && (!role || entry.role === role)).length;
+  const verdicts = ['holds', 'violated', 'base_mismatch', 'head_only', 'unverified'];
   return {
     run_id: runId, directory, side, scope: record.scope, execution_status: status, verdict: record.verdict,
     is_baseline: record.is_baseline, baseline: record.baseline, baseline_unavailable_reason: record.baseline_unavailable_reason,
     cases: record.cases, skipped, warnings,
+    // Every check, then the gating ones alone: only they decide the verdict.
     ...(side === 'base' ? { baseline_mismatch: record.baseline_mismatch } : {
-      compare: Object.fromEntries(['holds', 'violated', 'base_mismatch', 'head_only', 'unverified'].map((key) => [key, tally(key)])) }),
+      compare: Object.fromEntries(verdicts.map((key) => [key, tally(key)])),
+      compare_gating: Object.fromEntries(verdicts.map((key) => [key, tally(key, 'gating')])) }),
     next: !['completed', 'not_run'].includes(status)
       ? 'Execution did not complete. Read cases[].execution.reason and each case\'s logs/harbor.log, fix the cause, then run the same command again.'
       : side === 'base'

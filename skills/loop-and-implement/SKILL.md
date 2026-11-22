@@ -84,7 +84,7 @@ with a second checkout.
 | `ask_acceptance` | Ask the user to accept, below. |
 | `restart` | The Spec was exported again. Update the packages, record a new baseline, then `loop start --restart`. |
 | `repair_spec` | The Spec the loop started from no longer validates. Restore what changed; a requirement that must change goes to `agent-spec` and the user. |
-| `done` | The user accepted a run of this loop. Offer to commit, merge or open a pull request. |
+| `done` | The user accepted a run of this loop. Offer to commit, merge or open a pull request; once the accepted code is committed, `next.commit` names the commit and only a merge or pull request is left. |
 
 ## Rules
 
@@ -108,7 +108,7 @@ with a second checkout.
   on the starting code, which it keeps. The runs so far stay in the record under
   `previous`. To go on with more runs, use `loop extend` instead.
 - Claim only what a run shows. "Works" needs a passing full run on the current
-  commit; "improved" needs a baseline in which that check failed.
+  code; "improved" needs a baseline in which that check failed.
 - Do not push, merge or open a pull request unless the user asks.
 
 ## What the CLI checks
@@ -125,15 +125,18 @@ with a second checkout.
   only during the loop and fails again is reported as lost progress. Both
   compare results of the same package only: after a `write-eval` fix, the
   earlier results of that package do not count.
-- The minutes of the budget count from `loop start` or the last `loop extend`.
-  A run that did not complete still counts as a run; when the budget is used
-  up, `next` is `stop_budget` instead of another repair.
+- The minutes of the budget count from `loop start` or the last `loop extend`,
+  and stop when the user accepts. A run that did not complete still counts as a
+  run; when the budget is used up, `next` is `stop_budget` instead of another
+  repair.
 - Stuck means the same gating checks failed in the last two full runs on
   different code. Partial runs (`--case`) never count.
 - `loop accept` needs a passing full run, a complete report, an unchanged Spec,
   and the same code now as when that run started. Each loop is accepted once;
   an acceptance from an earlier loop of the change is kept in `accepted.json`
-  under `earlier`.
+  under `earlier`. The record keeps each check with its role, and the code
+  digest with `code_digest_of`, so `loop status` can still tell whether the
+  code changed when the run folder is gone.
 
 ## Final review
 
@@ -142,17 +145,20 @@ commit reviewed in a fresh context: a subagent if you have one, given only the
 Spec, the diff and the latest report, not this conversation. Ask it to look for
 special cases for eval inputs, changes the Spec does not ask for, side effects
 no check covers, and claims in the report that the records do not support.
-Each fix is a new commit and a new full run. Then write the run's Review
+Each fix needs a new full run; nothing has to be committed for it. Then write the run's Review
 section. Without a subagent, review the diff yourself as a separate pass and
 say so in Review: an author reviewing their own work misses more.
 
 ## Acceptance
 
 Show the user the comparison of each check (improved, kept, or with no
-baseline), the report, and anything the review left open. Acceptance is the
+baseline), which checks are only diagnostic, the report, and anything the
+review left open. A diagnostic check never decides the verdict, so say plainly
+which requirements it is the only evidence for. Acceptance is the
 user's decision. Only after they give it, run
 `edd loop accept <change> --repo <app> --run <id> --by <name> --ref <where they said it>`.
-Then offer to commit the change, merge it or open a pull request.
+Then follow `loop status`: it offers a commit, or only a merge or pull request
+once the accepted code is committed.
 
 ## When you stop
 

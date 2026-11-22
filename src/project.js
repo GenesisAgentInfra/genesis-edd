@@ -29,20 +29,28 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:f75b8f0f8992fdeb62442b8b3c0cbac772c783a4069d9072a43722e0b307c2a5',
     'sha256:33663ac9eb83b705a9cfd2fcc11fe78805082404804fed590f163d91e1f0ba09',
     'sha256:9d037e3bc2c705df8abf1ecc8a64d9bd56397b9aeca081ffe34f1017932d5993',
+    'sha256:469c2182dfc7f4e4b5c2252a28891379daaa7b4f873da1a149035aaea1e5d171',
   ],
   'agent-spec/scripts/run.mjs': ['sha256:881a4b48652d858fa99c6cccacd9549910b64631152884beef6bb88a70fc1e9a'],
-  'write-eval/SKILL.md': ['sha256:390f4c0a47e84b7d73a6317dbf9ed054d1879944fcfa38bd94016fd171bf889d'],
+  'write-eval/SKILL.md': [
+    'sha256:390f4c0a47e84b7d73a6317dbf9ed054d1879944fcfa38bd94016fd171bf889d',
+    'sha256:51b2afec0e56f6e2cac81c2392a56917b356e44635ff4dbda80350c0daa93e12',
+  ],
   'run-eval/SKILL.md': [
     'sha256:ffb9e10f3f25bffc007ed9381df23cb3d1e31b64dc8088352302158215f75ba7',
     'sha256:0f46f119fcc49a84dff2fd55274aee5ae5c80c9b4c7c99b5d3bc4999d01bded8',
     'sha256:8559cf63ec10a5d6323d1e620ab163f6c0619018536ec5653efb4507c070d021',
+    'sha256:296897d67a464063536748a9365e914689072f50cf7b0decd3aceb929bc5b7e3',
   ],
   'run-eval/references/run-records.md': [
     'sha256:0f2bafd0cf20299e5ab7d0f28ffbdbc657450d986d56cd708352ec1e761c5c61',
     'sha256:389a8ae7e97bd9e0ef6716f17c15fbddaf193a27f65bd4799cd825ef5ecd3024',
   ],
   'write-eval/references/harbor.md': ['sha256:560385a1e4ac0c91e0a1699c52b15ef5038181ec6cc9cf3e47bedaedebbabbfa'],
-  'loop-and-implement/SKILL.md': ['sha256:02d47d51ad3bcb6f8899622e70526fbf750a5047ce98661fd4df55e034356921'],
+  'loop-and-implement/SKILL.md': [
+    'sha256:02d47d51ad3bcb6f8899622e70526fbf750a5047ce98661fd4df55e034356921',
+    'sha256:1a71597ec5058d525133aec2936dec054800dc665d2769c9b1736417bce7ff9d',
+  ],
   'agent-spec/references/spec-format.md': [
     'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
     'sha256:99a3389ea7a87d2c61077a5f81252d39f594d6e86d5ad21f939c779020b56619',
@@ -125,7 +133,7 @@ export function initProject(repo, mode, agent) {
   if (!['codex', 'claude', 'both', 'none'].includes(agent)) throw new Error('--agent must be codex, claude, both or none.');
   const writes = [];
   const legacySkills = [];
-  const add = (relative, content, previousHash) => writes.push({ file: localPath(repo, relative), content, previousHash });
+  const add = (relative, content, previousHash, keep = false) => writes.push({ file: localPath(repo, relative), content, previousHash, keep });
   const configFile = localPath(repo, 'openspec/config.yaml');
   if (existsSync(configFile)) {
     const config = parse(readFileSync(configFile, 'utf8'));
@@ -161,12 +169,16 @@ export function initProject(repo, mode, agent) {
     }
     // Every skill starts the CLI through the one launcher in agent-spec.
     add(`${directory}/skills/agent-spec/scripts/runtime.json`, runtime);
+    // The installed skills run this machine's checkout, so another clone
+    // cannot use them: each one stays out of Git and every clone runs init.
+    // A .gitignore of the user's own there is theirs to keep.
+    for (const skill of SKILLS) add(`${directory}/skills/${skill}/.gitignore`, '*\n', undefined, true);
   }
   // Check the entire install before writing anything; never replace custom files.
   for (const write of writes) {
     if (existsSync(write.file)) {
       const current = readFileSync(write.file, 'utf8');
-      if (current !== write.content) {
+      if (current !== write.content && !write.keep) {
         if (![write.previousHash].flat().includes(digest(current))) throw new Error(`Existing file differs; left unchanged: ${write.file}`);
         write.update = true;
       }
@@ -189,7 +201,16 @@ export function initProject(repo, mode, agent) {
   for (const directory of ['openspec/specs', 'openspec/changes']) {
     mkdirSync(localPath(repo, directory), { recursive: true });
   }
-  return { repo, mode, agent, created, updated, migrated: legacySkills.map((file) => path.relative(repo, file)), schema: openspec(repo, ['schema', 'validate', SCHEMA, '--json']).data };
+  // A .gitignore does not untrack files: skill folders an earlier install
+  // committed stay in Git until they are removed from the index.
+  const warnings = [];
+  const folders = agentDirs.flatMap((directory) => SKILLS.map((skill) => `${directory}/skills/${skill}`));
+  const tracked = folders.length ? spawnSync('git', ['-C', repo, 'ls-files', '-z', '--', ...folders], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }) : null;
+  const committed = tracked?.status === 0 ? folders.filter((folder) => tracked.stdout.split('\0').some((file) => file.startsWith(`${folder}/`))) : [];
+  if (committed.length) {
+    warnings.push(`Git still tracks skill folders an earlier install committed: ${committed.join(', ')}. They point at this machine's checkout, and their .gitignore does not untrack them. To keep them out of Git, run \`git rm -r --cached ${committed.join(' ')}\` and commit; the files stay on disk.`);
+  }
+  return { repo, mode, agent, created, updated, migrated: legacySkills.map((file) => path.relative(repo, file)), warnings, schema: openspec(repo, ['schema', 'validate', SCHEMA, '--json']).data };
 }
 
 export function changeDirectory(repo, name) {
@@ -241,6 +262,11 @@ export function captureContext(repo, mode, mapFile) {
     const document = JSON.parse(content);
     if (typeof document.snapshot_id !== 'string' || !document.snapshot_id || !['complete', 'partial'].includes(document.analysis_status)) {
       throw new Error('Map must be a Genesis business-map.json with snapshot_id and analysis_status.');
+    }
+    // Genesis writes change-report.json beside the Map of a change review,
+    // which describes only the flows the change touched.
+    if (existsSync(path.join(path.dirname(file), 'change-report.json'))) {
+      throw new Error('This Map comes from a Genesis change review (change-report.json is beside it) and covers only the flows that change touched. Pass the business-map.json of a full map: run `/genesis map` first.');
     }
     map = {
       status: 'available', path: path.relative(repo, file), sha256: digest(content),

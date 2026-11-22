@@ -72,8 +72,8 @@ approve that one command.
 
 ### In your project
 
-Nothing to set up. The first time you use `agent-spec` in a project, the agent
-creates an `openspec/` folder there.
+Nothing to set up with the plugin. The first time you use `agent-spec` in a
+project, the agent creates an `openspec/` folder there.
 
 ### Docker and Harbor
 
@@ -123,6 +123,13 @@ node .agents/skills/agent-spec/scripts/run.mjs --version
 Use `.claude/skills/...` for Claude Code. Keep the checkout where it is: the
 installed skills run its CLI. Copying only the skill folders does not work.
 
+`init` also creates `openspec/`. Each skill folder it installs holds a
+`.gitignore` that keeps the folder out of Git, because it points at this
+machine's checkout: everyone who clones the project runs `init` from their own
+checkout. A `.gitignore` does not untrack files already committed; if an
+earlier install's skill folders are in Git, `init` names them and the
+`git rm -r --cached` command that takes them out.
+
 </details>
 
 ## Use
@@ -158,6 +165,7 @@ project install), or type `$` in Codex and pick the skill.
 | `.genesis/edd/<change>/runs/` | run records and before/after comparisons | no |
 | `.genesis/edd/<change>/reports/` | one report per run of the implementation loop | yes |
 | `.genesis/edd/<change>/accepted.json` | the user's acceptance of a passing run, with earlier ones | yes |
+| `.agents/skills/<skill>/`, `.claude/skills/<skill>/` | the four Genesis EDD skills, installed from a checkout by `init` | no |
 
 ## Skills
 
@@ -177,6 +185,7 @@ project install), or type `$` in Codex and pick the skill.
   new session.
 - **Checkout:** run `git pull` and `npm ci --ignore-scripts`, then run `init`
   again for each project. Installed files you edited are left as they are.
+  Read its `warnings`: it names skill folders an earlier install committed.
 
 ## License
 

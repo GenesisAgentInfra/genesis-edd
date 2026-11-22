@@ -347,6 +347,44 @@ test('later iterations can override onboarding mode and invalid maps leave no ch
   assert.equal(existsSync(path.join(repo, 'openspec/changes/invalid-map')), false);
 });
 
+test('init keeps a .gitignore of the user\'s own in a skill folder and names skill folders an earlier install committed', (t) => {
+  const repo = project(t, 'new', 'none');
+  const git = (args) => {
+    const result = spawnSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  };
+  git(['init', '-b', 'main']);
+  const own = path.join(repo, '.claude/skills/run-eval/.gitignore');
+  mkdirSync(path.dirname(own), { recursive: true });
+  writeFileSync(own, 'local-notes.md\n');
+  const first = initProject(repo, 'new', 'claude');
+  assert.equal(readFileSync(own, 'utf8'), 'local-notes.md\n');
+  assert.ok(!first.created.includes('.claude/skills/run-eval/.gitignore'));
+  assert.ok(first.created.includes('.claude/skills/write-eval/.gitignore'));
+  assert.deepEqual(first.warnings, []);
+
+  // An earlier install whose folders were committed stays tracked: init says so.
+  git(['add', '-f', '.claude/skills/agent-spec', '.claude/skills/write-eval']);
+  git(['commit', '-q', '-m', 'Commit installed skills']);
+  const again = initProject(repo, 'new', 'claude');
+  assert.equal(again.warnings.length, 1);
+  assert.match(again.warnings[0], /git rm -r --cached \.claude\/skills\/agent-spec \.claude\/skills\/write-eval`/);
+  assert.doesNotMatch(again.warnings[0], /run-eval|loop-and-implement/);
+});
+
+test('the Map of a Genesis change review is refused: it covers only the flows that change touched', (t) => {
+  const repo = project(t, 'existing');
+  const review = path.join(repo, '.genesis/out/latest');
+  mkdirSync(review, { recursive: true });
+  writeFileSync(path.join(review, 'business-map.json'), JSON.stringify({ snapshot_id: 'sha256:review', analysis_status: 'complete' }));
+  writeFileSync(path.join(review, 'change-report.json'), '{}');
+  assert.throws(() => newSpec(repo, 'after-review', { map: path.join(review, 'business-map.json') }), /change review/);
+  assert.equal(existsSync(path.join(repo, 'openspec/changes/after-review')), false);
+  rmSync(path.join(review, 'change-report.json'));
+  assert.equal(newSpec(repo, 'after-map', { map: path.join(review, 'business-map.json') }).context.map.status, 'available');
+});
+
 test('init is idempotent, preserves existing config and preflights conflicts', (t) => {
   const repo = project(t);
   assert.deepEqual(initProject(repo, 'new', 'none').created, []);
@@ -372,6 +410,10 @@ test('agent-spec installs for both agents and runs the pinned CLI', (t) => {
     assert.equal(JSON.parse(result.stdout).openspec, '2.1.0');
     assert.match(readFileSync(path.join(scripts, '.gitignore'), 'utf8'), /runtime.json/);
     assert.equal(existsSync(path.join(repo, directory, 'skills/genesis-spec')), false);
+    // The installed skills point at this machine's checkout and stay out of Git.
+    for (const skill of ['agent-spec', 'write-eval', 'run-eval', 'loop-and-implement']) {
+      assert.equal(readFileSync(path.join(repo, directory, 'skills', skill, '.gitignore'), 'utf8'), '*\n');
+    }
   }
   assert.deepEqual(initProject(repo, 'new', 'both').created, []);
 });

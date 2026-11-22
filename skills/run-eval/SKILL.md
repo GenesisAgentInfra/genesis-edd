@@ -33,7 +33,9 @@ the user unless that run is already authorized.
 1. Run `edd workflow check run-eval <change> --repo <app>`. Route package gaps
    to `write-eval` and Spec gaps to `agent-spec`. A missing tool is not a
    failing check: install it or ask the user to start it. Its `next.command` is
-   the baseline command until a baseline is recorded for this Spec.
+   the baseline command until a baseline is recorded for this Spec. After the
+   user accepts a run of the loop, `next.action` is `loop_done`: the loop is
+   finished, and `loop status` says what is left.
 2. Record the baseline before any code for this change is written.
    - **An implementation exists:** write the expected baseline result of each
      check from what this change does, then run
@@ -48,7 +50,9 @@ the user unless that run is already authorized.
    run is compared with that one baseline.
 4. Read the returned summary, then `run.json`, `compare.json` and each case's
    `logs/` in the run folder. Report every check with its before and after
-   result, and say which kind of evidence stands behind the verdict.
+   result, and say which kind of evidence stands behind the verdict. The
+   summary counts every check under `compare` and the gating ones alone under
+   `compare_gating`; only gating checks decide the verdict.
 
 The expectation file is a JSON array. Keep it beside the packages, as
 `.genesis/edd/<change>/baseline-expectations.json`:
