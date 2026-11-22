@@ -31,7 +31,8 @@ The loop needs the project in Git. It records the code of every run and never
 commits for you.
 The skills start from ordinary requests. Each stage checks its inputs first and
 sends the agent back to the stage that owns a gap. It works in a new project or
-an existing one, and uses a Genesis Map when you have one.
+an existing one, and uses a Genesis Map when you have one: a copy goes into Git
+with the spec.
 
 ## Install
 
@@ -158,7 +159,7 @@ project install), or type `$` in Codex and pick the skill.
 
 | Path | Holds | In Git |
 | --- | --- | --- |
-| `openspec/` | specs and their exported versions | yes |
+| `openspec/` | specs, their exported versions, and the Genesis Map each was written against (`business-map.json`) | yes |
 | `.genesis/edd/harness/` | the project kit shared by every eval package | yes |
 | `.genesis/edd/<change>/evals/` | one Harbor task package per scenario | yes |
 | `.genesis/edd/<change>/checks/` | proofs that each package's checks work | no |

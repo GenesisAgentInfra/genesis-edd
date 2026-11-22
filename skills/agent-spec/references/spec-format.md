@@ -98,7 +98,8 @@ an existing accepted rule: copy its entire block with the exact existing heading
 then apply the user's delta. Include all scenarios that remain valid. v0.1 accepts
 ADDED/MODIFIED only; removal/rename lifecycle and main-spec promotion are deferred.
 Do not use automatic OpenSpec archive/sync yet: Genesis provenance metadata must
-also be merged, and v0.1 does not implement that integration. Read prior changes
+also be merged, and v0.1 does not implement that integration. Archive also moves
+the change folder, which the Map path in genesis.json and the EDD records name. Read prior changes
 and handoffs as well as any pre-existing `openspec/specs` documents.
 
 Each requirement has at least one `#### Scenario:` with a WHEN/GIVEN trigger and
@@ -112,10 +113,21 @@ only when the preamble contains just frontmatter and an optional title: its hand
 preserves both, and archive/sync is unsupported. Every other strict warning or error
 still blocks validation. Raw upstream diagnostics remain in the JSON response.
 
-`genesis.json` beside the specs records project mode, base commit if present, Map
-snapshot/digest or an explicit absence, and baseline `not_run`. It is technical
-context, not a source of business requirements. A provided Map may be partial or
-stale; source identity alone does not prove coverage or freshness.
+`genesis.json` beside the specs records project mode, base commit if present, the
+Map (path, digest, snapshot and analysis status) or an explicit absence, and
+baseline `not_run`. It is technical context, not a source of business
+requirements. A provided Map may be partial or stale; source identity alone does
+not prove coverage or freshness.
+
+With `--map`, `spec new` copies the Map byte for byte into the change folder as
+`business-map.json`, and genesis.json points at that copy. Genesis's own output
+under `.genesis/out` stays out of Git; the copy is committed and reviewed with
+the Spec. Edit neither file: every export records genesis.json, so a change to it
+is a different export. A change made before the copy existed records
+`.genesis/out/...`. Once a copy is in its change folder, the copy decides, as it
+does on other clones, and it must have the recorded digest; until then the
+recorded file is read. Checks warn when the Map file is ignored by Git, or
+untracked while genesis.json is tracked.
 
 ## Impact
 

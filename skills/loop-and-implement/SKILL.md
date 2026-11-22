@@ -88,10 +88,10 @@ with a second checkout.
 
 ## Rules
 
-- Never edit the Spec, `checks.json`, a fixture's expected result, a
-  verifier's decision or a baseline to make a check pass. A wrong check is a
-  `write-eval` fix with its own evidence, proved by `eval check` and named in
-  the report. A wrong or unclear requirement is the user's decision, through
+- Never edit the Spec, its `genesis.json` or Map copy, `checks.json`, a
+  fixture's expected result, a verifier's decision or a baseline to make a
+  check pass. A wrong check is a `write-eval` fix with its own evidence,
+  proved by `eval check` and named in the report. A wrong or unclear requirement is the user's decision, through
   `agent-spec`.
 - Never special-case the eval inputs in application code: a known title, an
   ID, a fixed date.

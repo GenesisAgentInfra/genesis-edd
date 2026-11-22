@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -281,13 +282,22 @@ test('existing project records real Git base and Map identity; stale contents bl
   const mapFile = path.join(repo, 'map.json');
   writeFileSync(mapFile, JSON.stringify({ snapshot_id: 'sha256:example', analysis_status: 'partial' }));
   const created = newSpec(repo, 'report-notifications', { map: mapFile });
+  // Partial, but no step is named from code: nothing to warn about.
+  assert.deepEqual(created.warnings, []);
   assert.equal(created.context.code.base_commit, git(['rev-parse', 'HEAD']));
   assert.equal(created.context.map.status, 'available');
   assert.equal(created.context.map.analysis_status, 'partial');
   assert.equal(created.context.map.freshness, 'unverified');
+  // The Map is copied into the change folder and recorded there.
+  const copy = path.join(repo, 'openspec/changes/report-notifications/business-map.json');
+  assert.equal(created.context.map.path, 'openspec/changes/report-notifications/business-map.json');
+  assert.deepEqual(readFileSync(copy), readFileSync(mapFile));
   writeSpec(repo);
   assert.equal(validateSpec(repo, 'report-notifications').ready_for_eval_design, true);
+  // The original no longer matters; the copy does.
   writeFileSync(mapFile, JSON.stringify({ snapshot_id: 'sha256:changed', analysis_status: 'complete' }));
+  assert.equal(validateSpec(repo, 'report-notifications').ready_for_eval_design, true);
+  writeFileSync(copy, JSON.stringify({ snapshot_id: 'sha256:changed', analysis_status: 'complete' }));
   assert.throws(() => exportSpec(repo, 'report-notifications'), /Referenced Map changed/);
 });
 
@@ -382,7 +392,146 @@ test('the Map of a Genesis change review is refused: it covers only the flows th
   assert.throws(() => newSpec(repo, 'after-review', { map: path.join(review, 'business-map.json') }), /change review/);
   assert.equal(existsSync(path.join(repo, 'openspec/changes/after-review')), false);
   rmSync(path.join(review, 'change-report.json'));
-  assert.equal(newSpec(repo, 'after-map', { map: path.join(review, 'business-map.json') }).context.map.status, 'available');
+  const created = newSpec(repo, 'after-map', { map: path.join(review, 'business-map.json') });
+  assert.equal(created.context.map.status, 'available');
+  assert.equal(created.context.map.path, 'openspec/changes/after-map/business-map.json');
+  assert.ok(existsSync(path.join(repo, 'openspec/changes/after-map/business-map.json')));
+});
+
+test('the Map is copied byte for byte, from anywhere, and a partial Map with code-named steps is flagged', (t) => {
+  const repo = project(t, 'existing');
+  const outside = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-map-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  // Non-ASCII text, Windows line ends and no final newline survive as they are.
+  const bytes = Buffer.from('{"snapshot_id":"sha256:outside","analysis_status":"complete",\r\n"flows":[{"flow_id":"flow_refund","name":"退款审核","steps":[{"support":"agent_synthesis"}]}]}', 'utf8');
+  const complete = path.join(outside, 'business-map.json');
+  writeFileSync(complete, bytes);
+  const created = newSpec(repo, 'from-outside', { map: complete });
+  assert.equal(created.context.map.path, 'openspec/changes/from-outside/business-map.json');
+  assert.deepEqual(readFileSync(path.join(repo, created.context.map.path)), bytes);
+  assert.equal(created.context.map.sha256, `sha256:${createHash('sha256').update(bytes).digest('hex')}`);
+  assert.deepEqual(created.warnings, []);
+
+  const partial = path.join(outside, 'partial.json');
+  writeFileSync(partial, JSON.stringify({ snapshot_id: 'sha256:partial', analysis_status: 'partial', flows: [
+    { flow_id: 'flow_a', name: 'Described', steps: [{ support: 'agent_synthesis' }] },
+    { flow_id: 'flow_b', name: 'POST /refunds · refund', steps: [{ support: 'static_fact', name: 'if amount > 100:' }, { support: 'static_fact', name: 'return deny()' }] },
+  ] }));
+  const flagged = newSpec(repo, 'from-partial', { map: partial });
+  assert.equal(flagged.warnings.length, 1);
+  assert.match(flagged.warnings[0], /^2 of the 3 steps in this Map belong to flows Genesis has not described yet and are named from the source code/);
+  assert.match(flagged.warnings[0], /openspec\/changes\/from-partial\/business-map\.json is committed with the Spec/);
+  // Nothing is copied where there is no Map.
+  newSpec(repo, 'no-map');
+  assert.equal(existsSync(path.join(repo, 'openspec/changes/no-map/business-map.json')), false);
+});
+
+test('a committed Spec and its Map copy check out on another clone; Git gaps are named', (t) => {
+  const repo = project(t, 'existing');
+  const git = (cwd, args) => {
+    const result = spawnSync('git', ['-C', cwd, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  };
+  git(repo, ['init', '-q', '-b', 'main']);
+  // Genesis keeps its own output out of Git.
+  mkdirSync(path.join(repo, '.genesis/out/ses_1'), { recursive: true });
+  writeFileSync(path.join(repo, '.genesis/.gitignore'), 'sessions/\nout/\n');
+  const original = path.join(repo, '.genesis/out/ses_1/business-map.json');
+  writeFileSync(original, JSON.stringify({ snapshot_id: 'sha256:one', analysis_status: 'complete', flows: [{ flow_id: 'flow_submit', name: 'Submit a report' }] }));
+  newSpec(repo, 'report-notifications', { map: original });
+  writeSpec(repo);
+  const before = validateSpec(repo, 'report-notifications');
+  assert.equal(before.ready_for_eval_design, true, JSON.stringify(before.errors));
+  assert.doesNotMatch(before.warnings.join('\n'), /Git/);
+  // An ignore rule that would keep the copy out is named before the first commit.
+  writeFileSync(path.join(repo, '.gitignore'), 'business-map.json\n');
+  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /openspec\/changes\/report-notifications\/business-map\.json is ignored by Git, so other clones cannot check this Spec against its Map\. Commit it with the Spec\./);
+  rmSync(path.join(repo, '.gitignore'));
+  const exported = exportSpec(repo, 'report-notifications');
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'Spec']);
+  assert.doesNotMatch(validateSpec(repo, 'report-notifications').warnings.join('\n'), /Git/);
+
+  const clone = projectRoot(mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-clone-')));
+  t.after(() => rmSync(clone, { recursive: true, force: true }));
+  git(os.tmpdir(), ['clone', '-q', repo, clone]);
+  assert.equal(existsSync(path.join(clone, '.genesis/out')), false);
+  const there = validateSpec(clone, 'report-notifications');
+  assert.equal(there.ready_for_eval_design, true, JSON.stringify(there.errors));
+  assert.doesNotMatch(there.warnings.join('\n'), /Git/);
+  assert.equal(checkWorkflow(clone, 'write-eval', 'report-notifications').handoff.id, exported.id);
+  // A missing copy is restored from Git; a link to it would dangle elsewhere.
+  const cloned = path.join(clone, 'openspec/changes/report-notifications/business-map.json');
+  const kept = readFileSync(cloned);
+  rmSync(cloned);
+  const gone = checkWorkflow(clone, 'write-eval', 'report-notifications');
+  assert.equal(gone.gaps[0].code, 'map_unavailable');
+  assert.equal(gone.next.owner, 'agent');
+  assert.equal(gone.gaps[0].message, 'Referenced Map is unavailable: openspec/changes/report-notifications/business-map.json is missing. It is committed with the Spec, so restore it from Git. Do not edit genesis.json.');
+  writeFileSync(path.join(clone, 'map-elsewhere.json'), kept);
+  symlinkSync('../../../map-elsewhere.json', cloned);
+  assert.match(validateSpec(clone, 'report-notifications').errors.join('\n'), /business-map\.json is a symbolic link, which other clones cannot follow/);
+
+  // genesis.json committed without the copy beside it.
+  const copy = 'openspec/changes/report-notifications/business-map.json';
+  git(repo, ['rm', '-q', '--cached', copy]);
+  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /business-map\.json is not in Git, though genesis\.json is, so other clones cannot check this Spec against its Map\. Commit it with the Spec\./);
+  writeFileSync(path.join(repo, '.gitignore'), 'business-map.json\n');
+  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /business-map\.json is ignored by Git/);
+});
+
+test('a change made before the Map was copied keeps its genesis.json; a copy with the recorded digest stands in', (t) => {
+  const repo = project(t, 'existing');
+  const original = path.join(repo, '.genesis/out/ses_1/business-map.json');
+  mkdirSync(path.dirname(original), { recursive: true });
+  writeFileSync(original, JSON.stringify({ snapshot_id: 'sha256:one', analysis_status: 'complete', flows: [{ flow_id: 'flow_submit', name: 'Submit a report' }] }));
+  newSpec(repo, 'report-notifications', { map: original });
+  // What spec new recorded before: the path of Genesis's own output, no copy.
+  const change = path.join(repo, 'openspec/changes/report-notifications');
+  const contextFile = path.join(change, 'genesis.json');
+  const context = readJSON(contextFile);
+  writeFileSync(contextFile, `${JSON.stringify({ ...context, map: { ...context.map, path: '.genesis/out/ses_1/business-map.json' } }, null, 2)}\n`);
+  rmSync(path.join(change, 'business-map.json'));
+  writeSpec(repo);
+  const exported = exportSpec(repo, 'report-notifications');
+  assert.equal(validateSpec(repo, 'report-notifications').ready_for_eval_design, true);
+  // A path written on Windows still resolves.
+  const exportedContext = readFileSync(contextFile);
+  writeFileSync(contextFile, `${JSON.stringify({ ...context, map: { ...context.map, path: '.genesis\\out\\ses_1\\business-map.json' } }, null, 2)}\n`);
+  assert.equal(validateSpec(repo, 'report-notifications').ready_for_eval_design, true);
+  writeFileSync(contextFile, exportedContext);
+
+  // Genesis rewrote its output: the recorded file changed. A copy with the
+  // recorded digest decides, and impact is still checked against it.
+  const bytes = readFileSync(original);
+  writeFileSync(original, '{}');
+  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').gaps[0].code, 'map_changed');
+  assert.match(checkWorkflow(repo, 'write-eval', 'report-notifications').gaps[0].message, /Genesis rewrites \.genesis\/out\/latest\/ on every run, so look in the \.genesis\/out\/<session>\/ folders\. Copy it to openspec\/changes\/report-notifications\/business-map\.json/);
+  writeFileSync(path.join(change, 'business-map.json'), bytes);
+  let changed = checkWorkflow(repo, 'write-eval', 'report-notifications');
+  assert.equal(changed.status, 'ready', JSON.stringify(changed.gaps));
+  assert.equal(changed.handoff.id, exported.id);
+  const impactFile = path.join(change, 'impact.md');
+  writeFileSync(impactFile, '---\ngenesis_impact: 1\nentries:\n  - flow: flow_unknown\n    entry: POST /reports\n    effect: changes\n    evidence: openspec/changes/report-notifications/genesis.json\n---\n');
+  assert.match(validateSpec(repo, 'report-notifications').errors.join('\n'), /not in the recorded Map: flow_unknown/);
+  rmSync(impactFile);
+  rmSync(path.join(change, 'business-map.json'));
+
+  // Another clone: Genesis's output is not there.
+  rmSync(path.join(repo, '.genesis/out'), { recursive: true });
+  let result = checkWorkflow(repo, 'write-eval', 'report-notifications');
+  assert.equal(result.gaps[0].code, 'map_unavailable');
+  assert.match(result.gaps[0].message, /genesis\.json records \.genesis\/out\/ses_1\/business-map\.json, which this checkout does not have \(Genesis keeps its output out of Git\)\. Copy that file .* to openspec\/changes\/report-notifications\/business-map\.json/);
+
+  // The copy stands in without touching genesis.json, so the export still matches.
+  writeFileSync(path.join(change, 'business-map.json'), bytes);
+  result = checkWorkflow(repo, 'write-eval', 'report-notifications');
+  assert.equal(result.status, 'ready', JSON.stringify(result.gaps));
+  assert.equal(result.handoff.id, exported.id);
+  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /genesis\.json records the Map at \.genesis\/out\/ses_1\/business-map\.json; openspec\/changes\/report-notifications\/business-map\.json has the recorded digest and is used, as on other clones\./);
+  writeFileSync(path.join(change, 'business-map.json'), '{}');
+  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').gaps[0].code, 'map_changed');
 });
 
 test('init is idempotent, preserves existing config and preflights conflicts', (t) => {
@@ -620,7 +769,7 @@ test('broken context and changed Map snapshots route to technical recovery witho
   writeFileSync(map, JSON.stringify({ snapshot_id: 'original', analysis_status: 'partial' }));
   newSpec(repo, 'report-notifications', { map });
   writeSpec(repo);
-  writeFileSync(map, JSON.stringify({ snapshot_id: 'changed', analysis_status: 'complete' }));
+  writeFileSync(path.join(repo, 'openspec/changes/report-notifications/business-map.json'), JSON.stringify({ snapshot_id: 'changed', analysis_status: 'complete' }));
   let result = checkWorkflow(repo, 'spec-export', 'report-notifications');
   assert.equal(result.gaps[0].code, 'map_changed');
   assert.equal(result.next.owner, 'agent');
@@ -632,6 +781,46 @@ test('broken context and changed Map snapshots route to technical recovery witho
     assert.equal(result.gaps[0].kind, 'technical');
     assert.equal(result.next.owner, 'agent');
   }
+});
+
+test('in Git, a committed copy decides for a change made before the Map was copied, on this machine too', (t) => {
+  const repo = project(t, 'existing');
+  const git = (args) => {
+    const result = spawnSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git(['init', '-q', '-b', 'main']);
+  const original = path.join(repo, '.genesis/out/ses_1/business-map.json');
+  mkdirSync(path.dirname(original), { recursive: true });
+  writeFileSync(path.join(repo, '.genesis/.gitignore'), 'sessions/\nout/\n');
+  writeFileSync(original, JSON.stringify({ snapshot_id: 'sha256:one', analysis_status: 'complete', flows: [] }));
+  newSpec(repo, 'report-notifications', { map: original });
+  const change = path.join(repo, 'openspec/changes/report-notifications');
+  const contextFile = path.join(change, 'genesis.json');
+  const context = readJSON(contextFile);
+  writeFileSync(contextFile, `${JSON.stringify({ ...context, map: { ...context.map, path: '.genesis/out/ses_1/business-map.json' } }, null, 2)}\n`);
+  rmSync(path.join(change, 'business-map.json'));
+  writeSpec(repo);
+  const exported = exportSpec(repo, 'report-notifications');
+  git(['add', '-A']);
+  git(['commit', '-q', '-m', 'Spec made before the copy']);
+  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /\.genesis\/out\/ses_1\/business-map\.json is ignored by Git, so other clones cannot check this Spec against its Map\. Copy it to openspec\/changes\/report-notifications\/business-map\.json and commit it with the Spec; do not edit genesis\.json\./);
+
+  // Following that advice clears it.
+  const copy = path.join(change, 'business-map.json');
+  writeFileSync(copy, readFileSync(original));
+  git(['add', '-A']);
+  git(['commit', '-q', '-m', 'Commit the Map copy']);
+  const fixed = validateSpec(repo, 'report-notifications');
+  assert.equal(fixed.ready_for_eval_design, true, JSON.stringify(fixed.errors));
+  assert.doesNotMatch(fixed.warnings.join('\n'), /Git/);
+  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').handoff.id, exported.id);
+
+  // A wrong copy fails here as it would on any clone, though the recorded file still matches.
+  writeFileSync(copy, JSON.stringify({ snapshot_id: 'sha256:later', analysis_status: 'complete' }));
+  const wrong = checkWorkflow(repo, 'write-eval', 'report-notifications');
+  assert.equal(wrong.gaps[0].code, 'map_changed');
+  assert.match(wrong.gaps[0].message, /^Referenced Map changed: openspec\/changes\/report-notifications\/business-map\.json no longer has the digest recorded in genesis\.json\. Other clones read this copy, so it must be the recorded Map\./);
 });
 
 test('CLI recovery resumes the original stage after a business decision is supplied', (t) => {

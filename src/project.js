@@ -45,8 +45,10 @@ const PREVIOUS_SKILL_HASHES = {
   'run-eval/references/run-records.md': [
     'sha256:0f2bafd0cf20299e5ab7d0f28ffbdbc657450d986d56cd708352ec1e761c5c61',
     'sha256:389a8ae7e97bd9e0ef6716f17c15fbddaf193a27f65bd4799cd825ef5ecd3024',
+    'sha256:c187814a77aa95d7a820159ac7475d86fca61b492ac6e025494a2c443b846998',
   ],
   'write-eval/references/harbor.md': ['sha256:560385a1e4ac0c91e0a1699c52b15ef5038181ec6cc9cf3e47bedaedebbabbfa'],
+  'write-eval/references/environment.md': ['sha256:50b827232d9df5f55ed603fc8d670440f5cd877b33f581b82aa7ee0768aaa964'],
   'loop-and-implement/SKILL.md': [
     'sha256:02d47d51ad3bcb6f8899622e70526fbf750a5047ce98661fd4df55e034356921',
     'sha256:1a71597ec5058d525133aec2936dec054800dc665d2769c9b1736417bce7ff9d',
@@ -54,6 +56,7 @@ const PREVIOUS_SKILL_HASHES = {
   'agent-spec/references/spec-format.md': [
     'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
     'sha256:99a3389ea7a87d2c61077a5f81252d39f594d6e86d5ad21f939c779020b56619',
+    'sha256:7fc70e45daeb8334e30c2c40d0dd18de1f8593f3987bbc4275fba63de4af8a58',
   ],
 };
 // Files Genesis itself writes are not changes to the application.
@@ -252,32 +255,45 @@ export function codeState(repo) {
   return { head: git(['rev-parse', '--verify', 'HEAD']), changed, git };
 }
 
-export function captureContext(repo, mode, mapFile) {
-  const { head, changed } = codeState(repo);
-  const workingTree = changed === null ? null : changed.join('\n');
-  let map = { status: mode === 'new' ? 'not_applicable' : 'missing', reason: mode === 'new' ? 'new_project' : 'not_provided' };
-  if (mapFile) {
-    const file = path.resolve(repo, mapFile);
-    const content = readFileSync(file, 'utf8');
-    const document = JSON.parse(content);
-    if (typeof document.snapshot_id !== 'string' || !document.snapshot_id || !['complete', 'partial'].includes(document.analysis_status)) {
-      throw new Error('Map must be a Genesis business-map.json with snapshot_id and analysis_status.');
-    }
-    // Genesis writes change-report.json beside the Map of a change review,
-    // which describes only the flows the change touched.
-    if (existsSync(path.join(path.dirname(file), 'change-report.json'))) {
-      throw new Error('This Map comes from a Genesis change review (change-report.json is beside it) and covers only the flows that change touched. Pass the business-map.json of a full map: run `/genesis map` first.');
-    }
-    map = {
-      status: 'available', path: path.relative(repo, file), sha256: digest(content),
+// The Map a Spec is written against is copied into its change folder, so it is
+// committed and reviewed with the Spec. Genesis keeps its own output out of Git.
+export const mapCopy = (name) => `openspec/changes/${name}/business-map.json`;
+
+// Reads the Map chosen for a new change. Its bytes are copied as they are, so
+// the copy keeps the digest of the file Genesis wrote.
+export function readMap(repo, mapFile, name) {
+  const file = path.resolve(repo, mapFile);
+  const bytes = readFileSync(file);
+  const document = JSON.parse(bytes.toString('utf8'));
+  if (typeof document?.snapshot_id !== 'string' || !document.snapshot_id || !['complete', 'partial'].includes(document.analysis_status)) {
+    throw new Error('Map must be a Genesis business-map.json with snapshot_id and analysis_status.');
+  }
+  // Genesis writes change-report.json beside the Map of a change review,
+  // which describes only the flows the change touched.
+  if (existsSync(path.join(path.dirname(file), 'change-report.json'))) {
+    throw new Error('This Map comes from a Genesis change review (change-report.json is beside it) and covers only the flows that change touched. Pass the business-map.json of a full map: run `/genesis map` first.');
+  }
+  // Until Genesis describes a flow, its steps are named by lines of source code.
+  const steps = (Array.isArray(document.flows) ? document.flows : []).flatMap((flow) => (Array.isArray(flow?.steps) ? flow.steps : []));
+  const coded = steps.filter((step) => step?.support === 'static_fact').length;
+  return {
+    bytes,
+    record: {
+      status: 'available', path: mapCopy(name), sha256: digest(bytes),
       snapshot_id: document.snapshot_id, analysis_status: document.analysis_status,
       freshness: 'unverified',
-    };
-  }
+    },
+    warnings: coded ? [`${coded} of the ${steps.length} steps in this Map belong to flows Genesis has not described yet and are named from the source code: by a line of code, or by the entry point for a flow's trigger. The copy at ${mapCopy(name)} is committed with the Spec, so that code goes into Git too. If it should not, tell the user before anything is committed: describing those flows with \`/genesis map\` replaces those names.`] : [],
+  };
+}
+
+export function captureContext(repo, mode, map = null) {
+  const { head, changed } = codeState(repo);
+  const workingTree = changed === null ? null : changed.join('\n');
   return {
     version: 1, project_mode: mode,
     code: { base_commit: head, working_tree_dirty: workingTree === null ? null : workingTree !== '', captured_at: new Date().toISOString() },
-    map,
+    map: map ?? { status: mode === 'new' ? 'not_applicable' : 'missing', reason: mode === 'new' ? 'new_project' : 'not_provided' },
     baseline: { status: 'not_run', availability: mode === 'new' ? 'no_implementation' : 'unknown' },
   };
 }

@@ -7,8 +7,11 @@ file is about what to build.
 ## Order
 
 1. Follow the evaluated agent through the tools, services and state this
-   scenario touches. Use the Genesis Map and `impact` from the Spec handoff when
-   they exist; read the code where they do not reach.
+   scenario touches. Use the Genesis Map in the change folder,
+   `openspec/changes/<change>/business-map.json` (a change made before the copy
+   existed may name a file under `.genesis/out` in the handoff's
+   `context.map.path` instead), and `impact` from the Spec handoff when they
+   exist; read the code where they do not reach.
 2. Keep the agent's own code as it is: tool names, argument shapes and errors
    stay those of production. Replace the service or data behind an interface.
 3. Choose how each external dependency is provided. Record the choice in

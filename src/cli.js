@@ -34,7 +34,7 @@ validate exits 1 for malformed specs; valid drafts report ready_for_eval_design=
 It rejects more explicit requirements than their quoted source states.
 It checks impact.md, when present, against the recorded Map and the project files.
 spec new --map takes the business-map.json of a full Genesis map, not of a
-change review.
+change review, and copies it into the change folder: commit it with the Spec.
 Once a Spec is exported, code that moves that evidence is a warning for later
 stages; a new export needs evidence that matches the code.
 export requires a valid spec with no proposed requirements or open questions and
