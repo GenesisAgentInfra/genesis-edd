@@ -1,9 +1,10 @@
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { parse } from 'yaml';
 import {
   SCHEMA, captureContext, changeDirectory, digest, listFiles, localPath,
-  openspec, readJSON, requireProject, writeJSON,
+  mapCopy, openspec, readJSON, readMap, requireProject, writeJSON,
 } from './project.js';
 
 export function newSpec(repo, name, options = {}) {
@@ -12,10 +13,24 @@ export function newSpec(repo, name, options = {}) {
   if (existsSync(directory)) throw new Error('Change already exists; edit it or choose a new change name.');
   const mode = options.mode ?? project.mode;
   if (!['new', 'existing'].includes(mode)) throw new Error('--mode must be new or existing.');
-  const context = captureContext(repo, mode, options.map);
+  // The Map is checked before anything is created.
+  const map = options.map ? readMap(repo, options.map, name) : null;
+  const context = captureContext(repo, mode, map?.record);
   const result = openspec(repo, ['new', 'change', name, '--schema', SCHEMA, '--json']);
+  // Written before genesis.json, which points at it.
+  if (map) writeFileSync(localPath(repo, map.record.path), map.bytes, { flag: 'wx' });
   writeJSON(path.join(directory, 'genesis.json'), context);
-  return { change: name, directory, context, openspec: result.data, instructions: specInstructions(repo, name) };
+  return { change: name, directory, context, warnings: map?.warnings ?? [], openspec: result.data, instructions: specInstructions(repo, name) };
+}
+
+// Whether Git keeps the Map a Spec depends on: null when it does or when this
+// is not a Git checkout, otherwise why other clones will not have it.
+function mapInGit(repo, file, genesisFile) {
+  const git = (...args) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', timeout: 10_000 }).status === 0;
+  if (!git('rev-parse', '--is-inside-work-tree')) return null;
+  if (git('check-ignore', '-q', '--', file)) return 'is ignored by Git';
+  const tracked = (target) => git('ls-files', '--error-unmatch', '--', target);
+  return tracked(path.relative(repo, genesisFile)) && !tracked(file) ? 'is not in Git, though genesis.json is' : null;
 }
 
 function requireChange(repo, name) {
@@ -189,14 +204,48 @@ export function validateSpec(repo, name) {
   }
   if (!['available', 'missing', 'not_applicable'].includes(context.map?.status)) error('map_invalid', 'Invalid Map status.');
   if (context.map?.status === 'available') {
-    try {
-      const mapContent = readFileSync(path.resolve(repo, context.map.path), 'utf8');
-      if (digest(mapContent) !== context.map.sha256) error('map_changed', 'Referenced Map changed; restore the recorded snapshot or create a new change with the updated Map.');
-      else {
-        const flows = JSON.parse(mapContent).flows;
-        mapFlows = new Map((Array.isArray(flows) ? flows : []).map((flow) => [flow.flow_id, flow.name]));
+    const recorded = typeof context.map.path === 'string' ? context.map.path.replaceAll('\\', '/') : null;
+    const copy = mapCopy(name);
+    // Changes made before the Map was copied record it under .genesis/out,
+    // which other clones do not have. A copy in the change folder decides for
+    // them, as it does on every clone; genesis.json stays as it was exported.
+    const full = (file) => path.resolve(repo, file);
+    const linked = (file) => { try { return lstatSync(full(file)).isSymbolicLink(); } catch { return false; } };
+    const chosen = recorded !== copy && (existsSync(full(copy)) || linked(copy)) ? copy
+      : recorded && (existsSync(full(recorded)) || linked(recorded)) ? recorded : null;
+    const legacy = recorded !== copy;
+    const look = `Find the file whose digest is ${context.map.sha256}: Genesis rewrites .genesis/out/latest/ on every run, so look in the .genesis/out/<session>/ folders.`;
+    let bytes = null;
+    if (chosen && linked(chosen)) {
+      error('map_unavailable', `Referenced Map is unavailable: ${chosen} is a symbolic link, which other clones cannot follow. Replace it with a copy of the file itself.`);
+    } else if (!chosen) {
+      error('map_unavailable', !legacy
+        ? `Referenced Map is unavailable: ${copy} is missing. It is committed with the Spec, so restore it from Git. Do not edit genesis.json.`
+        : `Referenced Map is unavailable: genesis.json records ${recorded ?? 'no path'}, which this checkout does not have${recorded?.startsWith('.genesis/') ? ' (Genesis keeps its output out of Git)' : ''}. Copy that file from the machine that made it to ${copy}, where its digest must still be ${context.map.sha256}, and commit it with the Spec. Do not edit genesis.json, which is part of the exported Spec.`);
+    } else {
+      try { bytes = readFileSync(full(chosen)); } catch { bytes = null; }
+      if (bytes === null || digest(bytes) !== context.map.sha256) {
+        error('map_changed', `Referenced Map changed: ${chosen} no longer has the digest recorded in genesis.json. ${!legacy
+          ? 'Restore it from Git, or create a new change with the updated Map.'
+          : chosen === copy
+            ? `Other clones read this copy, so it must be the recorded Map. ${look} Copy it there. Do not edit genesis.json.`
+            : `${look} Copy it to ${copy} and commit it with the Spec, or create a new change with the updated Map. Do not edit genesis.json.`}`);
+        bytes = null;
       }
-    } catch { error('map_unavailable', 'Referenced Map is unavailable; restore its snapshot before export.'); }
+    }
+    if (bytes !== null) {
+      let flows;
+      let parsed = false;
+      try { flows = JSON.parse(bytes.toString('utf8'))?.flows; parsed = true; } catch {
+        error('map_unavailable', `Referenced Map is unavailable: ${chosen} is not valid JSON.`);
+      }
+      if (parsed) {
+        mapFlows = new Map((Array.isArray(flows) ? flows : []).map((flow) => [flow?.flow_id, flow?.name]));
+        if (legacy && chosen === copy) warnings.push(`genesis.json records the Map at ${recorded ?? 'no path'}; ${copy} has the recorded digest and is used, as on other clones.`);
+        const kept = mapInGit(repo, chosen, path.join(directory, 'genesis.json'));
+        if (kept) warnings.push(`${chosen} ${kept}, so other clones cannot check this Spec against its Map.${chosen === copy ? ' Commit it with the Spec.' : ` Copy it to ${copy} and commit it with the Spec; do not edit genesis.json.`}`);
+      }
+    }
     warnings.push('Map freshness against the current code is not automatically verified.');
   } else if (context.project_mode === 'existing') {
     warnings.push('No Map supplied for an existing project; use repository facts and record coverage limits.');

@@ -237,6 +237,7 @@ test('before any head run loop status says iterate and lists the gating checks t
   ]);
   assert.equal(status.next.action, 'iterate');
   assert.match(status.next.message, /Open: submit-failure-s1\/c1=fail\./);
+  assert.match(status.next.message, /nothing has to be committed/);
   assert.doesNotMatch(status.next.message, /submit-success-s1/);
   assert.deepEqual(status.next.pending_packages, []);
   assert.deepEqual(status.regressions, []);
@@ -269,9 +270,9 @@ test('a failing full run asks for its report, which loop report writes once and 
   const skeleton = readFileSync(written.file, 'utf8');
   assert.ok(skeleton.split('\n')[0].includes(TEMPLATE_MARK));
   for (const row of [
-    '| submit-failure-s1 | c1 | REQ-submit-failure | fail | fail | violated |',
-    '| submit-success-s1 | c1 | REQ-submit-success | pass | pass | holds |',
-    '| submit-success-s1 | c2 | REQ-submit-success | pass | pass | holds |',
+    '| submit-failure-s1 | c1 | REQ-submit-failure | gating | fail | fail | violated |',
+    '| submit-success-s1 | c1 | REQ-submit-success | gating | pass | pass | holds |',
+    '| submit-success-s1 | c2 | REQ-submit-success | gating | pass | pass | holds |',
   ]) assert.ok(skeleton.includes(row), `${row} in\n${skeleton}`);
   assert.match(skeleton, /^- `submit-failure-s1` `c1` \(violated\):$/m);
   assert.doesNotMatch(skeleton, /^## Review/m);
@@ -520,6 +521,10 @@ test('an accepted run is recorded with its checks and the acceptance, and the sa
   const command = ['loop', 'accept', CHANGE, '--repo', repo, '--run', run.run_id, '--by', ' Dana ', '--ref', ' review thread 12 '];
   const result = cli(command);
   assert.equal(result.status, 0, result.stderr);
+  // The run was on a clean commit, so nothing is left to commit.
+  assert.equal(result.json.commit, head);
+  assert.match(result.json.next, new RegExp(`committed in ${head.slice(0, 7)}`));
+  assert.doesNotMatch(result.json.next, /Offer to commit/);
   const file = path.join(root, 'accepted.json');
   assert.equal(result.json.file, file);
   const accepted = readJSON(file);
@@ -529,10 +534,11 @@ test('an accepted run is recorded with its checks and the acceptance, and the sa
   assert.equal(accepted.baseline, base.run_id);
   assert.equal(accepted.commit, head);
   assert.equal(accepted.code_digest, record.code_snapshot.digest);
+  assert.equal(accepted.code_digest_of, 'content');
   assert.deepEqual(accepted.checks, [
-    { case: 'submit-failure-s1', check: 'c1', intent: 'REQ-submit-failure', before: 'fail', after: 'pass', verdict: 'holds' },
-    { case: 'submit-success-s1', check: 'c1', intent: 'REQ-submit-success', before: 'pass', after: 'pass', verdict: 'holds' },
-    { case: 'submit-success-s1', check: 'c2', intent: 'REQ-submit-success', before: 'pass', after: 'pass', verdict: 'holds' },
+    { case: 'submit-failure-s1', check: 'c1', intent: 'REQ-submit-failure', role: 'gating', before: 'fail', after: 'pass', verdict: 'holds' },
+    { case: 'submit-success-s1', check: 'c1', intent: 'REQ-submit-success', role: 'gating', before: 'pass', after: 'pass', verdict: 'holds' },
+    { case: 'submit-success-s1', check: 'c2', intent: 'REQ-submit-success', role: 'gating', before: 'pass', after: 'pass', verdict: 'holds' },
   ]);
   assert.equal(accepted.accepted.by, 'Dana');
   assert.equal(accepted.accepted.ref, 'review thread 12');
@@ -1433,4 +1439,146 @@ test('a missing loop baseline blocks workflow check run-eval too, and the restor
   writeFileSync(file, `${JSON.stringify(older, null, 2)}\n`);
   const gap = checkWorkflow(repo, 'loop-and-implement', CHANGE).gaps.find((entry) => entry.code === 'loop_baseline_missing');
   assert.ok(gap.message.includes(`commit ${loop.base_commit}`), gap.message);
+});
+
+test('after acceptance the minutes stop at the acceptance, and done offers a commit until the accepted code is committed', (t) => {
+  const project = inLoop(t, { minutes: 60 });
+  const { repo, root } = project;
+  // The change is left uncommitted when it runs and is accepted.
+  setResults(repo, AFTER);
+  writeFileSync(path.join(repo, 'app/handler.txt'), 'Stop the success notice when a submission fails\n');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  const result = acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'review thread 12' });
+  assert.equal(result.commit, undefined);
+  assert.match(result.next, /Offer to commit the change/);
+
+  let status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.next.commit, undefined);
+  assert.match(status.next.message, /Offer to commit the change/);
+
+  // The clock stops when the user accepts, however long ago that was.
+  const accepted = readJSON(path.join(root, 'accepted.json'));
+  editLoop(project, (loop) => { loop.clock_started_at = minutesAgo(50); });
+  accepted.accepted.at = minutesAgo(43);
+  writeFileSync(path.join(root, 'accepted.json'), `${JSON.stringify(accepted, null, 2)}\n`);
+  status = loopStatus(repo, CHANGE);
+  near(status.loop.used.minutes, 7);
+  assert.equal(status.next.action, 'done');
+
+  // Committing the accepted code leaves only a merge or a pull request.
+  const head = commit(repo, 'Stop the success notice when a submission fails');
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.next.commit, head);
+  assert.match(status.next.message, new RegExp(`committed in ${head.slice(0, 7)}`));
+  assert.doesNotMatch(status.next.message, /Offer to commit/);
+  assert.ok(!status.warnings.some((warning) => /covers that run's code only/.test(warning)), JSON.stringify(status.warnings));
+
+  // A later edit is not covered by the acceptance, committed or not.
+  writeFileSync(path.join(repo, 'app/handler.txt'), 'another edit\n');
+  commit(repo, 'Another edit');
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.commit, undefined);
+  assert.ok(status.warnings.some((warning) => /covers that run's code only/.test(warning)), JSON.stringify(status.warnings));
+});
+
+test('without the accepted run folder, loop status still tells whether the code moved past the accepted run, also for an older record', (t) => {
+  const project = inLoop(t);
+  const { repo, root, runs } = project;
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'review thread 12' });
+  const file = path.join(root, 'accepted.json');
+  const record = readJSON(file);
+  assert.equal(record.code_digest_of, 'content');
+  rmSync(path.join(runs, run.run_id), { recursive: true });
+
+  const moved = () => loopStatus(repo, CHANGE).warnings.some((warning) => /covers that run's code only/.test(warning));
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'done');
+  assert.equal(moved(), false);
+  const scratch = path.join(repo, 'app/scratch.txt');
+  writeFileSync(scratch, 'an edit after the acceptance\n');
+  assert.equal(moved(), true);
+  rmSync(scratch);
+
+  // A record written before code_digest_of compares by its commit, since the
+  // accepted run had nothing uncommitted.
+  const { code_digest_of: kind, ...older } = record;
+  assert.equal(kind, 'content');
+  writeFileSync(file, `${JSON.stringify({ ...older, code_digest: 'sha256:digest-of-commit-and-files' }, null, 2)}\n`);
+  assert.equal(moved(), false);
+  writeFileSync(scratch, 'an edit after the acceptance\n');
+  assert.equal(moved(), true);
+});
+
+test('once a run of the loop is accepted, workflow check run-eval points at loop status instead of another run', (t) => {
+  const project = inLoop(t);
+  const { repo } = project;
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'run_eval');
+  acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'review thread 12' });
+  const check = checkWorkflow(repo, 'run-eval', CHANGE);
+  assert.equal(check.status, 'ready');
+  assert.equal(check.next.action, 'loop_done');
+  assert.deepEqual(check.next.command, ['loop', 'status', CHANGE, '--repo', repo]);
+  assert.match(check.next.note, new RegExp(run.run_id));
+
+  // A finished loop needs no Docker: stopping it afterwards blocks nothing.
+  project.tools.docker(false);
+  const stopped = checkWorkflow(repo, 'run-eval', CHANGE);
+  assert.equal(stopped.status, 'ready', JSON.stringify(stopped.gaps));
+  assert.equal(stopped.next.action, 'loop_done');
+  project.tools.docker(true);
+
+  // A new export starts a new loop; the old acceptance does not finish it.
+  exportRevision(project);
+  const revised = checkWorkflow(repo, 'run-eval', CHANGE);
+  assert.equal(revised.status, 'ready', JSON.stringify(revised.gaps));
+  assert.equal(revised.next.action, 'record_baseline');
+});
+
+test('an acceptance of uncommitted code still tells whether the code moved once the run folder is gone', (t) => {
+  const project = inLoop(t);
+  const { repo, root, runs } = project;
+  setResults(repo, AFTER);
+  writeFileSync(path.join(repo, 'app/handler.txt'), 'Stop the success notice when a submission fails\n');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'review thread 12' });
+  const record = readJSON(path.join(root, 'accepted.json'));
+  assert.ok(record.uncommitted_files.length, JSON.stringify(record));
+  assert.equal(record.code_digest_of, 'content');
+  rmSync(path.join(runs, run.run_id), { recursive: true });
+
+  const moved = () => loopStatus(repo, CHANGE).warnings.some((warning) => /covers that run's code only/.test(warning));
+  assert.equal(moved(), false);
+  writeFileSync(path.join(repo, 'app/handler.txt'), 'another edit\n');
+  assert.equal(moved(), true);
+});
+
+test('the report marks each check gating or diagnostic and says only gating checks decide', (t) => {
+  const project = inLoop(t);
+  const { repo, root } = project;
+  const file = path.join(root, 'evals', SUCCESS, 'tests/checks.json');
+  const declared = readJSON(file);
+  declared.checks = declared.checks.map((check) => (check.id === 'c2' ? { ...check, role: 'diagnostic' } : check));
+  writeFileSync(file, `${JSON.stringify(declared, null, 2)}\n`);
+  checkEval(repo, CHANGE, { case: SUCCESS });
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  assert.deepEqual(run.compare_gating, { holds: 1, violated: 0, base_mismatch: 0, head_only: 1, unverified: 0 });
+  const text = readFileSync(writeReport(repo, CHANGE, { run: run.run_id }).file, 'utf8');
+  assert.match(text, /Only gating checks decide the verdict/);
+  assert.match(text, /^\| Case \| Check \| Requirement \| Role \| Before \| After \| Verdict \|$/m);
+  assert.match(text, /^\| submit-success-s1 \| c2 \| REQ-submit-success \| diagnostic \| — \| pass \| head_only \|$/m);
+  completeReport(repo, run.run_id);
+  acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'review thread 12' });
+  assert.deepEqual(readJSON(path.join(root, 'accepted.json')).checks.map((entry) => [entry.case, entry.check, entry.role]), [
+    ['submit-failure-s1', 'c1', 'gating'], ['submit-success-s1', 'c1', 'gating'], ['submit-success-s1', 'c2', 'diagnostic'],
+  ]);
 });

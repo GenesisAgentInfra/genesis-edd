@@ -71,7 +71,9 @@ an expected result.
 7. Run `edd eval check <change> --repo <app>`. It puts each fixture in the
    agent's place and runs the real verifier through Harbor. A package is ready
    only while this record matches the package and the kit, so run it again after
-   any edit. It needs Docker and Harbor, and calls no model.
+   any edit. Packages whose record still matches are skipped and listed under
+   `already_proved`; `--case <id>` proves one again. It needs Docker and
+   Harbor, and calls no model.
 
 There is no flag to mark a package ready. Do not look for one.
 
