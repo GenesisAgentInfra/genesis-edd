@@ -30,6 +30,7 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:33663ac9eb83b705a9cfd2fcc11fe78805082404804fed590f163d91e1f0ba09',
     'sha256:9d037e3bc2c705df8abf1ecc8a64d9bd56397b9aeca081ffe34f1017932d5993',
     'sha256:469c2182dfc7f4e4b5c2252a28891379daaa7b4f873da1a149035aaea1e5d171',
+    'sha256:8778cd7d6dc3c144e96c758f1f149b1ae35c530a3a52df42a5305a832c113142',
   ],
   'agent-spec/scripts/run.mjs': ['sha256:881a4b48652d858fa99c6cccacd9549910b64631152884beef6bb88a70fc1e9a'],
   'write-eval/SKILL.md': [
@@ -46,17 +47,20 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:0f2bafd0cf20299e5ab7d0f28ffbdbc657450d986d56cd708352ec1e761c5c61',
     'sha256:389a8ae7e97bd9e0ef6716f17c15fbddaf193a27f65bd4799cd825ef5ecd3024',
     'sha256:c187814a77aa95d7a820159ac7475d86fca61b492ac6e025494a2c443b846998',
+    'sha256:c907c59be9416c241534a85affd4475e4848f5ada7213ec5e596365d779c047d',
   ],
   'write-eval/references/harbor.md': ['sha256:560385a1e4ac0c91e0a1699c52b15ef5038181ec6cc9cf3e47bedaedebbabbfa'],
   'write-eval/references/environment.md': ['sha256:50b827232d9df5f55ed603fc8d670440f5cd877b33f581b82aa7ee0768aaa964'],
   'loop-and-implement/SKILL.md': [
     'sha256:02d47d51ad3bcb6f8899622e70526fbf750a5047ce98661fd4df55e034356921',
     'sha256:1a71597ec5058d525133aec2936dec054800dc665d2769c9b1736417bce7ff9d',
+    'sha256:bfa2ba559def320af39c227eaa3e4356ebeba2434585906c564cabe32f977450',
   ],
   'agent-spec/references/spec-format.md': [
     'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
     'sha256:99a3389ea7a87d2c61077a5f81252d39f594d6e86d5ad21f939c779020b56619',
     'sha256:7fc70e45daeb8334e30c2c40d0dd18de1f8593f3987bbc4275fba63de4af8a58',
+    'sha256:72dcc8e43234509dac8eec197e670fd4dd43a5111deba5a0a8eb4bdd88cb88e4',
   ],
 };
 // Files Genesis itself writes are not changes to the application.
@@ -268,23 +272,132 @@ export function readMap(repo, mapFile, name) {
   if (typeof document?.snapshot_id !== 'string' || !document.snapshot_id || !['complete', 'partial'].includes(document.analysis_status)) {
     throw new Error('Map must be a Genesis business-map.json with snapshot_id and analysis_status.');
   }
+  // `mode` says what a Map covers. The Map of a change review covers what
+  // that review analyzed, not the project. Genesis before MAP_FIELDS wrote no
+  // mode, so such a Map may be either kind.
+  const mode = document.mode ?? null;
+  if (mode === 'change') {
+    throw new Error('This Map comes from a Genesis change review (its mode is change) and covers only what that review analyzed, not the whole project. Pass the business-map.json of a full map: run `/genesis map` first.');
+  }
+  if (mode !== null && mode !== 'map') {
+    throw new Error(`Map has a mode Genesis EDD does not know: ${JSON.stringify(mode)}. Pass the business-map.json of a full Genesis map, whose mode is map.`);
+  }
   // Genesis writes change-report.json beside the Map of a change review,
   // which describes only the flows the change touched.
   if (existsSync(path.join(path.dirname(file), 'change-report.json'))) {
     throw new Error('This Map comes from a Genesis change review (change-report.json is beside it) and covers only the flows that change touched. Pass the business-map.json of a full map: run `/genesis map` first.');
   }
+  const warnings = [];
+  if (mode === null) {
+    warnings.push(`This Map does not say whether it maps the whole project or a change review: Genesis before ${MAP_FIELDS} wrote no mode. Nothing beside it marks a review, so it is used and recorded with mode unknown. If it came from \`/genesis review\`, pass the business-map.json of a full map instead. A Map from Genesis ${MAP_FIELDS} or later says which it is.`);
+  }
+  const freshness = mapFreshness(repo, document.source);
+  if (freshness.warning) warnings.push(freshness.warning);
   // Until Genesis describes a flow, its steps are named by lines of source code.
   const steps = (Array.isArray(document.flows) ? document.flows : []).flatMap((flow) => (Array.isArray(flow?.steps) ? flow.steps : []));
   const coded = steps.filter((step) => step?.support === 'static_fact').length;
+  if (coded) {
+    warnings.push(`${coded} of the ${steps.length} steps in this Map belong to flows Genesis has not described yet and are named from the source code: by a line of code, or by the entry point for a flow's trigger. The copy at ${mapCopy(name)} is committed with the Spec, so that code goes into Git too. If it should not, tell the user before anything is committed: describing those flows with \`/genesis map\` replaces those names.`);
+  }
   return {
     bytes,
     record: {
       status: 'available', path: mapCopy(name), sha256: digest(bytes),
       snapshot_id: document.snapshot_id, analysis_status: document.analysis_status,
-      freshness: 'unverified',
+      mode: mode ?? 'unknown', freshness: freshness.status,
     },
-    warnings: coded ? [`${coded} of the ${steps.length} steps in this Map belong to flows Genesis has not described yet and are named from the source code: by a line of code, or by the entry point for a flow's trigger. The copy at ${mapCopy(name)} is committed with the Spec, so that code goes into Git too. If it should not, tell the user before anything is committed: describing those flows with \`/genesis map\` replaces those names.`] : [],
+    warnings,
   };
+}
+
+const short = (commit) => commit.slice(0, 7);
+// The Genesis commit from which a Map records `mode` and `source`. Genesis EDD
+// does not depend on Genesis: a Map without them is still accepted.
+const MAP_FIELDS = '9c0c914';
+const SHA256 = /^sha256:[0-9a-f]{64}$/;
+const REVISION = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+// The path rules of Genesis's own contract: relative, POSIX, no control
+// characters, no empty, `.` or `..` segment.
+const repoPath = (file) => file.length > 0 && !/[\u0000-\u001f\\]/.test(file) && !file.startsWith('/')
+  && !/^[A-Za-z]:/.test(file) && file.split('/').every((segment) => !['', '.', '..'].includes(segment));
+
+// Whether a Map still matches the commit checked out now. Genesis records,
+// under `source`, the commit it read (`revision`), whether uncommitted changes
+// were read with it, whether files it would have read were left out, and every
+// file read with the SHA-256 of its bytes as the commit stores them, which is
+// what `git show <revision>:<path>` prints. The same bytes are read here from
+// the commit checked out now. A file added since is not listed, so `verified`
+// says nothing about new files.
+export function mapFreshness(repo, source) {
+  const unverified = (reason) => ({ status: 'unverified', warning: `Whether this Map still matches the code was not checked: ${reason}` });
+  if (source === undefined || source === null) {
+    return unverified(`it does not record the code it was read from, which Genesis before ${MAP_FIELDS} did not do. A Map from Genesis ${MAP_FIELDS} or later can be checked.`);
+  }
+  const files = source?.files;
+  if (typeof source !== 'object' || Array.isArray(source) || !REVISION.test(source.revision ?? '')
+    || typeof source.worktree_dirty !== 'boolean' || !['complete', 'partial'].includes(source.integrity_status)
+    || typeof files !== 'object' || files === null || Array.isArray(files) || !Object.keys(files).length
+    || Object.entries(files).some(([file, sum]) => !repoPath(file) || typeof sum !== 'string' || !SHA256.test(sum))) {
+    return unverified('its source is not in the form Genesis writes.');
+  }
+  if (source.worktree_dirty) {
+    return unverified('Genesis read the code with uncommitted changes, so its digests may be of code no commit holds.');
+  }
+  const head = spawnSync('git', ['-C', repo, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], { encoding: 'utf8', timeout: 10_000 });
+  const commit = head.status === 0 ? head.stdout.trim() : null;
+  if (!commit) return unverified('the project has no commit to compare it with.');
+  const paths = Object.keys(files).sort();
+  const committed = committedDigests(repo, commit, paths);
+  if (!committed) return unverified(`Git could not read the files of commit ${short(commit)}.`);
+  const changed = paths.filter((file) => committed.get(file) !== files[file]);
+  if (changed.length) {
+    const named = changed.slice(0, 5).join(', ');
+    return { status: 'stale', warning: `This Map no longer matches the code of commit ${short(commit)}: ${changed.length} of the ${paths.length} files it was read from changed or are gone since Genesis read them (${named}${changed.length > 5 ? ', …' : ''}). Its flows may describe code that is not there anymore. Tell the user. To write the Spec against the code as it is, map the project again with \`/genesis map\`, remove the change folder \`spec new\` just created, and run \`spec new\` again with the new Map.` };
+  }
+  if (source.integrity_status === 'partial') {
+    return unverified(`Genesis left out files it would have read, such as one over its size limit (its integrity_status is partial). ${paths.length === 1 ? 'The one file' : `The ${paths.length} files`} it read ${paths.length === 1 ? 'is' : 'are'} unchanged at ${short(commit)}.`);
+  }
+  return { status: 'verified', warning: null };
+}
+
+// The SHA-256 of each path as `commit` stores it, or undefined where the commit
+// has no file there; null when Git could not be read. Batches keep the output
+// of one Git call bounded.
+function committedDigests(repo, commit, paths) {
+  const result = new Map();
+  for (let start = 0; start < paths.length; start += 500) {
+    const chunk = paths.slice(start, start + 500);
+    const read = spawnSync('git', ['-C', repo, 'cat-file', '--batch'], {
+      input: chunk.map((file) => `${commit}:${file}\n`).join(''), timeout: 120_000, maxBuffer: 1024 * 1024 * 1024,
+    });
+    if (read.error || read.status !== 0) return null;
+    const out = read.stdout;
+    let offset = 0;
+    for (const file of chunk) {
+      const end = out.indexOf(10, offset);
+      if (end < 0) return null;
+      // `<object> <type> <size>`, then the content; `<name> missing` when the
+      // commit has nothing at that path.
+      const header = /^[0-9a-f]{40,64} ([a-z]+) (\d+)$/.exec(out.toString('utf8', offset, end));
+      offset = end + 1;
+      if (!header) continue;
+      const size = Number(header[2]);
+      if (offset + size > out.length) return null;
+      if (header[1] === 'blob') result.set(file, digest(out.subarray(offset, offset + size)));
+      offset += size + 1;
+    }
+  }
+  return result;
+}
+
+// A Genesis review of a finished change starts from the Map the Spec was
+// written against: it carries that Map's entries and flows, so the change
+// lands on the same flows on every clone. Null without a Map or a base commit.
+export function genesisReview(repo, name, map, base) {
+  if (!map || map.status !== 'available' || !base) return null;
+  const copy = mapCopy(name);
+  const from = existsSync(path.join(repo, copy)) ? copy : String(map.path).replaceAll('\\', '/');
+  return { base, entries_from: from, prepare: ['map', 'prepare', '--base', base, '--entries-from', from] };
 }
 
 export function captureContext(repo, mode, map = null) {

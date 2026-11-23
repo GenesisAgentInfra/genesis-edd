@@ -32,7 +32,15 @@ commits for you.
 The skills start from ordinary requests. Each stage checks its inputs first and
 sends the agent back to the stage that owns a gap. It works in a new project or
 an existing one, and uses a Genesis Map when you have one: a copy goes into Git
-with the spec.
+with the spec, with a note of whether the Map still matched the code. When the
+loop's final review asks Genesis to review the change, Genesis starts from that
+copy, so every clone puts the change on the same flows. Both need a Map and a
+Genesis from commit `9c0c914` on
+([GenesisAgentInfra/genesis#45](https://github.com/GenesisAgentInfra/genesis/pull/45)),
+which records what a Map covers (`mode`) and the code it was read from
+(`source`), and lets a review start from a committed Map (`--entries-from`). A
+Map from an earlier Genesis is still accepted, recorded with mode `unknown` and
+freshness `unverified`.
 
 ## Install
 

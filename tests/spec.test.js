@@ -280,13 +280,16 @@ test('existing project records real Git base and Map identity; stale contents bl
   git(['init', '-b', 'main']);
   git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--allow-empty', '-m', 'Initial base']);
   const mapFile = path.join(repo, 'map.json');
-  writeFileSync(mapFile, JSON.stringify({ snapshot_id: 'sha256:example', analysis_status: 'partial' }));
+  writeFileSync(mapFile, JSON.stringify({ snapshot_id: 'sha256:example', analysis_status: 'partial', mode: 'map' }));
   const created = newSpec(repo, 'report-notifications', { map: mapFile });
-  // Partial, but no step is named from code: nothing to warn about.
-  assert.deepEqual(created.warnings, []);
+  // Partial, but no step is named from code. Without a source, only its
+  // freshness is left unchecked.
+  assert.equal(created.warnings.length, 1);
+  assert.match(created.warnings[0], /^Whether this Map still matches the code was not checked: it does not record the code it was read from/);
   assert.equal(created.context.code.base_commit, git(['rev-parse', 'HEAD']));
   assert.equal(created.context.map.status, 'available');
   assert.equal(created.context.map.analysis_status, 'partial');
+  assert.equal(created.context.map.mode, 'map');
   assert.equal(created.context.map.freshness, 'unverified');
   // The Map is copied into the change folder and recorded there.
   const copy = path.join(repo, 'openspec/changes/report-notifications/business-map.json');
@@ -403,14 +406,15 @@ test('the Map is copied byte for byte, from anywhere, and a partial Map with cod
   const outside = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-map-'));
   t.after(() => rmSync(outside, { recursive: true, force: true }));
   // Non-ASCII text, Windows line ends and no final newline survive as they are.
-  const bytes = Buffer.from('{"snapshot_id":"sha256:outside","analysis_status":"complete",\r\n"flows":[{"flow_id":"flow_refund","name":"退款审核","steps":[{"support":"agent_synthesis"}]}]}', 'utf8');
+  const bytes = Buffer.from('{"snapshot_id":"sha256:outside","analysis_status":"complete","mode":"map",\r\n"flows":[{"flow_id":"flow_refund","name":"退款审核","steps":[{"support":"agent_synthesis"}]}]}', 'utf8');
   const complete = path.join(outside, 'business-map.json');
   writeFileSync(complete, bytes);
   const created = newSpec(repo, 'from-outside', { map: complete });
   assert.equal(created.context.map.path, 'openspec/changes/from-outside/business-map.json');
   assert.deepEqual(readFileSync(path.join(repo, created.context.map.path)), bytes);
   assert.equal(created.context.map.sha256, `sha256:${createHash('sha256').update(bytes).digest('hex')}`);
-  assert.deepEqual(created.warnings, []);
+  const named = (result) => result.warnings.filter((warning) => /named from the source code/.test(warning));
+  assert.deepEqual(named(created), []);
 
   const partial = path.join(outside, 'partial.json');
   writeFileSync(partial, JSON.stringify({ snapshot_id: 'sha256:partial', analysis_status: 'partial', flows: [
@@ -418,12 +422,168 @@ test('the Map is copied byte for byte, from anywhere, and a partial Map with cod
     { flow_id: 'flow_b', name: 'POST /refunds · refund', steps: [{ support: 'static_fact', name: 'if amount > 100:' }, { support: 'static_fact', name: 'return deny()' }] },
   ] }));
   const flagged = newSpec(repo, 'from-partial', { map: partial });
-  assert.equal(flagged.warnings.length, 1);
-  assert.match(flagged.warnings[0], /^2 of the 3 steps in this Map belong to flows Genesis has not described yet and are named from the source code/);
-  assert.match(flagged.warnings[0], /openspec\/changes\/from-partial\/business-map\.json is committed with the Spec/);
+  assert.equal(named(flagged).length, 1);
+  assert.match(named(flagged)[0], /^2 of the 3 steps in this Map belong to flows Genesis has not described yet and are named from the source code/);
+  assert.match(named(flagged)[0], /openspec\/changes\/from-partial\/business-map\.json is committed with the Spec/);
   // Nothing is copied where there is no Map.
   newSpec(repo, 'no-map');
   assert.equal(existsSync(path.join(repo, 'openspec/changes/no-map/business-map.json')), false);
+});
+
+test('a Map whose mode is change is refused, and one without a mode is used as unknown, never as map', (t) => {
+  const repo = project(t, 'existing');
+  const outside = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-map-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  const write = (name, value) => {
+    const file = path.join(outside, name);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(value));
+    return file;
+  };
+  const base = { snapshot_id: 'sha256:modes', analysis_status: 'complete' };
+  assert.throws(() => newSpec(repo, 'from-review', { map: write('review.json', { ...base, mode: 'change' }) }),
+    /comes from a Genesis change review \(its mode is change\) and covers only what that review analyzed/);
+  assert.equal(existsSync(path.join(repo, 'openspec/changes/from-review')), false);
+  assert.throws(() => newSpec(repo, 'odd-mode', { map: write('odd.json', { ...base, mode: 'diff' }) }), /mode Genesis EDD does not know: "diff"/);
+  assert.equal(existsSync(path.join(repo, 'openspec/changes/odd-mode')), false);
+
+  const full = newSpec(repo, 'from-map', { map: write('map.json', { ...base, mode: 'map' }) });
+  assert.equal(full.context.map.mode, 'map');
+  assert.doesNotMatch(full.warnings.join('\n'), /does not say whether/);
+  // A Map from Genesis before mode existed may be either kind.
+  for (const [change, value] of [['from-older', base], ['null-mode', { ...base, mode: null }]]) {
+    const older = newSpec(repo, change, { map: write(`${change}.json`, value) });
+    assert.equal(older.context.map.mode, 'unknown');
+    assert.match(older.warnings.join('\n'), /does not say whether it maps the whole project or a change review: Genesis before 9c0c914 wrote no mode\. Nothing beside it marks a review, so it is used and recorded with mode unknown\./);
+  }
+  // change-report.json beside a Map still marks a review, whatever its mode says.
+  const latest = write('latest/business-map.json', { ...base, mode: 'map' });
+  writeFileSync(path.join(path.dirname(latest), 'change-report.json'), '{}');
+  assert.throws(() => newSpec(repo, 'beside-report', { map: latest }), /change-report\.json is beside it/);
+  assert.equal(existsSync(path.join(repo, 'openspec/changes/beside-report')), false);
+});
+
+// A Git project with the given application files committed.
+function committedProject(t, files) {
+  const repo = project(t, 'existing');
+  const git = (...args) => {
+    const result = spawnSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git('init', '-q', '-b', 'main');
+  writeFiles(repo, files);
+  git('add', '-A');
+  git('commit', '-q', '-m', 'Add application code');
+  return { repo, git };
+}
+function writeFiles(repo, files) {
+  for (const [file, content] of Object.entries(files)) {
+    mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
+    writeFileSync(path.join(repo, file), content);
+  }
+}
+const sha256 = (content) => `sha256:${createHash('sha256').update(content).digest('hex')}`;
+// The `source` Genesis records for a clean read of these files at revision.
+const sourceOf = (revision, files, extra = {}) => ({ revision, worktree_dirty: false, integrity_status: 'complete',
+  files: Object.fromEntries(Object.entries(files).map(([file, content]) => [file, sha256(content)])), ...extra });
+// A full Map with that source, written outside the project.
+function sourcedMap(t, source) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-map-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'business-map.json');
+  writeFileSync(file, JSON.stringify({ snapshot_id: 'sha256:sourced', analysis_status: 'complete', mode: 'map', ...(source === undefined ? {} : { source }) }));
+  return file;
+}
+const FRESHNESS = /still matches the code|no longer matches the code/;
+const APP = {
+  'app/submit.py': 'def submit(report):\n    return notify(report)\n',
+  'app/notify.py': 'def notify(report):\n    return "sent"\n',
+  'docs/报告 notes.md': '# 报告\n',
+};
+
+test('a clean, complete Map is verified while every file it read is unchanged at the commit, as Git stores it', (t) => {
+  const { repo, git } = committedProject(t, APP);
+  const source = sourceOf(git('rev-parse', 'HEAD'), APP);
+  const created = newSpec(repo, 'fresh', { map: sourcedMap(t, source) });
+  assert.equal(created.context.map.freshness, 'verified');
+  assert.doesNotMatch(created.warnings.join('\n'), FRESHNESS);
+
+  // A later commit that leaves those files alone, and a checkout that converts
+  // their line ends: the commit still stores the bytes Genesis hashed.
+  writeFileSync(path.join(repo, '.gitattributes'), '*.py text eol=crlf\n');
+  writeFiles(repo, { 'app/extra.py': 'added = True\n' });
+  git('add', '-A');
+  git('commit', '-q', '-m', 'Add a file the Map does not list');
+  rmSync(path.join(repo, 'app/submit.py'));
+  git('checkout', '--', 'app/submit.py');
+  assert.match(readFileSync(path.join(repo, 'app/submit.py'), 'utf8'), /\r\n/);
+  assert.equal(newSpec(repo, 'converted', { map: sourcedMap(t, source) }).context.map.freshness, 'verified');
+  // The commit is compared, not the working tree, which genesis.json records apart.
+  writeFileSync(path.join(repo, 'app/notify.py'), 'def notify(report):\n    return "queued"\n');
+  const edited = newSpec(repo, 'edited', { map: sourcedMap(t, source) });
+  assert.equal(edited.context.map.freshness, 'verified');
+  assert.equal(edited.context.code.working_tree_dirty, true);
+});
+
+test('a Map is stale once a file it read changed or is gone; a dirty or partial one is only unverified', (t) => {
+  const { repo, git } = committedProject(t, APP);
+  const source = sourceOf(git('rev-parse', 'HEAD'), APP);
+  writeFiles(repo, { 'app/notify.py': 'def notify(report):\n    return "queued"\n' });
+  git('rm', '-q', 'docs/报告 notes.md');
+  git('add', '-A');
+  git('commit', '-q', '-m', 'Queue notices and drop the notes');
+  const head = git('rev-parse', 'HEAD');
+
+  const stale = newSpec(repo, 'stale', { map: sourcedMap(t, source) });
+  assert.equal(stale.context.map.freshness, 'stale');
+  assert.match(stale.warnings.join('\n'), new RegExp(`This Map no longer matches the code of commit ${head.slice(0, 7)}: 2 of the 3 files it was read from changed or are gone since Genesis read them \\(app/notify\\.py, docs/报告 notes\\.md\\)\\. .*map the project again with \`/genesis map\`, remove the change folder \`spec new\` just created`));
+  // Files left out do not hide a file that changed.
+  assert.equal(newSpec(repo, 'stale-partial', { map: sourcedMap(t, { ...source, integrity_status: 'partial' }) }).context.map.freshness, 'stale');
+  // Read with uncommitted changes, a digest may be of code no commit holds.
+  const dirty = newSpec(repo, 'dirty', { map: sourcedMap(t, { ...source, worktree_dirty: true }) });
+  assert.equal(dirty.context.map.freshness, 'unverified');
+  assert.match(dirty.warnings.join('\n'), /not checked: Genesis read the code with uncommitted changes/);
+  // Every file read is unchanged, but some were left out.
+  const partial = newSpec(repo, 'partial', { map: sourcedMap(t, sourceOf(source.revision, { 'app/submit.py': APP['app/submit.py'] }, { integrity_status: 'partial' })) });
+  assert.equal(partial.context.map.freshness, 'unverified');
+  assert.match(partial.warnings.join('\n'), new RegExp(`its integrity_status is partial\\)\\. The one file it read is unchanged at ${head.slice(0, 7)}\\.`));
+});
+
+test('freshness is unverified without a source, with one Genesis would not write, or without a commit', (t) => {
+  const { repo, git } = committedProject(t, APP);
+  const source = sourceOf(git('rev-parse', 'HEAD'), APP);
+  const none = newSpec(repo, 'no-source', { map: sourcedMap(t, undefined) });
+  assert.equal(none.context.map.freshness, 'unverified');
+  assert.match(none.warnings.join('\n'), /it does not record the code it was read from, which Genesis before 9c0c914 did not do/);
+  for (const [change, broken] of [
+    ['short-revision', { ...source, revision: source.revision.slice(0, 7) }],
+    ['bad-digest', { ...source, files: { 'app/submit.py': 'md5:abc' } }],
+    ['outside-path', { ...source, files: { '../secret.py': sha256('x') } }],
+    ['no-files', { ...source, files: {} }],
+    ['no-flag', { ...source, worktree_dirty: 'no' }],
+  ]) {
+    const result = newSpec(repo, change, { map: sourcedMap(t, broken) });
+    assert.equal(result.context.map.freshness, 'unverified', change);
+    assert.match(result.warnings.join('\n'), /its source is not in the form Genesis writes/, change);
+  }
+  const uncommitted = project(t, 'existing');
+  const result = newSpec(uncommitted, 'no-commit', { map: sourcedMap(t, source) });
+  assert.equal(result.context.map.freshness, 'unverified');
+  assert.match(result.warnings.join('\n'), /the project has no commit to compare it with/);
+});
+
+test('freshness reads every listed file as stored, binary content and more than one batch of Git output included', (t) => {
+  const files = Object.fromEntries(Array.from({ length: 700 }, (_, index) => [`src/m${index}.py`, `value = ${index}\n`]));
+  files['assets/logo.bin'] = Buffer.from([0, 10, 255, 10, 0, 13, 10]);
+  const { repo, git } = committedProject(t, files);
+  const source = sourceOf(git('rev-parse', 'HEAD'), files);
+  assert.equal(newSpec(repo, 'many', { map: sourcedMap(t, source) }).context.map.freshness, 'verified');
+  writeFiles(repo, { 'src/m650.py': 'value = -1\n' });
+  git('commit', '-q', '-am', 'Change one file in the second batch');
+  const stale = newSpec(repo, 'many-stale', { map: sourcedMap(t, source) });
+  assert.equal(stale.context.map.freshness, 'stale');
+  assert.match(stale.warnings.join('\n'), /1 of the 701 files it was read from changed or are gone since Genesis read them \(src\/m650\.py\)/);
 });
 
 test('a committed Spec and its Map copy check out on another clone; Git gaps are named', (t) => {
