@@ -34,7 +34,13 @@ validate exits 1 for malformed specs; valid drafts report ready_for_eval_design=
 It rejects more explicit requirements than their quoted source states.
 It checks impact.md, when present, against the recorded Map and the project files.
 spec new --map takes the business-map.json of a full Genesis map, not of a
-change review, and copies it into the change folder: commit it with the Spec.
+change review (mode change, or change-report.json beside it), and copies it
+into the change folder: commit it with the Spec. A Map without a mode is
+recorded as unknown. freshness says whether every file the Map was read from
+is unchanged at the current commit: verified, stale, or unverified when the
+Map has no source, was read with uncommitted changes or left files out.
+Genesis writes mode and source from commit 9c0c914 on; a Map without them is
+accepted, with mode unknown and freshness unverified.
 Once a Spec is exported, code that moves that evidence is a warning for later
 stages; a new export needs evidence that matches the code.
 export requires a valid spec with no proposed requirements or open questions and
@@ -68,7 +74,10 @@ its code as the commit it started from plus code.patch. loop status is
 read-only: it follows every check through the loop's runs and names the next
 step: iterate, write the report, split changes after a regression, stop when
 stuck or out of budget, review, or ask the user to accept; after acceptance it
-reports done, and the minutes stop. loop extend raises the budget once the
+reports done, and the minutes stop. With a recorded Map, the review step names
+the genesis map prepare arguments (--base, --entries-from) that start a Genesis
+review from the Spec's Map (--entries-from needs Genesis 9c0c914 or later).
+loop extend raises the budget once the
 user agrees: N more full runs and M minutes from now (default 5 and 60),
 keeping runs and the baseline.
 loop start --restart starts the loop over, keeping its starting code; while a

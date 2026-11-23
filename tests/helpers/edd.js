@@ -197,10 +197,11 @@ finish
 //                                   (awaiting_integration, skipped by runs)
 //   commit: true                    commit everything before eval check
 //   check: true                     run checkEval; it must pass when anything is finished
+//   map: null                       a business-map.json object for spec new --map
 // Returns { repo, name, tools, packages: { id: [check ids] }, check (checkEval result
 // or null), root (.genesis/edd/<change>), runs (its runs/ folder) }.
 export function readyProject(t, options = {}) {
-  const { mode = 'existing', spec = 'two', results = BEFORE, unconnected = [], commit: committed = true, check = true } = options;
+  const { mode = 'existing', spec = 'two', results = BEFORE, unconnected = [], commit: committed = true, check = true, map = null } = options;
   if (!SPECS[spec]) throw new Error(`spec must be one of ${Object.keys(SPECS).join(', ')}.`);
   const tools = useFakeTools(t);
   const repo = projectRoot(mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-project-')));
@@ -210,7 +211,13 @@ export function readyProject(t, options = {}) {
   git(repo, ['config', 'user.email', 'test@example.invalid']);
   git(repo, ['config', 'commit.gpgsign', 'false']);
   initProject(repo, mode, 'none');
-  newSpec(repo, CHANGE);
+  let mapFile = null;
+  if (map) {
+    mapFile = path.join(repo, '.genesis/out/ses_test/business-map.json');
+    mkdirSync(path.dirname(mapFile), { recursive: true });
+    writeFileSync(mapFile, JSON.stringify(map));
+  }
+  newSpec(repo, CHANGE, mapFile ? { map: mapFile } : {});
   writeSpec(repo, SPECS[spec]);
   exportSpec(repo, CHANGE);
   newEval(repo, CHANGE);

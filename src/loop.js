@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { codeState, digest, isGenerated, readJSON } from './project.js';
+import { codeState, digest, genesisReview, isGenerated, readJSON } from './project.js';
 import { eddDirectory, validateEval } from './eval.js';
 import { activeLoop, codeSnapshot, ignoreRecords, pinnedBase, readRuns, recordedBaseline, restoreHint, sameCode, savePatch, startCode } from './run.js';
 
@@ -306,7 +306,11 @@ export function loopStatus(repo, name) {
   } else if (latest && reports[latest.run_id].length && !(latest.verdict === 'pass' && reports[latest.run_id].every((entry) => entry === 'section Review is empty'))) {
     next = { action: 'write_report', command: command('loop', 'report'), message: `Write the report for ${latest.run_id} before anything else: ${reports[latest.run_id].join('; ')}.` };
   } else if (latest?.verdict === 'pass' && reports[latest.run_id].length) {
-    next = { action: 'final_review', message: 'Every gating check passes. Have the whole change reviewed in a fresh context against the Spec, then write the Review section of this run\'s report.' };
+    // A Genesis review of the change starts from the Map the Spec was written
+    // against, so the change lands on that Map's flows on every clone.
+    const review = genesisReview(repo, name, evals.map, loop.base_commit);
+    next = { action: 'final_review', ...(review ? { genesis_review: review } : {}),
+      message: `Every gating check passes.${review ? ` If Genesis is installed, first review the change with its skill, and run every \`map prepare\` of that review as \`genesis ${review.prepare.join(' ')}\`: it starts from the Map the Spec was written against, so the change lands on the same flows on every clone. Give the reviewer the result.` : ''} Have the whole change reviewed in a fresh context against the Spec, then write the Review section of this run's report.` };
   } else if (latest?.verdict === 'pass') {
     next = { action: 'ask_acceptance', owner: 'user', command: [...command('loop', 'accept'), '--run', latest.run_id, '--by', '<user>', '--ref', '<where they said so>'],
       message: 'Show the user the per-check comparison and the report. Record acceptance only with their own words; a pass is not acceptance.' };

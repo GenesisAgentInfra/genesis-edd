@@ -436,6 +436,26 @@ test('the loop stops on budget once its full runs are used up', (t) => {
   assert.equal(status.next.owner, 'user');
 });
 
+test('the final review starts a Genesis review from the Map copy, so every clone lands the change on the same flows', (t) => {
+  const { repo } = withBaseline(t, { map: { snapshot_id: 'sha256:loop', analysis_status: 'complete', mode: 'map', flows: [] } });
+  const { loop } = startLoop(repo, CHANGE);
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  writeReport(repo, CHANGE);
+  completeReport(repo, run.run_id, { review: false });
+  const status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'final_review');
+  const copy = `openspec/changes/${CHANGE}/business-map.json`;
+  assert.deepEqual(status.next.genesis_review, {
+    base: loop.base_commit, entries_from: copy,
+    prepare: ['map', 'prepare', '--base', loop.base_commit, '--entries-from', copy],
+  });
+  assert.ok(status.next.message.includes(`\`genesis map prepare --base ${loop.base_commit} --entries-from ${copy}\``), status.next.message);
+  // Acceptance does not wait for it: the Review section is what counts.
+  completeReport(repo, run.run_id);
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'ask_acceptance');
+});
+
 test('a passing full run needs a final review in its report before acceptance is asked for', (t) => {
   const { repo } = inLoop(t);
   changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
@@ -455,6 +475,9 @@ test('a passing full run needs a final review in its report before acceptance is
   assert.deepEqual(reportGaps(repo, CHANGE, record), ['section Review is empty']);
   let status = loopStatus(repo, CHANGE);
   assert.equal(status.next.action, 'final_review');
+  // No Map was recorded, so there is no Genesis review to start from it.
+  assert.equal(status.next.genesis_review, undefined);
+  assert.doesNotMatch(status.next.message, /genesis map prepare/);
   assert.deepEqual(status.runs.map((entry) => entry.report), ['incomplete']);
 
   completeReport(repo, run.run_id);

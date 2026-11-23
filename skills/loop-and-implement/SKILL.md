@@ -149,6 +149,18 @@ Each fix needs a new full run; nothing has to be committed for it. Then write th
 section. Without a subagent, review the diff yourself as a separate pass and
 say so in Review: an author reviewing their own work misses more.
 
+When the Spec recorded a Map, `loop status` also gives `next.genesis_review`.
+If Genesis is installed, review the change with it first, through its own
+skill, and pass the `prepare` arguments to every `genesis map prepare` of that
+review: `--base` with the commit the loop started from and `--entries-from`
+with the Map copy, `openspec/changes/<change>/business-map.json`. Genesis then
+starts from the entries and flows of the Map the Spec was written against, so
+the change lands on the same flows on every clone. `--entries-from` needs
+Genesis at or after commit `9c0c914`. If Genesis reads the project without its
+Python analysis, `prepare` refuses `--entries-from`: run it without and say so. Give the reviewer the summary of that review. Its Map covers only
+the change: never pass it to `spec new`, and leave the Map copy as it is. If
+Genesis is not installed, say so in Review.
+
 ## Acceptance
 
 Show the user the comparison of each check (improved, kept, or with no

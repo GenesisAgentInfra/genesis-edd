@@ -114,10 +114,17 @@ preserves both, and archive/sync is unsupported. Every other strict warning or e
 still blocks validation. Raw upstream diagnostics remain in the JSON response.
 
 `genesis.json` beside the specs records project mode, base commit if present, the
-Map (path, digest, snapshot and analysis status) or an explicit absence, and
-baseline `not_run`. It is technical context, not a source of business
-requirements. A provided Map may be partial or stale; source identity alone does
-not prove coverage or freshness.
+Map (path, digest, snapshot, analysis status, mode and freshness) or an explicit
+absence, and baseline `not_run`. It is technical context, not a source of
+business requirements. `mode` is `map`, or `unknown` for a Map from a Genesis
+that did not say what it maps. A provided Map may be partial or stale.
+`freshness` compares the digests Genesis records under the Map's `source` with
+the same files at the base commit, as Git stores them: `verified` for a Map read
+without uncommitted changes and without files left out, whose every file is
+unchanged; `stale` when a file changed or is gone; `unverified` when the Map has
+no `source`, was read with uncommitted changes, or left files out and every file
+it read is unchanged. A file added after the Map is not listed, so `verified`
+does not cover new files, and `analysis_status` still decides coverage.
 
 With `--map`, `spec new` copies the Map byte for byte into the change folder as
 `business-map.json`, and genesis.json points at that copy. Genesis's own output
