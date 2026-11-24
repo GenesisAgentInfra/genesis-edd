@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { ROOT, initProject, projectRoot, readJSON } from '../src/project.js';
+import { ROOT, SCHEMA, initProject, openspec, projectRoot, readJSON } from '../src/project.js';
 import { exportSpec, newSpec, specInstructions, specStatus, validateSpec } from '../src/spec.js';
 import { checkWorkflow } from '../src/workflow.js';
 
@@ -336,6 +336,21 @@ test('existing projects without a Map remain usable with an explicit limitation'
   assert.equal(checkWorkflow(repo, 'spec-export', 'report-notifications').status, 'ready');
 });
 
+test('without a recorded Map, impact.md flow IDs are left unchecked and validation says so', (t) => {
+  const repo = project(t, 'existing');
+  mkdirSync(path.join(repo, 'app'));
+  writeFileSync(path.join(repo, 'app/notify.py'), 'def notify():\n    return True\n');
+  newSpec(repo, 'report-notifications');
+  writeSpec(repo);
+  const impactFile = path.join(repo, 'openspec/changes/report-notifications/impact.md');
+  writeFileSync(impactFile, '---\ngenesis_impact: 1\nentries:\n  - flow: flow_doesnotexist\n    entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:2\n---\n');
+  const result = validateSpec(repo, 'report-notifications');
+  assert.equal(result.ready_for_eval_design, true, JSON.stringify(result.errors));
+  assert.ok(result.warnings.includes('impact.md names flow IDs (flow_doesnotexist), but no Map is recorded, so they could not be checked. A flow ID comes from the recorded Map; without one, leave `flow` out.'), JSON.stringify(result.warnings));
+  writeFileSync(impactFile, '---\ngenesis_impact: 1\nentries:\n  - entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:2\n---\n');
+  assert.doesNotMatch(validateSpec(repo, 'report-notifications').warnings.join('\n'), /flow IDs/);
+});
+
 test('incremental requirements reuse the accepted capability and stable identity', (t) => {
   const repo = project(t, 'existing');
   const mainFile = path.join(repo, 'openspec/specs/notifications/spec.md');
@@ -508,6 +523,7 @@ test('a clean, complete Map is verified while every file it read is unchanged at
   const created = newSpec(repo, 'fresh', { map: sourcedMap(t, source) });
   assert.equal(created.context.map.freshness, 'verified');
   assert.doesNotMatch(created.warnings.join('\n'), FRESHNESS);
+  assert.doesNotMatch(created.warnings.join('\n'), /uncommitted edits/);
 
   // A later commit that leaves those files alone, and a checkout that converts
   // their line ends: the commit still stores the bytes Genesis hashed.
@@ -524,6 +540,15 @@ test('a clean, complete Map is verified while every file it read is unchanged at
   const edited = newSpec(repo, 'edited', { map: sourcedMap(t, source) });
   assert.equal(edited.context.map.freshness, 'verified');
   assert.equal(edited.context.code.working_tree_dirty, true);
+  // Those edits are named, since impact.md evidence is read from them.
+  const head = git('rev-parse', 'HEAD').slice(0, 7);
+  assert.deepEqual(edited.warnings.filter((warning) => /uncommitted edits/.test(warning)), [
+    `1 of the files this Map was read from has uncommitted edits (app/notify.py). Its freshness compares commit ${head}, not those edits, while impact.md evidence is read from the working tree. If the edits are not part of this request, the Map and that evidence may describe different code: tell the user.`,
+  ]);
+  // Edits to files the Map did not read are not named.
+  git('checkout', '--', 'app/notify.py');
+  writeFiles(repo, { 'app/extra.py': 'added = False\n', 'app/new.py': 'new = True\n' });
+  assert.doesNotMatch(newSpec(repo, 'elsewhere', { map: sourcedMap(t, source) }).warnings.join('\n'), /uncommitted edits/);
 });
 
 test('a Map is stale once a file it read changed or is gone; a dirty or partial one is only unverified', (t) => {
@@ -586,6 +611,87 @@ test('freshness reads every listed file as stored, binary content and more than 
   assert.match(stale.warnings.join('\n'), /1 of the 701 files it was read from changed or are gone since Genesis read them \(src\/m650\.py\)/);
 });
 
+test('validate, export and workflow check repeat what genesis.json recorded about the Map', (t) => {
+  const { repo, git } = committedProject(t, APP);
+  const head = git('rev-parse', 'HEAD').slice(0, 7);
+  const source = sourceOf(git('rev-parse', 'HEAD'), APP);
+  const notes = (change) => validateSpec(repo, change).warnings.filter((warning) => /Map/.test(warning));
+  newSpec(repo, 'fresh', { map: sourcedMap(t, source) });
+  writeSpec(repo, fixture, 'fresh');
+  const verified = [`The Map was verified against the code of base commit ${head}.`];
+  assert.deepEqual(notes('fresh'), verified);
+  const check = checkWorkflow(repo, 'spec-export', 'fresh');
+  assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
+  assert.deepEqual(check.warnings.filter((warning) => /Map/.test(warning)), verified);
+  assert.deepEqual(exportSpec(repo, 'fresh').warnings.filter((warning) => /Map/.test(warning)), verified);
+  assert.deepEqual(checkWorkflow(repo, 'write-eval', 'fresh').warnings.filter((warning) => /Map/.test(warning)), verified);
+
+  // A stale Map stays usable, and every check says so, not only spec new.
+  writeFiles(repo, { 'app/notify.py': 'def notify(report):\n    return "queued"\n' });
+  git('commit', '-q', '-am', 'Queue notices');
+  const later = git('rev-parse', 'HEAD').slice(0, 7);
+  newSpec(repo, 'stale', { map: sourcedMap(t, source) });
+  writeSpec(repo, fixture, 'stale');
+  const stale = [`This Map no longer matched the code of base commit ${later} when \`spec new\` checked it (freshness stale): its flows may describe code that is not there anymore. Tell the user. To write the Spec against the code as it is, map the project again with \`/genesis map\` and create a new change with the new Map; do not edit genesis.json.`];
+  assert.deepEqual(notes('stale'), stale);
+  const staleCheck = checkWorkflow(repo, 'spec-export', 'stale');
+  assert.equal(staleCheck.status, 'ready');
+  assert.deepEqual(staleCheck.warnings.filter((warning) => /Map/.test(warning)), stale);
+
+  // A Map without source or mode, partial, with steps named from code.
+  const older = path.join(repo, 'older.json');
+  writeFileSync(older, JSON.stringify({ snapshot_id: 'sha256:older', analysis_status: 'partial', flows: [
+    { flow_id: 'flow_a', name: 'Described', steps: [{ support: 'agent_synthesis' }] },
+    { flow_id: 'flow_b', name: 'POST /refunds', steps: [{ support: 'static_fact' }, { support: 'static_fact' }] },
+  ] }));
+  newSpec(repo, 'older', { map: older });
+  writeSpec(repo, fixture, 'older');
+  assert.deepEqual(notes('older'), [
+    `Whether this Map still matched the code of base commit ${later} was not checked (freshness unverified): when \`spec new\` recorded it, the Map had no source, had been read with uncommitted changes or had left files out, or there was no commit to compare it with.`,
+    'This Map does not say whether it maps the whole project or a change review (mode unknown). Make sure it is a full map: the Map of a `/genesis review` covers only what that review analyzed.',
+    'This Map is partial: some flows are not described yet or leave code unaccounted for, or files were left out. Record that limit; do not call its coverage complete.',
+    '2 of the 3 steps in this Map belong to flows Genesis has not described yet and are named from the source code. That code goes into Git with the Map copy: tell the user before it is committed.',
+  ]);
+
+  // A change made before spec new recorded freshness says only that.
+  const contextFile = path.join(repo, 'openspec/changes/fresh/genesis.json');
+  const context = readJSON(contextFile);
+  delete context.map.freshness;
+  delete context.map.mode;
+  writeFileSync(contextFile, `${JSON.stringify(context, null, 2)}\n`);
+  assert.deepEqual(notes('fresh'), ['Whether this Map matches the code was not checked: the change was made before `spec new` recorded freshness.']);
+  assert.doesNotMatch(validateSpec(repo, 'fresh').warnings.join('\n'), /not automatically verified/);
+});
+
+test('a complete Map records its entry coverage and warns about entries outside its planned flows', (t) => {
+  const repo = project(t, 'existing');
+  const write = (name, coverage) => {
+    const file = path.join(repo, name);
+    writeFileSync(file, JSON.stringify({ snapshot_id: `sha256:${name}`, analysis_status: 'complete', mode: 'map', flows: [], ...(coverage ? { coverage } : {}) }));
+    return file;
+  };
+  const counts = { entries_total: 4, entries_planned: 1, entries_skipped: 1, entries_unhandled: 2 };
+  const created = newSpec(repo, 'some', { map: write('some.json', {
+    scope: '1 planned flow covering 1 of 4 entries.', ...counts,
+    skipped_entries: [{ entry_id: 'entry_a', symbol_id: 'app.jobs:run', reason: 'budget' }], tasks_total: 1, tasks_validated: 1, tasks_pending: 0,
+  }) });
+  assert.equal(created.context.map.analysis_status, 'complete');
+  assert.deepEqual(created.context.map.coverage, counts);
+  const outside = (warnings) => warnings.filter((warning) => /planned flows/.test(warning));
+  assert.deepEqual(outside(created.warnings), ['This Map\'s planned flows cover 1 of the 4 entries Genesis found: 1 skipped (1 budget) and 2 not handled. Its analysis_status says whether those flows are finished, not whether the whole project is mapped. If the request touches an entry outside them, read its code, or map it with `/genesis map`.']);
+  writeSpec(repo, fixture, 'some');
+  assert.deepEqual(outside(validateSpec(repo, 'some').warnings), ['This Map\'s planned flows cover 1 of the 4 entries Genesis found: 1 skipped and 2 not handled. Its analysis_status says whether those flows are finished, not whether the whole project is mapped. If the request touches an entry outside them, read its code, or map it with `/genesis map`.']);
+  assert.equal(readJSON(exportSpec(repo, 'some').file).context.map.coverage.entries_unhandled, 2);
+
+  // Every entry planned: recorded, no warning. No coverage: nothing recorded.
+  const all = newSpec(repo, 'all', { map: write('all.json', { entries_total: 3, entries_planned: 3, entries_skipped: 0, entries_unhandled: 0 }) });
+  assert.deepEqual(all.context.map.coverage, { entries_total: 3, entries_planned: 3, entries_skipped: 0, entries_unhandled: 0 });
+  assert.deepEqual(outside(all.warnings), []);
+  const none = newSpec(repo, 'none', { map: write('none.json', null) });
+  assert.equal('coverage' in none.context.map, false);
+  assert.deepEqual(outside(none.warnings), []);
+});
+
 test('a committed Spec and its Map copy check out on another clone; Git gaps are named', (t) => {
   const repo = project(t, 'existing');
   const git = (cwd, args) => {
@@ -639,6 +745,77 @@ test('a committed Spec and its Map copy check out on another clone; Git gaps are
   assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /business-map\.json is not in Git, though genesis\.json is, so other clones cannot check this Spec against its Map\. Commit it with the Spec\./);
   writeFileSync(path.join(repo, '.gitignore'), 'business-map.json\n');
   assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /business-map\.json is ignored by Git/);
+});
+
+test('a checkout with CRLF line ends keeps the identity of the Spec, its export and its Map', (t) => {
+  const repo = project(t, 'existing');
+  const git = (cwd, args) => {
+    const result = spawnSync('git', ['-C', cwd, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git(repo, ['init', '-q', '-b', 'main']);
+  writeFiles(repo, { 'app/notify.py': 'def notify():\n    return True\n' });
+  // Genesis writes its Map indented, one value per line.
+  const mapFile = path.join(repo, 'map.json');
+  writeFileSync(mapFile, `${JSON.stringify({ snapshot_id: 'sha256:lines', analysis_status: 'complete', mode: 'map', flows: [{ flow_id: 'flow_submit', name: 'Submit a report' }] }, null, 2)}\n`);
+  newSpec(repo, 'report-notifications', { map: mapFile });
+  const specFile = writeSpec(repo);
+  const impactFile = path.join(repo, 'openspec/changes/report-notifications/impact.md');
+  writeFileSync(impactFile, '---\ngenesis_impact: 1\nentries:\n  - flow: flow_submit\n    entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:2\n---\n');
+  const exported = exportSpec(repo, 'report-notifications');
+  // An LF Spec keeps the digest of its bytes, as before.
+  const handoff = readJSON(exported.file);
+  assert.equal(handoff.specs[0].sha256, sha256(readFileSync(specFile)));
+  assert.equal(handoff.impact.sha256, sha256(readFileSync(impactFile)));
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'Spec']);
+
+  // Git for Windows converts text files to CRLF on checkout by default.
+  const clone = projectRoot(mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-crlf-')));
+  t.after(() => rmSync(clone, { recursive: true, force: true }));
+  git(os.tmpdir(), ['clone', '-q', '-c', 'core.autocrlf=true', repo, clone]);
+  for (const file of ['specs/notifications/spec.md', 'impact.md', 'business-map.json']) {
+    assert.match(readFileSync(path.join(clone, 'openspec/changes/report-notifications', file), 'utf8'), /\r\n/, file);
+  }
+  const check = checkWorkflow(clone, 'write-eval', 'report-notifications');
+  assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
+  assert.equal(check.handoff.id, exported.id);
+  assert.equal(exportSpec(clone, 'report-notifications').id, exported.id);
+  // A Map copy with other content still fails, whatever its line ends.
+  writeFileSync(path.join(clone, 'openspec/changes/report-notifications/business-map.json'), '{\r\n  "snapshot_id": "sha256:other"\r\n}\r\n');
+  assert.equal(checkWorkflow(clone, 'write-eval', 'report-notifications').gaps[0].code, 'map_changed');
+});
+
+test('a Map written with CRLF line ends keeps its identity in a checkout with LF line ends', (t) => {
+  const repo = project(t, 'existing');
+  const git = (cwd, args) => {
+    const result = spawnSync('git', ['-C', cwd, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git(repo, ['init', '-q', '-b', 'main']);
+  // Git stores text files with LF line ends, whatever the working tree has.
+  writeFiles(repo, { '.gitattributes': '* text=auto\n', 'app/notify.py': 'def notify():\n    return True\n' });
+  // Genesis on Windows writes its Map with CRLF line ends.
+  const mapFile = path.join(repo, 'map.json');
+  writeFileSync(mapFile, `${JSON.stringify({ snapshot_id: 'sha256:lines', analysis_status: 'complete', mode: 'map', flows: [{ flow_id: 'flow_submit', name: 'Submit a report' }] }, null, 2)}\n`.replace(/\n/g, '\r\n'));
+  newSpec(repo, 'report-notifications', { map: mapFile });
+  writeSpec(repo);
+  const exported = exportSpec(repo, 'report-notifications');
+  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').status, 'ready');
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'Spec']);
+
+  const clone = projectRoot(mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-lf-')));
+  t.after(() => rmSync(clone, { recursive: true, force: true }));
+  git(os.tmpdir(), ['clone', '-q', '-c', 'core.autocrlf=false', '-c', 'core.eol=lf', repo, clone]);
+  const copy = path.join(clone, 'openspec/changes/report-notifications/business-map.json');
+  assert.doesNotMatch(readFileSync(copy, 'utf8'), /\r\n/);
+  const check = checkWorkflow(clone, 'write-eval', 'report-notifications');
+  assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
+  assert.equal(check.handoff.id, exported.id);
+  // A Map copy with other content still fails, whatever its line ends.
+  writeFileSync(copy, '{\n  "snapshot_id": "sha256:other"\n}\n');
+  assert.equal(checkWorkflow(clone, 'write-eval', 'report-notifications').gaps[0].code, 'map_changed');
 });
 
 test('a change made before the Map was copied keeps its genesis.json; a copy with the recorded digest stands in', (t) => {
@@ -818,6 +995,19 @@ test('bad names and symlink destinations cannot escape the selected project', (t
   assert.equal(existsSync(path.join(outside, 'skills')), false);
 });
 
+test('workflow check of the Spec stage does not touch .genesis, so a symlinked .genesis does not block it', (t) => {
+  const repo = project(t);
+  const outside = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-outside-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  symlinkSync(outside, path.join(repo, '.genesis'), 'dir');
+  newSpec(repo, 'report-notifications');
+  writeSpec(repo);
+  const check = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
+  assert.equal(check.next.action, 'export_spec');
+  assert.deepEqual(readdirSync(outside), []);
+});
+
 test('CLI reports invalid specs and deferred commands with nonzero exit codes', (t) => {
   const repo = project(t);
   newSpec(repo, 'report-notifications');
@@ -941,6 +1131,47 @@ test('broken context and changed Map snapshots route to technical recovery witho
     assert.equal(result.gaps[0].kind, 'technical');
     assert.equal(result.next.owner, 'agent');
   }
+});
+
+test('a change folder spec new left unfinished is named for deletion, never deleted', (t) => {
+  const repo = project(t, 'existing');
+  const git = (...args) => {
+    const result = spawnSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git('init', '-q', '-b', 'main');
+  // OpenSpec created the folder; spec new stopped before it wrote genesis.json.
+  const interrupted = (name, map = false) => {
+    openspec(repo, ['new', 'change', name, '--schema', SCHEMA, '--json']);
+    if (map) writeFileSync(path.join(repo, 'openspec/changes', name, 'business-map.json'), '{}');
+    return path.join(repo, 'openspec/changes', name);
+  };
+  const advice = (name) => `openspec/changes/${name}/ has no genesis.json and nothing in it is in Git: an earlier \`spec new\` stopped before it finished, so there is no recorded context to restore. Delete that folder and run \`spec new\` again.`;
+  const folder = interrupted('report-notifications', true);
+  assert.throws(() => newSpec(repo, 'report-notifications'), (error) => error.message === advice('report-notifications'));
+  const check = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  assert.equal(check.gaps[0].code, 'context_unavailable');
+  assert.equal(check.gaps[0].message, advice('report-notifications'));
+  assert.equal(check.next.owner, 'agent');
+  assert.ok(existsSync(path.join(folder, '.openspec.yaml')));
+  rmSync(folder, { recursive: true });
+  assert.equal(newSpec(repo, 'report-notifications').context.map.status, 'missing');
+
+  // Anything committed, or authored, is not an unfinished spec new.
+  const committed = interrupted('committed');
+  git('add', '--', 'openspec/changes/committed');
+  git('commit', '-q', '-m', 'Half a change');
+  assert.throws(() => newSpec(repo, 'committed'), /^Error: Change already exists/);
+  assert.match(checkWorkflow(repo, 'spec-export', 'committed').gaps[0].message, /^Restore the recorded code\/Map context/);
+  const authored = interrupted('authored');
+  writeSpec(repo, fixture, 'authored');
+  assert.throws(() => newSpec(repo, 'authored'), /^Error: Change already exists/);
+  assert.ok(existsSync(committed) && existsSync(authored));
+
+  // Without Git there is nothing to be committed.
+  const plain = project(t, 'existing');
+  openspec(plain, ['new', 'change', 'plain', '--schema', SCHEMA, '--json']);
+  assert.throws(() => newSpec(plain, 'plain'), /^Error: openspec\/changes\/plain\/ has no genesis\.json: an earlier `spec new` stopped before it finished/);
 });
 
 test('in Git, a committed copy decides for a change made before the Map was copied, on this machine too', (t) => {

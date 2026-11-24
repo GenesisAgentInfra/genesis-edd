@@ -23,8 +23,8 @@ Genesis service or extra model key is needed.
    such, never as a failed check.
 4. **loop-and-implement.** Change the code until the checks pass, within a
    budget the user agrees to. The spec, the expected results and the baseline
-   stay fixed while the code changes. Every run gets a short report; the loop
-   stops when the checks pass, the budget runs out, the same checks keep
+   stay fixed while the code changes. Every full run gets a short report; the
+   loop stops when the checks pass, the budget runs out, the same checks keep
    failing, or the user must decide. Acceptance is the user's.
 
 The loop needs the project in Git. It records the code of every run and never
@@ -93,6 +93,17 @@ Writing specs and packages works without them. Proving packages
 - Harbor. Install it with `uv tool install harbor`, or run it without a global
   install by setting
   `GENESIS_EDD_HARBOR='["uvx","--from","harbor","harbor"]'`.
+
+### Genesis Map
+
+Optional: Genesis EDD works without a Map. To use one, install
+[Genesis](https://github.com/GenesisAgentInfra/genesis) and map the project
+with it before writing a spec. A Map that records what it covers (`mode`) and
+the code it was read from (`source`), and a final review that starts from the
+Map's committed copy (`--entries-from`), need a Genesis from commit `9c0c914`
+on. If `genesis map prepare` rejects `--entries-from`, update Genesis as its
+[install guide](https://github.com/GenesisAgentInfra/genesis/blob/main/docs/install.md#update)
+says.
 
 <details>
 <summary>Install into one project from a checkout</summary>
@@ -168,13 +179,26 @@ project install), or type `$` in Codex and pick the skill.
 | Path | Holds | In Git |
 | --- | --- | --- |
 | `openspec/` | specs, their exported versions, and the Genesis Map each was written against (`business-map.json`) | yes |
+| `.genesis/edd/.gitignore` | keeps the package proofs, run records and loop state below out of Git; lines you add are kept | yes |
 | `.genesis/edd/harness/` | the project kit shared by every eval package | yes |
 | `.genesis/edd/<change>/evals/` | one Harbor task package per scenario | yes |
+| `.genesis/edd/<change>/baseline-expectations.json` | the expected baseline result of each check, written by the agent before the baseline runs | yes |
 | `.genesis/edd/<change>/checks/` | proofs that each package's checks work | no |
-| `.genesis/edd/<change>/runs/` | run records and before/after comparisons | no |
-| `.genesis/edd/<change>/reports/` | one report per run of the implementation loop | yes |
+| `.genesis/edd/<change>/runs/` | run records and before/after comparisons, each with its code as a commit plus `code.patch` | no |
+| `.genesis/edd/<change>/loop.json`, `loop-start.patch` | the running loop: its Spec, baseline, budget and starting code, with what the starting commit does not hold | no |
+| `.genesis/edd/<change>/reports/` | one report per full run of the implementation loop | yes |
 | `.genesis/edd/<change>/accepted.json` | the user's acceptance of a passing run, with earlier ones | yes |
+| `.dockerignore` | a `.genesis` line, which the agent adds when a package builds from the project root, so expected results stay out of the image | yes |
 | `.agents/skills/<skill>/`, `.claude/skills/<skill>/` | the four Genesis EDD skills, installed from a checkout by `init` | no |
+
+The paths marked no belong to this machine. A fresh clone has no package
+proofs, no runs, the baseline among them, and no loop: prove the packages there
+with `eval check` before running them.
+
+Do not ignore `openspec/` or all of `.genesis/` in your `.gitignore`: the
+files marked yes would stay out of Git, and Genesis EDD warns when they do. To
+keep other output under `.genesis/` out of Git, ignore `.genesis/*` and add
+`!.genesis/edd/` after it, or ignore only `.genesis/out/`.
 
 ## Skills
 

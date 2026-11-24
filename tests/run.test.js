@@ -1,16 +1,17 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { readJSON } from '../src/project.js';
 import { validateEval } from '../src/eval.js';
-import { checkEval, codeSnapshot, runTools, sameCode, startRun } from '../src/run.js';
+import { checkEval, codeSnapshot, runTools, sameCode, savePatch, startRun } from '../src/run.js';
 import { startLoop } from '../src/loop.js';
 import { checkWorkflow } from '../src/workflow.js';
 import {
-  AFTER, AGENT, BEFORE, CHANGE, FAKE_HARBOR_VERSION, cli, commit, connect, git, readRecord, readyProject, setResults, writeExpectations,
+  AFTER, AGENT, BEFORE, CHANGE, FAKE_HARBOR_VERSION, cli, commit, connect, git, harborThen, readRecord, readyProject, setResults, writeExpectations,
 } from './helpers/edd.js';
 
 const FAILURE = 'submit-failure-s1';
@@ -85,7 +86,7 @@ test('a baseline attempt that errored does not count: head runs are still refuse
 
   assert.throws(() => startRun(repo, CHANGE), (error) => {
     refused('baseline_missing')(error);
-    assert.match(error.gaps[0].message, new RegExp(attempt.json.run_id));
+    assert.ok(error.gaps[0].message.startsWith(`The last baseline attempt, ${attempt.json.run_id}, did not run; fix the cause and record it again.`), error.gaps[0].message);
     return true;
   });
   const head = cli(['run', 'start', CHANGE, '--repo', repo]);
@@ -1182,4 +1183,273 @@ test('eval check proves again a package whose last proof failed, and a failed pr
   assert.deepEqual(again.cases.map((item) => item.case), [SUCCESS]);
   assert.deepEqual(again.already_proved, [FAILURE]);
   assert.ok(tools.runs().length > calls);
+});
+
+// Each package's run edits the application once Harbor is done with it, as an
+// agent or the user editing while a run executes would.
+const EDIT_DURING_RUN = "appendFileSync(path.join(repo, 'app/edited.txt'), 'edited during the run\\n');";
+
+test('code edited while a run executes makes it neither a baseline nor a pass, and the run says to run again on stable code', (t) => {
+  const { repo, tools } = readyProject(t);
+  harborThen(t, EDIT_DURING_RUN);
+  const base = startRun(repo, CHANGE, { baseline: true });
+  assert.equal(base.execution_status, 'completed', JSON.stringify(base));
+  assert.equal(base.is_baseline, false);
+  assert.equal(base.baseline_unavailable_reason, 'execution_blocked');
+  assert.match(base.next, /The code changed while this run executed/);
+  assert.equal(readRecord(base).run.code_changed_during_run, true);
+  // The attempt ran; it is no baseline because the code changed meanwhile.
+  assert.throws(() => startRun(repo, CHANGE), (error) => {
+    refused('baseline_missing')(error);
+    const { message } = error.gaps[0];
+    assert.ok(message.startsWith(`The last baseline attempt, ${base.run_id}, ran while the code changed, so it is not a baseline; record it again without editing the code during the run.`), message);
+    assert.doesNotMatch(message, /did not run/);
+    return true;
+  });
+
+  tools.harbor(true);
+  rmSync(path.join(repo, 'app/edited.txt'));
+  const stable = startRun(repo, CHANGE, { baseline: true });
+  assert.equal(stable.is_baseline, true);
+  assert.equal(readRecord(stable).run.code_changed_during_run, false);
+  assert.ok(stable.warnings.every((warning) => !warning.includes('changed while this run executed')), JSON.stringify(stable.warnings));
+
+  setResults(repo, AFTER);
+  harborThen(t, EDIT_DURING_RUN);
+  const head = cli(['run', 'start', CHANGE, '--repo', repo]);
+  assert.equal(head.status, 0, head.stderr);
+  assert.equal(head.json.execution_status, 'completed');
+  assert.deepEqual(head.json.compare, tally({ holds: 3 }));
+  assert.equal(head.json.verdict, 'unverified');
+  assert.ok(head.json.warnings.includes('The code changed while this run executed, so its results do not belong to one version of the code. Do not edit the code during a run; run again once it is stable.'),
+    JSON.stringify(head.json.warnings));
+  assert.match(head.json.next, /run the same command again/);
+  const { run } = readRecord(head.json.directory);
+  assert.equal(run.code_changed_during_run, true);
+  assert.equal(run.verdict, 'unverified');
+  // The record keeps the code the run started from.
+  assert.equal(run.code_snapshot.file_digests['app/edited.txt'], undefined);
+});
+
+// Makes .git read-only, as a sandbox that lets a run read the repository but
+// not write to it does, until the returned function makes it writable again.
+function readOnlyGit(repo) {
+  const chmod = (mode) => assert.equal(spawnSync('chmod', ['-R', mode, path.join(repo, '.git')]).status, 0);
+  chmod('a-w');
+  return () => chmod('u+w');
+}
+
+test('code.patch is written while .git is read-only, nothing is written into its objects, and it restores the code', (t) => {
+  const { repo } = readyProject(t);
+  startRun(repo, CHANGE, { baseline: true });
+  setResults(repo, AFTER);
+  writeFileSync(path.join(repo, 'app/wip.txt'), 'work in progress\n');
+  const objects = tree(path.join(repo, '.git/objects'));
+  const writable = readOnlyGit(repo);
+  let head;
+  try { head = startRun(repo, CHANGE); } finally { writable(); }
+  assert.equal(head.verdict, 'pass', JSON.stringify(head));
+  assert.ok(head.warnings.every((warning) => !warning.includes('could not be written')), JSON.stringify(head.warnings));
+  assert.deepEqual(tree(path.join(repo, '.git/objects')), objects);
+  const snapshot = readRecord(head).run.code_snapshot;
+  assert.equal(snapshot.patch, 'code.patch');
+  assert.deepEqual(snapshot.changed_files, ['app/results.json', 'app/wip.txt']);
+
+  const clone = scratch(t, 'genesis-edd-read-only-');
+  git(clone, ['clone', '-q', repo, '.']);
+  git(clone, ['checkout', '-q', '--detach', snapshot.commit]);
+  git(clone, ['apply', path.join(head.directory, 'code.patch')]);
+  assert.deepEqual(tree(path.join(clone, 'app')), tree(path.join(repo, 'app')));
+});
+
+test('a run whose code.patch cannot be written warns that its code cannot be restored', (t) => {
+  // File modes do not stop root from reading a file, so the patch would not fail.
+  if (process.getuid?.() === 0) { t.skip('needs a user that file modes apply to'); return; }
+  const { repo } = readyProject(t);
+  startRun(repo, CHANGE, { baseline: true });
+  setResults(repo, AFTER);
+  const locked = path.join(repo, 'app/locked.bin');
+  writeFileSync(locked, 'unreadable\n');
+  chmodSync(locked, 0o000);
+  const head = startRun(repo, CHANGE);
+  assert.equal(head.execution_status, 'completed', JSON.stringify(head));
+  const warning = head.warnings.find((entry) => entry.startsWith('code.patch could not be written'));
+  assert.match(warning ?? '', /^code\.patch could not be written \(git add failed: .+\), so the code of this run cannot be restored: its commit does not hold the uncommitted files\.$/);
+  const { run } = readRecord(head);
+  assert.ok(run.warnings.includes(warning));
+  assert.equal(run.code_snapshot.patch, undefined);
+  assert.ok(!existsSync(path.join(head.directory, 'code.patch')));
+});
+
+test('code.patch and loop-start.patch are written when the project path holds a colon, and they restore the code', (t) => {
+  if (process.platform === 'win32') { t.skip('a folder name cannot hold a colon on Windows'); return; }
+  const { repo, root } = readyProject(t, { parent: scratch(t, 'genesis-edd-a:b-') });
+  assert.match(repo, /:/);
+  writeFileSync(path.join(repo, 'app/handler.txt'), 'the code before the change\n');
+  const start = tree(path.join(repo, 'app'));
+  const base = startRun(repo, CHANGE, { baseline: true });
+  assert.equal(base.is_baseline, true, JSON.stringify(base));
+  const started = startLoop(repo, CHANGE);
+  assert.deepEqual(started.warnings, []);
+  assert.equal(started.loop.start_code.patch, 'loop-start.patch');
+
+  setResults(repo, AFTER);
+  writeFileSync(path.join(repo, 'app/wip.txt'), 'work in progress\n');
+  const head = startRun(repo, CHANGE);
+  for (const run of [base, head]) {
+    assert.ok(run.warnings.every((warning) => !warning.includes('could not be written')), JSON.stringify(run.warnings));
+    assert.equal(readRecord(run).run.code_snapshot.patch, 'code.patch');
+  }
+
+  const { commit: at } = readRecord(head).run.code_snapshot;
+  for (const [patch, code] of [[path.join(base.directory, 'code.patch'), start], [path.join(root, 'loop-start.patch'), start],
+    [path.join(head.directory, 'code.patch'), tree(path.join(repo, 'app'))]]) {
+    const clone = scratch(t, 'genesis-edd-colon-clone-');
+    git(clone, ['clone', '-q', repo, '.']);
+    git(clone, ['checkout', '-q', '--detach', at]);
+    git(clone, ['apply', patch]);
+    assert.deepEqual(tree(path.join(clone, 'app')), code, patch);
+  }
+});
+
+test('code.patch is written when the commit is found only through the user\'s GIT_ALTERNATE_OBJECT_DIRECTORIES', (t) => {
+  const { repo } = readyProject(t);
+  // A clone with no objects of its own, which reads the project's only through the variable.
+  const shared = scratch(t, 'genesis-edd-shared-');
+  git(shared, ['clone', '-q', '--shared', repo, '.']);
+  rmSync(path.join(shared, '.git/objects/info/alternates'));
+  const saved = process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+  t.after(() => {
+    if (saved === undefined) delete process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+    else process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES = saved;
+  });
+  process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES = path.join(repo, '.git/objects');
+  writeFileSync(path.join(shared, 'app/wip.txt'), 'work in progress\n');
+  const { snapshot } = codeSnapshot(shared);
+  assert.deepEqual(snapshot.changed_files, ['app/wip.txt']);
+  const file = path.join(scratch(t, 'genesis-edd-patch-'), 'code.patch');
+  assert.deepEqual(savePatch(shared, snapshot, file), { patch: 'code.patch', error: null });
+
+  const clone = scratch(t, 'genesis-edd-shared-clone-');
+  git(clone, ['clone', '-q', repo, '.']);
+  git(clone, ['checkout', '-q', '--detach', snapshot.commit]);
+  git(clone, ['apply', file]);
+  assert.deepEqual(tree(path.join(clone, 'app')), tree(path.join(shared, 'app')));
+});
+
+test('the records .gitignore keeps the lines a user added and gains only the built-in lines it lacks', (t) => {
+  const { repo, root } = readyProject(t);
+  const file = path.join(root, '..', '.gitignore');
+  writeFileSync(file, '# Large logs stay local\n*.log\n!keep-me/\n/*/runs/');
+  startRun(repo, CHANGE, { baseline: true });
+  const merged = '# Large logs stay local\n*.log\n!keep-me/\n/*/runs/\n/*/checks/\n/*/loop.json\n/*/loop-start.patch\n__pycache__/\n';
+  assert.equal(readFileSync(file, 'utf8'), merged);
+  setResults(repo, AFTER);
+  startRun(repo, CHANGE);
+  assert.equal(readFileSync(file, 'utf8'), merged);
+});
+
+test('a head run with no ready package is refused with no_runnable_case, as workflow check is, and writes no run', (t) => {
+  const { repo, root, runs, tools } = readyProject(t);
+  const base = startRun(repo, CHANGE, { baseline: true });
+  // An edited package waits for `eval check` again.
+  for (const id of [FAILURE, SUCCESS]) writeFileSync(path.join(root, 'evals', id, 'instruction.md'), `Submit the weekly report for scenario ${id} twice.\n`);
+  const workflow = checkWorkflow(repo, 'run-eval', CHANGE);
+  assert.equal(workflow.status, 'blocked');
+  const calls = tools.runs().length;
+  assert.throws(() => startRun(repo, CHANGE), (error) => {
+    refused('no_runnable_case')(error);
+    assert.deepEqual(error.gaps, workflow.gaps);
+    assert.deepEqual(error.resume, workflow.resume);
+    assert.match(error.message, /^No package is ready to run\. Waiting: submit-failure-s1 \(check: run `eval check`/);
+    return true;
+  });
+  const refusal = cli(['run', 'start', CHANGE, '--repo', repo]);
+  assert.equal(refusal.status, 1);
+  assert.deepEqual(refusal.json.gaps.map((gap) => [gap.code, gap.route]), [['no_runnable_case', 'write-eval']]);
+  assert.deepEqual(refusal.json.resume.command, ['workflow', 'check', 'run-eval', CHANGE, '--repo', repo]);
+  assert.deepEqual(runIds(runs), [base.run_id]);
+  assert.equal(tools.runs().length, calls);
+});
+
+test('a run stopped at its timeout records the timeout, also when Harbor wrote a cancelled trial result on its way out', (t) => {
+  const { repo } = readyProject(t, { spec: 'example' });
+  startRun(repo, CHANGE, { baseline: true });
+  // Like Harbor, this one records the trial it is in as cancelled when told to stop.
+  const harbor = path.join(scratch(t, 'genesis-edd-slow-'), 'harbor.mjs');
+  writeFileSync(harbor, `import { mkdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+const argv = process.argv.slice(2);
+if (argv[0] === '--version') { console.log('harbor 0.0.0 (slow)'); process.exit(0); }
+const trial = path.join(argv[argv.indexOf('-o') + 1], 'harbor', 'trial-1');
+process.on('SIGTERM', () => {
+  mkdirSync(trial, { recursive: true });
+  writeFileSync(path.join(trial, 'result.json'), JSON.stringify({ exception_info: { exception_type: 'CancelledError', exception_message: '' } }));
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+`);
+  process.env.GENESIS_EDD_HARBOR = JSON.stringify([process.execPath, harbor]);
+  const run = startRun(repo, CHANGE, { timeout: 0.03 });
+  assert.equal(run.execution_status, 'error');
+  assert.equal(run.verdict, 'unverified');
+  assert.ok(existsSync(path.join(run.directory, FAILURE, 'logs/harbor/trial-1/result.json')));
+  assert.equal(run.cases[0].execution.reason, 'Harbor did not finish within 0.03 minutes and was stopped. Raise --timeout, or find what hangs in logs/.');
+});
+
+test('a trial result.json that cannot be read is an execution error with its reason, and the run goes on and is recorded', (t) => {
+  const { repo } = readyProject(t);
+  startRun(repo, CHANGE, { baseline: true });
+  setResults(repo, AFTER);
+  // Harbor stops while it writes the result of the first package's trial.
+  harborThen(t, `if (argv[argv.indexOf('-p') + 1].endsWith('${FAILURE}')) {
+    const file = path.join(logs, 'harbor', 'trial-1', 'result.json');
+    writeFileSync(file, readFileSync(file, 'utf8').slice(0, 20));
+  }`);
+  const run = cli(['run', 'start', CHANGE, '--repo', repo]);
+  assert.equal(run.status, 1, run.stderr);
+  assert.equal(run.json.execution_status, 'error');
+  assert.equal(run.json.verdict, 'unverified');
+  const byCase = Object.fromEntries(run.json.cases.map((item) => [item.id, item]));
+  assert.equal(byCase[FAILURE].execution.status, 'error');
+  assert.match(byCase[FAILURE].execution.reason, /^logs\/harbor\/trial-1\/result\.json cannot be read \(.+\)\. Harbor may have stopped while writing it; see logs\/harbor\.log\.$/);
+  assert.deepEqual(byCase[FAILURE].gating, { pass: 0, fail: 0, unknown: 1 });
+  assert.deepEqual(byCase[SUCCESS].execution, { status: 'completed' });
+  assert.deepEqual(rows(readRecord(run.json.directory).compare), [
+    [FAILURE, 'c1', 'fail', 'unknown', 'unverified'],
+    [SUCCESS, 'c1', 'pass', 'pass', 'holds'],
+    [SUCCESS, 'c2', 'pass', 'pass', 'holds'],
+  ]);
+});
+
+test('a run folder without run.json, left by an interrupted run, is named in a warning that says it can be deleted', (t) => {
+  const { repo, runs } = readyProject(t);
+  const base = startRun(repo, CHANGE, { baseline: true });
+  const interrupted = '20260101-000000-dead';
+  mkdirSync(path.join(runs, interrupted, FAILURE, 'logs'), { recursive: true });
+  writeFileSync(path.join(runs, interrupted, 'code.patch'), '');
+  setResults(repo, AFTER);
+  const head = startRun(repo, CHANGE);
+  assert.equal(head.verdict, 'pass');
+  assert.equal(head.baseline, base.run_id);
+  assert.deepEqual(head.warnings.filter((warning) => warning.startsWith('Run folders')), [`Run folders without a readable run.json, left by a run that was interrupted or is still running: ${interrupted}. They are not counted or compared. Delete them once their logs are no longer needed.`]);
+  assert.deepEqual(readRecord(head).run.warnings, head.warnings);
+});
+
+test('a head run whose agent, model or attempts differ from the baseline warns which ones, and its verdicts stay as they are', (t) => {
+  const { repo } = readyProject(t);
+  const base = startRun(repo, CHANGE, { baseline: true, model: 'synthetic/model-a' });
+  setResults(repo, AFTER);
+  const differs = (run) => run.warnings.filter((warning) => warning.startsWith('The settings of this run differ'));
+  const same = startRun(repo, CHANGE, { model: 'synthetic/model-a' });
+  assert.deepEqual(differs(same), []);
+
+  const other = startRun(repo, CHANGE, { agent: 'other_agent:OtherAgent', model: 'synthetic/model-b', attempts: 2 });
+  assert.equal(other.verdict, 'pass');
+  assert.deepEqual(other.compare, tally({ holds: 3 }));
+  assert.deepEqual(differs(other), [`The settings of this run differ from those of the baseline ${base.run_id}: agent other_agent:OtherAgent here, ${AGENT} in the baseline; model synthetic/model-b here, synthetic/model-a in the baseline; attempts 2 here, 1 in the baseline. A different result may come from that, not from the change. Run with the baseline's settings to compare like with like.`]);
+  assert.deepEqual(readRecord(other).run.warnings, other.warnings);
+
+  const unnamed = startRun(repo, CHANGE);
+  assert.deepEqual(differs(unnamed), [`The settings of this run differ from those of the baseline ${base.run_id}: model none here, synthetic/model-a in the baseline. A different result may come from that, not from the change. Run with the baseline's settings to compare like with like.`]);
 });

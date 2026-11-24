@@ -33,9 +33,13 @@ the user unless that run is already authorized.
 1. Run `edd workflow check run-eval <change> --repo <app>`. Route package gaps
    to `write-eval` and Spec gaps to `agent-spec`. A missing tool is not a
    failing check: install it or ask the user to start it. Its `next.command` is
-   the baseline command until a baseline is recorded for this Spec. After the
-   user accepts a run of the loop, `next.action` is `loop_done`: the loop is
-   finished, and `loop status` says what is left.
+   the baseline command until a baseline is recorded for this Spec, and again
+   while no loop runs and the recorded one has a `baseline_mismatch`, with
+   `--expect` once `baseline-expectations.json` exists. For a mismatch,
+   `next.note` names it; follow `baseline_mismatch` under Recover gaps before
+   recording again. After the user accepts a run of the loop, and while the
+   code is still that run's and no later run fails, `next.action` is
+   `loop_done`: the loop is finished, and `loop status` says what is left.
 2. Record the baseline before any code for this change is written.
    - **An implementation exists:** write the expected baseline result of each
      check from what this change does, then run
@@ -61,6 +65,14 @@ The expectation file is a JSON array. Keep it beside the packages, as
 [{ "case": "submit-failure-s1", "check": "c1", "expected": "fail", "reason": "The failure branch is added by this change." }]
 ```
 
+`--attempts N` runs each package N times, for an evaluated agent whose results
+vary from run to run. A check must hold every time: one failing attempt fails
+it, so a check that passes in some attempts and fails in others is a failure,
+marked `flaky`. Look for what differs between the attempts before calling it
+noise. Give the baseline and every head run the same `--attempts`, agent and
+model; a head run whose settings differ from the baseline's warns, because its
+comparison may show that difference rather than the change.
+
 ## Rules
 
 - A baseline is the code before the change. Never rerun it on changed code, and
@@ -69,6 +81,9 @@ The expectation file is a JSON array. Keep it beside the packages, as
   Spec, head runs compare with the loop's baseline, and any base record,
   `--unavailable` included, is refused on code other than the loop's starting
   code.
+- Do not edit the code while a run executes. A run during which the code
+  changed records `code_changed_during_run`, never passes and is not a
+  baseline; run it again on stable code.
 - Do not edit a check, an expectation or the Spec to produce a failing
   baseline or a passing head. A baseline that does not match its expectation is
   recorded as a mismatch and investigated.
@@ -83,6 +98,12 @@ The expectation file is a JSON array. Keep it beside the packages, as
 ## Recover gaps
 
 - `baseline_missing`: record the baseline first, as in step 2.
+- `baseline_mismatch`: the baseline did not behave as declared, and no loop
+  starts on it. Find out why first. If the expectation was wrong, correct it in
+  `baseline-expectations.json`, say why, and record the baseline again with
+  it; if the code was not the code before the change, restore that code and
+  record the baseline there. Ask the user when it is unclear what that code
+  does.
 - `baseline_after_change`: a loop for this Spec is running and the code is no
   longer the code it started from. Do not record a baseline on it; see
   `loop-and-implement`.

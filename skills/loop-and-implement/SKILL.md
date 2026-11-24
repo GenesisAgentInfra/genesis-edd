@@ -34,7 +34,10 @@ Runs need Docker and Harbor, as in run-eval.
 3. If you added files only for the evals after the baseline, such as
    `.dockerignore`, record the baseline again with the same `--expect` file;
    `loop start` refuses a baseline that ran on other code. This works only
-   before the first `loop start` for this Spec.
+   before the first `loop start` for this Spec. `loop start` also refuses a
+   baseline with a `baseline_mismatch`: either the expectation in
+   `baseline-expectations.json` is wrong, so fix it and record the baseline
+   again, or the code is not the code before the change.
 4. Run `edd loop start <change> --repo <app> --max-iterations N --max-minutes M`.
    When the user later agrees to go on past the budget, run
    `edd loop extend <change> --repo <app> --max-iterations N --max-minutes M`:
@@ -44,7 +47,9 @@ Nothing has to be committed. Every run stores its code as the commit it started
 from plus `code.patch` in the run folder, with everything that commit does not
 hold. Commit on a branch if you can and the user wants it. If `.git` is
 read-only, as in Codex's sandbox, carry on without commits; never work around it
-with a second checkout.
+with a second checkout. When a patch cannot be written, `run start` or
+`loop start` warns that the code cannot be restored: keep a copy of the
+uncommitted files before changing them.
 
 ## Each iteration
 
@@ -65,40 +70,46 @@ with a second checkout.
    `eval check`. The expected results stay as they are.
 6. Run the project's existing tests, if it has any. A check covers only its
    scenario; those tests guard the rest of the application.
-7. Run `edd run start <change> --repo <app>`. Add `--attempts N` when the
-   evaluated agent gives different results from run to run.
+7. Run `edd run start <change> --repo <app>` with the `--attempts` the loop's
+   baseline ran with, its `environment_ref.attempts`. If the evaluated agent
+   gives different results from run to run and needs more attempts, tell the
+   user: the baseline has to be recorded again with them on the loop's starting
+   code, and the loop started over with `loop start --restart`.
 8. Run `edd loop report <change> --repo <app>` and fill in Cause, Changes and
-   Next. Then return to step 1.
+   Next. Leave Review empty: it is written only when `loop status` says
+   `final_review`. Then return to step 1.
 
 ## What `next.action` asks
 
 | Action | Do |
 | --- | --- |
 | `iterate` | Classify the open checks it lists and change the right layer. |
-| `write_report` | Complete the named run's report before anything else. |
+| `write_report` | Complete the named run's report before anything else: Cause, Changes and Next. |
 | `repair_execution` | The run did not complete. Fix the adapter or environment in `write-eval`, or rerun after a build or timeout fault. It is not a result of the code. |
 | `split_changes` | A check that passed before the change now fails. Restore the code of the last run where it passed and reapply the changes one at a time to find the one that breaks it. |
 | `stop_stuck` | The same checks failed twice on different code. Stop and ask the user. |
 | `stop_budget` | The budget is used up. Stop and report. Raise it with `loop extend` only when the user agrees. |
-| `final_review` | Every gating check passes. Review the change, below. |
+| `final_review` | Every gating check passes. Review the change, below, then write Review. |
 | `ask_acceptance` | Ask the user to accept, below. |
+| `run_again` | The code changed while the latest run executed, so its results belong to no one version of the code; or the latest run passed and the code changed after it, so neither that run nor an acceptance of it covers the code now. Leave the code as it is during a run, and run every package again; only a passing run of the current code can be accepted. |
 | `restart` | The Spec was exported again. Update the packages, record a new baseline, then `loop start --restart`. |
 | `repair_spec` | The Spec the loop started from no longer validates. Restore what changed; a requirement that must change goes to `agent-spec` and the user. |
-| `done` | The user accepted a run of this loop. Offer to commit, merge or open a pull request; once the accepted code is committed, `next.commit` names the commit and only a merge or pull request is left. |
+| `done` | The user accepted a run of this loop, the code is still that run's, and no later full run fails. Offer to commit, merge or open a pull request. `next.uncommitted` lists the change's own files still to commit, such as reports and `accepted.json`; once everything is committed, `next.commit` names the commit and only a merge or pull request is left. |
 
 ## Rules
 
 - Never edit the Spec, its `genesis.json` or Map copy, `checks.json`, a
   fixture's expected result, a verifier's decision or a baseline to make a
   check pass. A wrong check is a `write-eval` fix with its own evidence,
-  proved by `eval check` and named in the report. A wrong or unclear requirement is the user's decision, through
-  `agent-spec`.
+  proved by `eval check` and named in the report. A wrong or unclear
+  requirement is the user's decision, through `agent-spec`.
 - Never special-case the eval inputs in application code: a known title, an
   ID, a fixed date.
 - To go back to the code of a run, check out its `code_snapshot.commit` and
   `git apply` its `code.patch`. Keep your own changes aside first.
 - Run again only after a real change. The same code shows nothing new.
-- Do not record the baseline again during the loop. Head runs keep comparing
+- Do not record the baseline again during the loop, except on its starting
+  code before `loop start --restart`, as step 7 says. Head runs keep comparing
   with the loop's baseline, and the CLI refuses any base record on code other
   than the loop's starting code: `start_code` in `loop.json`, its commit plus
   `loop-start.patch` beside it. Files added for the evals during the loop, such
@@ -114,29 +125,61 @@ with a second checkout.
 ## What the CLI checks
 
 - The same code means the same content: `code_snapshot.digest` covers every
-  file a run sees, committed or not, and leaves the commit out. Committing
-  alone changes nothing, so it never blocks a base record on the starting
-  code, an acceptance or a restart.
+  tracked file and every untracked file Git does not ignore, committed or not,
+  and leaves the commit out. Committing alone changes nothing, so it never
+  blocks a base record on the starting code, an acceptance or a restart.
+  Ignored files are not covered; keep them out of the image with
+  `.dockerignore`.
 - A report is complete when its first, template line is gone, Result, Cause,
   Changes and Next have content, every check listed under Cause has a cause
-  after it, and a passing run also has Review.
-- A regression is a gating check that passed in the baseline, or in the run
-  before when there is no baseline result, and fails now. A check that passed
-  only during the loop and fails again is reported as lost progress. Both
-  compare results of the same package only: after a `write-eval` fix, the
-  earlier results of that package do not count.
+  after it, and a passing run also has a Review of at least 40 characters.
+  `write_report` and `loop report` never ask for Review; `final_review` does,
+  once the rest is complete. `loop status` cannot tell when Review was
+  written: a Review written before `final_review` skips that step and its
+  Genesis review, so leave Review empty until then.
+- A regression is a gating check that passed in the baseline, or, when there
+  is no baseline result, in the latest earlier full run with a pass or fail
+  for it, and fails now; a run in between that could not tell does not hide
+  it. A check that passed only during the loop and fails again is reported as
+  lost progress. Both compare results of the same package only: after a
+  `write-eval` fix, the earlier results of that package do not count. A run
+  during which the code changed is compared neither as the latest run nor as
+  an earlier one.
 - The minutes of the budget count from `loop start` or the last `loop extend`,
-  and stop when the user accepts. A run that did not complete still counts as a
-  run; when the budget is used up, `next` is `stop_budget` instead of another
-  repair.
+  and stop at the user's acceptance only while it covers the loop: once the
+  code changes or a later full run fails, the minutes since the acceptance
+  count too. A run that did not complete still counts as a run; when the
+  budget is used up, `next` is `stop_budget` instead of another repair. The
+  budget is not enforced elsewhere: `run start` past it and `loop accept` of
+  a run made past it warn, and `accepted.json` records the budget and what
+  was used.
 - Stuck means the same gating checks failed in the last two full runs on
-  different code. Partial runs (`--case`) never count.
+  different code. Partial runs (`--case`) and runs during which the code
+  changed never count.
 - `loop accept` needs a passing full run, a complete report, an unchanged Spec,
-  and the same code now as when that run started. Each loop is accepted once;
-  an acceptance from an earlier loop of the change is kept in `accepted.json`
-  under `earlier`. The record keeps each check with its role, and the code
-  digest with `code_digest_of`, so `loop status` can still tell whether the
-  code changed when the run folder is gone.
+  code that did not change while the run executed, and the same code now as
+  when that run started. A loop is accepted once while that acceptance covers
+  it; an acceptance from an earlier loop of the change is kept in
+  `accepted.json` under `earlier`. The record keeps each check with its role,
+  and the code digest with `code_digest_of`, so `loop status` can still tell
+  whether the code changed when the run folder is gone.
+- After acceptance, `done` holds only while the code is the accepted run's and
+  no full run after the acceptance fails. Otherwise the acceptance no longer
+  covers the loop, and `loop status` marks it `outdated`: a gating check the
+  accepted run passed and a later run fails is a regression, and a passing run
+  of the code now needs the user's acceptance again, which `loop accept`
+  records with the earlier one under `earlier`.
+- `done` names a commit only when the application code and the change's own
+  files are committed: `openspec/changes/<change>/`, `openspec/config.yaml`,
+  `openspec/genesis.json`, `.genesis/edd/<change>/` apart from the ignored run
+  records, the project kit and `.genesis/edd/.gitignore`. Leftovers such as
+  `.DS_Store` or an editor's swap file do not count. When a `.gitignore` rule
+  keeps any of them out of Git, such as one that ignores `.genesis/` or
+  `openspec/`, `loop status`, `loop accept`, `eval new` and `eval validate`
+  warn; change the rule so they are committed. Of the paths the rule keeps
+  out, `next.uncommitted` lists each that Git holds nothing of, and the new
+  files in a folder the rule ignores, until they are in Git. It never lists a
+  file that a narrower rule, such as `*.log` or `.env`, keeps out on its own.
 
 ## Final review
 
@@ -145,21 +188,41 @@ commit reviewed in a fresh context: a subagent if you have one, given only the
 Spec, the diff and the latest report, not this conversation. Ask it to look for
 special cases for eval inputs, changes the Spec does not ask for, side effects
 no check covers, and claims in the report that the records do not support.
-Each fix needs a new full run; nothing has to be committed for it. Then write the run's Review
-section. Without a subagent, review the diff yourself as a separate pass and
-say so in Review: an author reviewing their own work misses more.
+Files that were already uncommitted when the loop started, which `loop status`
+names, show up in a diff from that commit; tell the reviewer their edits from
+before the loop are not part of this change. When the loop started before the
+project's first commit, no diff shows the change alone: give the reviewer
+`loop-start.patch`, which holds the files as they were then, to compare with.
+Each fix needs a new full run; nothing has to be committed for it. Then write
+the run's Review section: who reviewed, what they checked and found, and how
+each finding was handled.
+Without a subagent, review the diff yourself as a separate pass and say so in
+Review: an author reviewing their own work misses more.
 
 When the Spec recorded a Map, `loop status` also gives `next.genesis_review`.
 If Genesis is installed, review the change with it first, through its own
 skill, and pass the `prepare` arguments to every `genesis map prepare` of that
-review: `--base` with the commit the loop started from and `--entries-from`
-with the Map copy, `openspec/changes/<change>/business-map.json`. Genesis then
-starts from the entries and flows of the Map the Spec was written against, so
-the change lands on the same flows on every clone. `--entries-from` needs
-Genesis at or after commit `9c0c914`. If Genesis reads the project without its
-Python analysis, `prepare` refuses `--entries-from`: run it without and say so. Give the reviewer the summary of that review. Its Map covers only
-the change: never pass it to `spec new`, and leave the Map copy as it is. If
-Genesis is not installed, say so in Review.
+review: `--base` with the commit the loop started from, `--entries-from` with
+the Map copy, `openspec/changes/<change>/business-map.json`, and
+`--include-untracked` when the change has untracked files. Genesis then starts
+from the entries and flows of the Map the Spec was written against, so the
+change lands on the same flows on every clone.
+`genesis_review.uncommitted_at_start` lists files that were already
+uncommitted when the loop started: say in the review that their edits from
+before the loop are not part of this change.
+
+- `--entries-from` needs Genesis at or after commit `9c0c914`. If
+  `genesis map prepare` rejects the option, tell the user to update Genesis,
+  or run it without the option and say in Review that the flow ids may differ
+  from the Spec's Map. If Genesis reads the project without its Python
+  analysis, `prepare` refuses `--entries-from` too: run it without and say so.
+- Genesis does not see the eval packages under `.genesis/`, so a verdict such
+  as "not reached by any test" does not account for EDD's evals. Say so in
+  the review, next to the run that passed.
+
+Give the reviewer the summary of that review. Its Map covers only the change:
+never pass it to `spec new`, and leave the Map copy as it is. If Genesis is not
+installed, say so in Review.
 
 ## Acceptance
 
@@ -169,8 +232,9 @@ review left open. A diagnostic check never decides the verdict, so say plainly
 which requirements it is the only evidence for. Acceptance is the
 user's decision. Only after they give it, run
 `edd loop accept <change> --repo <app> --run <id> --by <name> --ref <where they said it>`.
-Then follow `loop status`: it offers a commit, or only a merge or pull request
-once the accepted code is committed.
+Then follow `loop status`: it offers a commit, naming the change's own files
+that still have to be committed, or only a merge or pull request once
+everything is committed.
 
 ## When you stop
 

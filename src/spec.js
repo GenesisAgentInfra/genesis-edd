@@ -3,14 +3,14 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import path from 'node:path';
 import { parse } from 'yaml';
 import {
-  SCHEMA, captureContext, changeDirectory, digest, listFiles, localPath,
-  mapCopy, openspec, readJSON, readMap, requireProject, writeJSON,
+  SCHEMA, captureContext, changeDirectory, codeNamedSteps, digest, listFiles, localPath,
+  mapCopy, openspec, outsideFlows, readJSON, readMap, requireProject, writeJSON,
 } from './project.js';
 
 export function newSpec(repo, name, options = {}) {
   const project = requireProject(repo);
   const directory = changeDirectory(repo, name);
-  if (existsSync(directory)) throw new Error('Change already exists; edit it or choose a new change name.');
+  if (existsSync(directory)) throw new Error(unfinishedChange(repo, name) ?? 'Change already exists; edit it or choose a new change name.');
   const mode = options.mode ?? project.mode;
   if (!['new', 'existing'].includes(mode)) throw new Error('--mode must be new or existing.');
   // The Map is checked before anything is created.
@@ -22,6 +22,31 @@ export function newSpec(repo, name, options = {}) {
   writeJSON(path.join(directory, 'genesis.json'), context);
   return { change: name, directory, context, warnings: map?.warnings ?? [], openspec: result.data, instructions: specInstructions(repo, name) };
 }
+
+// A change folder that `spec new` created and did not finish: OpenSpec made it,
+// and genesis.json was never written. It holds only what spec new writes, and
+// none of it is in Git, so deleting it loses nothing. Returns what to do, or
+// null for any other folder.
+function unfinishedChange(repo, name) {
+  const directory = changeDirectory(repo, name);
+  if (!existsSync(directory) || existsSync(path.join(directory, 'genesis.json'))) return null;
+  let files;
+  try { files = listFiles(directory).map((file) => path.relative(directory, file).split(path.sep).join('/')); } catch { return null; }
+  if (files.some((file) => !['.openspec.yaml', 'business-map.json'].includes(file))) return null;
+  const folder = `openspec/changes/${name}/`;
+  const git = (...args) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', timeout: 10_000 });
+  const inGit = git('rev-parse', '--is-inside-work-tree').status === 0;
+  if (inGit) {
+    const tracked = git('ls-files', '-z', '--', folder);
+    if (tracked.status !== 0 || tracked.stdout) return null;
+  }
+  return `${folder} has no genesis.json${inGit ? ' and nothing in it is in Git' : ''}: an earlier \`spec new\` stopped before it finished, so there is no recorded context to restore. Delete that folder and run \`spec new\` again.`;
+}
+
+// Specs and impact.md are read with LF line ends, so a checkout that turns
+// them into CRLF, such as Git's core.autocrlf on Windows, keeps the identity
+// of the Spec and its export.
+const lf = (text) => text.replace(/\r\n/g, '\n');
 
 // Whether Git keeps the Map a Spec depends on: null when it does or when this
 // is not a Git checkout, otherwise why other clones will not have it.
@@ -111,7 +136,7 @@ export const specReview = (specs) => specRequirements(specs).map(({ id, basis, s
 // Which entries and flows a request touches, written by the agent for an
 // existing project. Flow IDs and evidence are checked against the Map and repo.
 function readImpact(repo, file, mapFlows, fail) {
-  const content = readFileSync(file, 'utf8');
+  const content = lf(readFileSync(file, 'utf8'));
   const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content);
   let metadata;
   try { metadata = match && parse(match[1]); } catch (cause) { fail(`Invalid YAML: ${cause.message}`); return null; }
@@ -146,6 +171,28 @@ function readImpact(repo, file, mapFlows, fail) {
     });
   });
   return { path: 'impact.md', sha256: digest(content), entries };
+}
+
+// What genesis.json recorded about the Map, for every check that reads the
+// change: `spec new` warns once, and an agent that resumes later has only this
+// record. `flows` are those of the recorded Map.
+function recordedMap(context, flows) {
+  const { map } = context;
+  const at = typeof context.code?.base_commit === 'string' ? ` of base commit ${context.code.base_commit.slice(0, 7)}` : '';
+  const notes = [];
+  if (map.freshness === 'verified') notes.push(`The Map was verified against the code${at}.`);
+  else if (map.freshness === 'stale') notes.push(`This Map no longer matched the code${at} when \`spec new\` checked it (freshness stale): its flows may describe code that is not there anymore. Tell the user. To write the Spec against the code as it is, map the project again with \`/genesis map\` and create a new change with the new Map; do not edit genesis.json.`);
+  else if (map.freshness === 'unverified') notes.push(`Whether this Map still matched the code${at} was not checked (freshness unverified): when \`spec new\` recorded it, the Map had no source, had been read with uncommitted changes or had left files out, or there was no commit to compare it with.`);
+  else notes.push('Whether this Map matches the code was not checked: the change was made before `spec new` recorded freshness.');
+  if (map.mode === 'unknown') notes.push('This Map does not say whether it maps the whole project or a change review (mode unknown). Make sure it is a full map: the Map of a `/genesis review` covers only what that review analyzed.');
+  if (map.analysis_status === 'partial') notes.push('This Map is partial: some flows are not described yet or leave code unaccounted for, or files were left out. Record that limit; do not call its coverage complete.');
+  const coverage = map.coverage;
+  if (Number.isInteger(coverage?.entries_planned) && Number.isInteger(coverage?.entries_total) && coverage.entries_planned < coverage.entries_total) {
+    notes.push(outsideFlows(coverage));
+  }
+  const { coded, total } = codeNamedSteps(flows);
+  if (coded) notes.push(`${coded} of the ${total} steps in this Map belong to flows Genesis has not described yet and are named from the source code. That code goes into Git with the Map copy: tell the user before it is committed.`);
+  return notes;
 }
 
 export function validateSpec(repo, name) {
@@ -189,7 +236,7 @@ export function validateSpec(repo, name) {
     return report();
   }
   try { context = readJSON(localPath(repo, `openspec/changes/${name}/genesis.json`)); } catch (cause) {
-    error('context_unavailable', `Restore the recorded code/Map context; do not invent snapshot identities: ${cause.message}`);
+    error('context_unavailable', unfinishedChange(repo, name) ?? `Restore the recorded code/Map context; do not invent snapshot identities: ${cause.message}`);
     return report();
   }
   if (!record(context)) {
@@ -224,7 +271,14 @@ export function validateSpec(repo, name) {
         : `Referenced Map is unavailable: genesis.json records ${recorded ?? 'no path'}, which this checkout does not have${recorded?.startsWith('.genesis/') ? ' (Genesis keeps its output out of Git)' : ''}. Copy that file from the machine that made it to ${copy}, where its digest must still be ${context.map.sha256}, and commit it with the Spec. Do not edit genesis.json, which is part of the exported Spec.`);
     } else {
       try { bytes = readFileSync(full(chosen)); } catch { bytes = null; }
-      if (bytes === null || digest(bytes) !== context.map.sha256) {
+      // A checkout that converts the copy's line ends between LF and CRLF does
+      // not change the Map: the recorded digest may be of either form.
+      const matches = (content) => {
+        const unix = lf(content.toString('latin1'));
+        return [content, Buffer.from(unix, 'latin1'), Buffer.from(unix.replace(/\n/g, '\r\n'), 'latin1')]
+          .some((form) => digest(form) === context.map.sha256);
+      };
+      if (bytes === null || !matches(bytes)) {
         error('map_changed', `Referenced Map changed: ${chosen} no longer has the digest recorded in genesis.json. ${!legacy
           ? 'Restore it from Git, or create a new change with the updated Map.'
           : chosen === copy
@@ -244,9 +298,9 @@ export function validateSpec(repo, name) {
         if (legacy && chosen === copy) warnings.push(`genesis.json records the Map at ${recorded ?? 'no path'}; ${copy} has the recorded digest and is used, as on other clones.`);
         const kept = mapInGit(repo, chosen, path.join(directory, 'genesis.json'));
         if (kept) warnings.push(`${chosen} ${kept}, so other clones cannot check this Spec against its Map.${chosen === copy ? ' Commit it with the Spec.' : ` Copy it to ${copy} and commit it with the Spec; do not edit genesis.json.`}`);
+        warnings.push(...recordedMap(context, flows));
       }
     }
-    warnings.push('Map freshness against the current code is not automatically verified.');
   } else if (context.project_mode === 'existing') {
     warnings.push('No Map supplied for an existing project; use repository facts and record coverage limits.');
   }
@@ -264,7 +318,7 @@ export function validateSpec(repo, name) {
     const relative = path.relative(directory, file);
     const fail = (message) => error('spec_invalid', `${relative}: ${message}`, { path: relative });
     let content;
-    try { content = readFileSync(file, 'utf8'); } catch (cause) { fail(cause.message); continue; }
+    try { content = lf(readFileSync(file, 'utf8')); } catch (cause) { fail(cause.message); continue; }
     const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(content);
     if (!match) { fail('Missing Genesis YAML frontmatter.'); continue; }
     let metadata;
@@ -345,6 +399,10 @@ export function validateSpec(repo, name) {
   if (existsSync(impactFile)) {
     impact = readImpact(repo, impactFile, mapFlows, (message, workingTree) => error('impact_invalid', `impact.md: ${message}`,
       { path: 'impact.md', ...(workingTree ? { working_tree: true } : {}) }));
+    const unchecked = context.map?.status === 'available' ? [] : [...new Set((impact?.entries ?? []).map((entry) => entry.flow).filter(Boolean))];
+    if (unchecked.length) {
+      warnings.push(`impact.md names flow IDs (${unchecked.join(', ')}), but no Map is recorded, so they could not be checked. A flow ID comes from the recorded Map; without one, leave \`flow\` out.`);
+    }
   } else if (context.project_mode === 'existing') {
     warnings.push('No impact.md for an existing project: the entries and flows this request touches are not recorded.');
   }
