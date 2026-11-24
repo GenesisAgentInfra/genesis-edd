@@ -1,16 +1,17 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { initProject, projectRoot, readJSON } from '../src/project.js';
+import { ignoredArtifacts, initProject, projectRoot, readJSON } from '../src/project.js';
 import { exportSpec, newSpec, validateSpec } from '../src/spec.js';
 import { newEval, validateEval } from '../src/eval.js';
 import { checkEval, codeSnapshot, startRun } from '../src/run.js';
 import { acceptLoop, extendLoop, loopStatus, reportGaps, startLoop, writeReport } from '../src/loop.js';
 import { checkWorkflow } from '../src/workflow.js';
 import {
-  AFTER, AGENT, BEFORE, CHANGE, FIXTURES, SPECS, cli, commit, connect, git, readRecord, readyProject, setResults, useFakeTools,
+  AFTER, AGENT, BEFORE, CHANGE, FIXTURES, SPECS, cli, commit, connect, git, harborThen, readRecord, readyProject, setResults, useFakeTools,
   writeExpectations, writeSpec,
 } from './helpers/edd.js';
 
@@ -410,7 +411,7 @@ test('a check that passed only during the loop and fails again is lost progress,
   const status = loopStatus(repo, CHANGE);
   assert.deepEqual(status.regressions, []);
   assert.deepEqual(status.lost_progress, [{ case: 'submit-failure-s1', check: 'c1', intent: 'REQ-submit-failure' }]);
-  assert.ok(status.warnings.some((warning) => /Passed in the run before and fails again: submit-failure-s1\/c1/.test(warning)), JSON.stringify(status.warnings));
+  assert.ok(status.warnings.some((warning) => /Passed in an earlier run and fails again: submit-failure-s1\/c1/.test(warning)), JSON.stringify(status.warnings));
   assert.equal(status.stuck, false);
   assert.equal(status.next.action, 'iterate');
 });
@@ -544,10 +545,13 @@ test('an accepted run is recorded with its checks and the acceptance, and the sa
   const command = ['loop', 'accept', CHANGE, '--repo', repo, '--run', run.run_id, '--by', ' Dana ', '--ref', ' review thread 12 '];
   const result = cli(command);
   assert.equal(result.status, 0, result.stderr);
-  // The run was on a clean commit, so nothing is left to commit.
-  assert.equal(result.json.commit, head);
-  assert.match(result.json.next, new RegExp(`committed in ${head.slice(0, 7)}`));
-  assert.doesNotMatch(result.json.next, /Offer to commit/);
+  // The run was on a clean commit, but the report and the acceptance record
+  // belong in Git too and are not committed yet.
+  assert.equal(result.json.commit, undefined);
+  assert.deepEqual(result.json.uncommitted, [`.genesis/edd/${CHANGE}/accepted.json`, `.genesis/edd/${CHANGE}/reports/`]);
+  assert.match(result.json.next, new RegExp(`The accepted code is committed in ${head.slice(0, 7)}, but the commit is incomplete: \\.genesis/edd/${CHANGE}/accepted\\.json, \\.genesis/edd/${CHANGE}/reports/ are not committed\\.`));
+  assert.doesNotMatch(result.json.next, /The accepted change is committed/);
+  assert.deepEqual(result.json.warnings, []);
   const file = path.join(root, 'accepted.json');
   assert.equal(result.json.file, file);
   const accepted = readJSON(file);
@@ -1040,7 +1044,7 @@ test('a check that passed in the run before and fails after its package changed 
   assert.deepEqual(status.checks.find((entry) => entry.case === FAILURE).runs, ['pass', 'fail']);
   assert.deepEqual(status.regressions, []);
   assert.deepEqual(status.lost_progress, []);
-  assert.ok(!status.warnings.some((warning) => /Passed in the run before/.test(warning)), JSON.stringify(status.warnings));
+  assert.ok(!status.warnings.some((warning) => /Passed in an earlier run/.test(warning)), JSON.stringify(status.warnings));
   assert.equal(status.next.action, 'iterate', JSON.stringify(status.next));
 });
 
@@ -1099,12 +1103,18 @@ test('after acceptance loop status reports done with who accepted, even with the
   assert.equal(shown.status, 0, shown.stderr);
   assert.equal(shown.json.next.action, 'done');
 
+  // Code that moved past the accepted run is no longer covered: with the
+  // budget used up, another run needs the user to raise it first.
   const scratch = path.join(repo, 'app/scratch.txt');
   writeFileSync(scratch, 'an edit after the acceptance\n');
   status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'done');
+  assertStopBudget(status.next, repo);
+  assert.match(status.next.message, new RegExp(`The code changed after ${run.run_id}, the run the user accepted, so the acceptance no longer covers it`));
+  assert.doesNotMatch(status.next.message, /merge|pull request|Offer to commit/);
+  assert.equal(status.accepted.outdated, true);
   assert.ok(status.warnings.some((warning) => /acceptance covers that run's code only/i.test(warning)), JSON.stringify(status.warnings));
   rmSync(scratch);
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'done');
 
   // The Spec comes before acceptance: an edit without export, then a new export.
   writeSpec(repo, REVISED);
@@ -1114,12 +1124,13 @@ test('after acceptance loop status reports done with who accepted, even with the
   writeSpec(repo, SPECS.two);
   assert.equal(loopStatus(repo, CHANGE).next.action, 'done');
 
-  // Acceptance comes before a later run that did not complete.
+  // A later run on other code that did not complete is not done either.
   changeCode(repo, { ...AFTER, [SUCCESS]: 'error' }, 'an edit after the acceptance');
   assert.equal(startRun(repo, CHANGE).execution_status, 'error');
   status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'done');
+  assertStopBudget(status.next, repo);
   assert.equal(status.accepted.run_id, run.run_id);
+  assert.equal(status.accepted.outdated, true);
 });
 
 test('a restarted loop can accept its own passing run, and each acceptance keeps the ones before it under earlier', (t) => {
@@ -1604,4 +1615,733 @@ test('the report marks each check gating or diagnostic and says only gating chec
   assert.deepEqual(readJSON(path.join(root, 'accepted.json')).checks.map((entry) => [entry.case, entry.check, entry.role]), [
     ['submit-failure-s1', 'c1', 'gating'], ['submit-success-s1', 'c1', 'gating'], ['submit-success-s1', 'c2', 'diagnostic'],
   ]);
+});
+
+// Whether the code now has the content digest a run recorded.
+const sameCodeAsRun = (repo, run) => codeSnapshot(repo).snapshot.digest === readRecord(run).run.code_snapshot.digest;
+
+test('a run during which the code changed is never accepted, even once the code is back where that run started', (t) => {
+  const { repo, root } = inLoop(t);
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  // Each package's run edits the application once Harbor is done with it.
+  harborThen(t, "appendFileSync(path.join(repo, 'app/edited.txt'), 'edited during the run\\n');");
+  const run = startRun(repo, CHANGE);
+  assert.equal(run.verdict, 'unverified', JSON.stringify(run));
+  rmSync(path.join(repo, 'app/edited.txt'));
+  assert.equal(sameCodeAsRun(repo, run), true);
+
+  const status = loopStatus(repo, CHANGE);
+  assert.ok(status.warnings.includes(`The code changed while ${run.run_id} executed, so its results do not belong to one version of the code. Leave the code as it is during a run, and run again.`),
+    JSON.stringify(status.warnings));
+  completeReport(repo, run.run_id);
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'chat' }), (error) => {
+    blockedWith('code_changed_during_run')(error);
+    assert.ok(!codes(error.gaps).includes('code_changed'), JSON.stringify(error.gaps));
+    return true;
+  });
+  assert.ok(!existsSync(path.join(root, 'accepted.json')));
+});
+
+test('loop start keeps uncommitted starting code as loop-start.patch while .git is read-only, without writing into its objects', (t) => {
+  const { repo, root } = readyProject(t);
+  writeFileSync(path.join(repo, 'app/handler.txt'), 'the code before the change\n');
+  startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
+  const objects = path.join(repo, '.git/objects');
+  const before = spawnSync('find', [objects], { encoding: 'utf8' }).stdout;
+  assert.equal(spawnSync('chmod', ['-R', 'a-w', path.join(repo, '.git')]).status, 0);
+  let started;
+  try { started = startLoop(repo, CHANGE); } finally { spawnSync('chmod', ['-R', 'u+w', path.join(repo, '.git')]); }
+  assert.deepEqual(started.warnings, []);
+  assert.equal(started.loop.start_code.patch, 'loop-start.patch');
+  assert.match(readFileSync(path.join(root, 'loop-start.patch'), 'utf8'), /^\+the code before the change$/m);
+  assert.equal(spawnSync('find', [objects], { encoding: 'utf8' }).stdout, before);
+});
+
+test('loop start warns when loop-start.patch cannot be written, because the starting code cannot be restored', (t) => {
+  // File modes do not stop root from reading a file, so the patch would not fail.
+  if (process.getuid?.() === 0) { t.skip('needs a user that file modes apply to'); return; }
+  const { repo, root } = readyProject(t);
+  startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
+  const locked = path.join(repo, 'app/locked.bin');
+  writeFileSync(locked, 'unreadable\n');
+  chmodSync(locked, 0o000);
+  const head = git(repo, ['rev-parse', 'HEAD']);
+  const started = startLoop(repo, CHANGE);
+  assert.equal(started.warnings.length, 1, JSON.stringify(started.warnings));
+  assert.match(started.warnings[0], new RegExp(`^loop-start\\.patch could not be written \\(git add failed: .+\\), so the loop's starting code cannot be restored: commit ${head.slice(0, 7)} does not hold its uncommitted files\\.`));
+  assert.equal(started.loop.start_code.patch, undefined);
+  assert.ok(!existsSync(path.join(root, 'loop-start.patch')));
+});
+
+test('loop status names run folders without run.json, left by interrupted runs, and says they can be deleted', (t) => {
+  const { repo, runs } = inLoop(t);
+  const interrupted = '20260101-000000-dead';
+  mkdirSync(path.join(runs, interrupted, 'submit-failure-s1', 'logs'), { recursive: true });
+  writeFileSync(path.join(runs, interrupted, 'code.patch'), '');
+  const status = loopStatus(repo, CHANGE);
+  assert.ok(status.warnings.includes(`Run folders without a readable run.json, left by a run that was interrupted or is still running: ${interrupted}. They are not counted or compared. Delete them once their logs are no longer needed.`),
+    JSON.stringify(status.warnings));
+  assert.equal(status.loop.used.iterations, 0);
+});
+
+// --- Acceptance that stops covering the loop, the final review, what still
+// has to be committed, ignored records, comparisons across runs that could not
+// tell, the baseline a loop starts on, the Genesis review and the budget. ---
+
+test('after acceptance, code that changed is no longer done: loop status says run again, workflow check runs again, and a passing run of that code is accepted again', (t) => {
+  const project = inLoop(t);
+  const { repo, root } = project;
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  const first = fullRun(repo);
+  completeReport(repo, first.run_id);
+  acceptLoop(repo, CHANGE, { run: first.run_id, by: 'Dana', ref: 'thread 1' });
+  const earlier = readJSON(path.join(root, 'accepted.json'));
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'done');
+
+  editApp(repo, AFTER, 'a tweak after the acceptance');
+  let status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'run_again', JSON.stringify(status.next));
+  assert.deepEqual(status.next.command, ['run', 'start', CHANGE, '--repo', repo]);
+  assert.match(status.next.message, new RegExp(`The code changed after ${first.run_id}, the run the user accepted, so the acceptance no longer covers it`));
+  assert.match(status.next.message, /needs their acceptance again/);
+  assert.doesNotMatch(status.next.message, /merge|pull request|Offer to commit/);
+  assert.equal(status.next.commit, undefined);
+  assert.equal(status.accepted.outdated, true);
+  const check = checkWorkflow(repo, 'run-eval', CHANGE);
+  assert.equal(check.next.action, 'run_eval', JSON.stringify(check.next));
+
+  const second = fullRun(repo);
+  assert.equal(second.verdict, 'pass');
+  completeReport(repo, second.run_id, { review: false });
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'final_review');
+  completeReport(repo, second.run_id);
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'ask_acceptance');
+  assert.match(status.next.message, new RegExp(`acceptance of run ${first.run_id} no longer covers the loop`));
+  acceptLoop(repo, CHANGE, { run: second.run_id, by: 'Dana', ref: 'thread 2' });
+  const record = readJSON(path.join(root, 'accepted.json'));
+  assert.equal(record.run_id, second.run_id);
+  assert.deepEqual(record.earlier, [earlier]);
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.accepted.outdated, undefined);
+  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'loop_done');
+});
+
+test('after acceptance, a later full run that fails lists the checks the accepted run passed under regressions and is not done', (t) => {
+  const { repo } = inLoop(t);
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  const accepted = fullRun(repo);
+  completeReport(repo, accepted.run_id);
+  acceptLoop(repo, CHANGE, { run: accepted.run_id, by: 'Dana', ref: 'thread 1' });
+
+  // The failed submission sends the success notice again, as before the change.
+  changeCode(repo, BEFORE, 'one more small tweak');
+  const later = fullRun(repo);
+  assert.equal(later.verdict, 'fail');
+  let status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'write_report');
+  assert.ok(status.warnings.some((warning) => warning.startsWith(`Run ${later.run_id}, after the user accepted run ${accepted.run_id}, fails`)), JSON.stringify(status.warnings));
+  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'run_eval');
+  completeReport(repo, later.run_id);
+  status = loopStatus(repo, CHANGE);
+  // Without the acceptance this would be lost progress; it breaks what the user accepted.
+  assert.deepEqual(status.regressions, [{ case: FAILURE, check: 'c1', intent: 'REQ-submit-failure' }]);
+  assert.deepEqual(status.lost_progress, []);
+  assert.equal(status.next.action, 'split_changes');
+  assert.equal(status.accepted.outdated, true);
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: later.run_id, by: 'Dana', ref: 'thread 2' }), refusedWith('not_passing'));
+});
+
+test('write_report and loop report never ask for Review, the final review follows once the rest of the report is complete, and a Review of a few characters is refused', (t) => {
+  const { repo } = inLoop(t);
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  let status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'write_report');
+  assert.doesNotMatch(status.next.message, /Review is empty/);
+
+  const written = writeReport(repo, CHANGE);
+  assert.match(written.next, /^Fill in Cause, Changes and Next, then delete the template line\. Leave Review empty/);
+  const skeleton = readFileSync(written.file, 'utf8');
+  assert.match(skeleton.split('\n')[0], /write Cause, Changes and Next, then delete this line/);
+  assert.match(skeleton, /^<!-- Leave this empty until `loop status` says final_review\./m);
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'write_report');
+  assert.match(status.next.message, /the template line is still there; section Next is empty\. Leave Review for the final review that follows\.$/);
+  assert.deepEqual(writeReport(repo, CHANGE).missing, ['the template line is still there', 'section Next is empty']);
+
+  const file = completeReport(repo, run.run_id, { review: false });
+  assert.deepEqual(writeReport(repo, CHANGE).missing, []);
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'final_review');
+  assert.match(status.next.message, /in at least 40 characters\.$/);
+
+  // One word is not a review.
+  writeFileSync(file, readFileSync(file, 'utf8').replace(/^## Review[ \t]*$/m, '## Review\n\nLooks good.'));
+  const short = 'section Review is too short: it needs at least 40 characters on who reviewed the whole change, what they checked and found, and how each finding was handled';
+  assert.deepEqual(reportGaps(repo, CHANGE, { run_id: run.run_id, verdict: 'pass' }), [short]);
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'final_review');
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'chat' }), (error) => {
+    refusedWith('report_incomplete')(error);
+    assert.ok(error.message.includes(short), error.message);
+    return true;
+  });
+  writeFileSync(file, readFileSync(file, 'utf8').replace('Looks good.', 'A fresh reviewer compared the whole diff with the Spec and found nothing to change.'));
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'ask_acceptance');
+});
+
+test('done says the commit is incomplete while the change\'s own files are not committed, names them, and names the commit once they are', (t) => {
+  const { repo } = inLoop(t);
+  editApp(repo, AFTER, 'Stop the success notice when a submission fails');
+  writeFileSync(path.join(repo, 'openspec/changes', CHANGE, 'design-notes.md'), '# Notes\n');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'thread 1' });
+
+  git(repo, ['add', 'app']);
+  git(repo, ['commit', '-q', '-m', 'Commit only the application']);
+  const head = git(repo, ['rev-parse', 'HEAD']);
+  const edd = `.genesis/edd/${CHANGE}`;
+  let status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.next.commit, undefined);
+  assert.deepEqual(status.next.uncommitted, ['.genesis/edd/.gitignore', `${edd}/accepted.json`, `${edd}/baseline-expectations.json`, `${edd}/reports/`,
+    `openspec/changes/${CHANGE}/design-notes.md`]);
+  assert.match(status.next.message, new RegExp(`The accepted code is committed in ${head.slice(0, 7)}, but the commit is incomplete: `));
+  assert.ok(status.next.message.includes(`${edd}/accepted.json`), status.next.message);
+  assert.doesNotMatch(status.next.message, /The accepted change is committed/);
+
+  const all = commit(repo, 'Commit the evals, reports and acceptance');
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.commit, all);
+  assert.equal(status.next.uncommitted, undefined);
+  assert.match(status.next.message, new RegExp(`The accepted change is committed in ${all.slice(0, 7)}\\. Offer to merge it or open a pull request`));
+
+  // What Finder or an editor leaves beside the files is not part of the change.
+  writeFileSync(path.join(repo, edd, 'evals', FAILURE, '.DS_Store'), '');
+  writeFileSync(path.join(repo, edd, 'evals', FAILURE, 'tests/checks.json.swp'), '');
+  writeFileSync(path.join(repo, edd, 'reports', 'notes.md~'), '');
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.commit, all, JSON.stringify(status.next));
+  assert.equal(status.next.uncommitted, undefined);
+});
+
+test('a .gitignore that ignores .genesis/ is named in eval new, eval validate, loop status and loop accept, and keeps done from saying committed', (t) => {
+  const { repo } = inLoop(t);
+  writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\n.genesis/\n');
+  editApp(repo, AFTER, 'Stop the success notice when a submission fails');
+  const edd = `.genesis/edd/${CHANGE}`;
+  const ignored = `Git ignores files of this change that must be committed: .genesis/edd/.gitignore, .genesis/edd/harness/, ${edd}/evals/, ${edd}/baseline-expectations.json, ${edd}/reports/, ${edd}/accepted.json (rule \`.genesis/\` in .gitignore:2).`;
+  const named = (warnings) => warnings.some((warning) => warning.startsWith(ignored) && warning.includes('ignore `.genesis/*` and add `!.genesis/edd/` after it, or ignore only `.genesis/out/`'));
+  assert.ok(named(validateEval(repo, CHANGE).warnings), JSON.stringify(validateEval(repo, CHANGE).warnings));
+  assert.ok(named(newEval(repo, CHANGE).warnings));
+  assert.ok(named(cli(['eval', 'validate', CHANGE, '--repo', repo]).json.warnings));
+  assert.ok(named(loopStatus(repo, CHANGE).warnings));
+
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  commit(repo, 'Commit everything Git does not ignore');
+  const accepted = acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'thread 1' });
+  assert.ok(named(accepted.warnings), JSON.stringify(accepted.warnings));
+  assert.equal(accepted.commit, undefined);
+  // The packages were committed before the rule; only what Git does not hold is listed.
+  assert.deepEqual(accepted.uncommitted, ['.genesis/edd/.gitignore', `${edd}/accepted.json`, `${edd}/baseline-expectations.json`, `${edd}/reports/`]);
+  const status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.next.commit, undefined);
+  assert.match(status.next.message, /the commit is incomplete/);
+
+  // Ignoring Genesis's own output only is fine.
+  writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\n.genesis/*\n!.genesis/edd/\n');
+  assert.ok(!named(validateEval(repo, CHANGE).warnings));
+  assert.deepEqual(validateEval(repo, CHANGE).warnings.filter((warning) => warning.startsWith('Git ignores')), []);
+});
+
+test('final review and acceptance are not asked for once the code changed after the passing run: loop status says run again', (t) => {
+  const { repo } = inLoop(t);
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id, { review: false });
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'final_review');
+
+  const scratch = path.join(repo, 'app/scratch.txt');
+  writeFileSync(scratch, 'a fix from the review\n');
+  let status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'run_again');
+  assert.deepEqual(status.next.command, ['run', 'start', CHANGE, '--repo', repo]);
+  assert.match(status.next.message, new RegExp(`^The code changed after ${run.run_id}; that run says nothing about the code now\\.`));
+  assert.doesNotMatch(status.next.message, /acceptance no longer covers/);
+  rmSync(scratch);
+  completeReport(repo, run.run_id);
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'ask_acceptance');
+
+  writeFileSync(scratch, 'an edit before the user answered\n');
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'run_again');
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'chat' }), refusedWith('code_changed'));
+});
+
+test('a run that could not tell in between does not hide lost progress: each check compares with its latest pass or fail', (t) => {
+  const { repo } = inLoop(t);
+  changeCode(repo, AFTER, 'fix the failure notice');
+  completeReport(repo, fullRun(repo).run_id);
+  changeCode(repo, { ...AFTER, [FAILURE]: { c1: 'unknown' } }, 'a run whose evidence could not tell');
+  const unclear = fullRun(repo);
+  assert.equal(unclear.verdict, 'unverified');
+  completeReport(repo, unclear.run_id);
+  changeCode(repo, BEFORE, 'undo the fix by accident');
+  completeReport(repo, fullRun(repo).run_id);
+
+  const status = loopStatus(repo, CHANGE);
+  assert.deepEqual(status.checks.find((entry) => entry.case === FAILURE).runs, ['pass', 'unknown', 'fail']);
+  assert.deepEqual(status.lost_progress, [{ case: FAILURE, check: 'c1', intent: 'REQ-submit-failure' }]);
+  assert.ok(status.warnings.some((warning) => /Passed in an earlier run and fails again: submit-failure-s1\/c1/.test(warning)), JSON.stringify(status.warnings));
+});
+
+test('without a baseline result, a run that did not complete in between does not hide a regression', (t) => {
+  const { repo } = readyProject(t);
+  startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
+  startLoop(repo, CHANGE);
+  changeCode(repo, AFTER, 'first version');
+  completeReport(repo, fullRun(repo).run_id);
+  changeCode(repo, { ...AFTER, [SUCCESS]: 'error' }, 'an interrupted run');
+  assert.equal(startRun(repo, CHANGE).execution_status, 'error');
+  changeCode(repo, BROKEN, 'third version');
+  completeReport(repo, fullRun(repo).run_id);
+
+  const status = loopStatus(repo, CHANGE);
+  assert.deepEqual(status.checks.find((entry) => entry.case === SUCCESS && entry.check === 'c1').runs, ['pass', 'unknown', 'fail']);
+  assert.deepEqual(status.regressions, [{ case: SUCCESS, check: 'c1', intent: 'REQ-submit-success' }]);
+  assert.equal(status.next.action, 'split_changes');
+});
+
+test('workflow check run-eval gives the baseline command --expect with baseline-expectations.json once it exists', (t) => {
+  const { repo, root } = readyProject(t);
+  const before = checkWorkflow(repo, 'run-eval', CHANGE);
+  assert.deepEqual(before.next.command, ['run', 'start', CHANGE, '--repo', repo, '--baseline']);
+  assert.match(before.next.note, new RegExp(`kept as \\.genesis/edd/${CHANGE}/baseline-expectations\\.json`));
+  const file = writeExpectations(repo, EXPECT);
+  assert.equal(file, path.join(root, 'baseline-expectations.json'));
+  const after = checkWorkflow(repo, 'run-eval', CHANGE);
+  assert.equal(after.next.action, 'record_baseline');
+  assert.deepEqual(after.next.command, ['run', 'start', CHANGE, '--repo', repo, '--baseline', '--expect', file]);
+  // The command works as given.
+  const base = cli(after.next.command);
+  assert.equal(base.status, 0, base.stderr);
+  assert.deepEqual(base.json.baseline_mismatch, []);
+});
+
+test('loop start refuses a baseline that did not behave as declared, and workflow check run-eval gives the baseline command until it is recorded again', (t) => {
+  const { repo, root } = readyProject(t);
+  const wrong = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, { ...EXPECT, [`${SUCCESS}/c1`]: 'fail' }) });
+  assert.deepEqual(wrong.baseline_mismatch, [{ case: SUCCESS, check: 'c1', expected: 'fail', got: 'pass' }]);
+  assert.throws(() => startLoop(repo, CHANGE), (error) => {
+    blockedWith('baseline_mismatch')(error);
+    const refusal = error.gaps.find((entry) => entry.code === 'baseline_mismatch');
+    assert.equal(refusal.owner, 'agent');
+    assert.equal(refusal.route, 'run-eval');
+    assert.ok(refusal.message.startsWith(`The baseline ${wrong.run_id} did not behave as declared: ${SUCCESS}/c1 was expected to fail and got pass.`), refusal.message);
+    assert.match(refusal.message, /the expectation in baseline-expectations\.json is wrong/);
+    assert.match(refusal.message, /this is not the code before the change/);
+    return true;
+  });
+  assert.ok(!existsSync(path.join(root, 'loop.json')));
+  const check = checkWorkflow(repo, 'loop-and-implement', CHANGE);
+  assert.equal(check.status, 'blocked');
+  assert.deepEqual(codes(check.gaps), ['baseline_mismatch']);
+  assert.equal(check.next.route, 'run-eval');
+  // The stage it routes to records the baseline again, not a head run.
+  const route = checkWorkflow(repo, 'run-eval', CHANGE);
+  assert.equal(route.status, 'ready');
+  assert.equal(route.next.action, 'record_baseline');
+  assert.deepEqual(route.next.command, ['run', 'start', CHANGE, '--repo', repo, '--baseline', '--expect', path.join(root, 'baseline-expectations.json')]);
+  assert.ok(route.next.note.startsWith(`The baseline ${wrong.run_id} did not behave as declared: ${SUCCESS}/c1 was expected to fail and got pass.`), route.next.note);
+  assert.match(route.next.note, /the expectation in baseline-expectations\.json is wrong/);
+  assert.match(route.next.note, /this is not the code before the change/);
+  // Without the file, the note says where to keep the expectations.
+  rmSync(path.join(root, 'baseline-expectations.json'));
+  const bare = checkWorkflow(repo, 'run-eval', CHANGE);
+  assert.deepEqual(bare.next.command, ['run', 'start', CHANGE, '--repo', repo, '--baseline']);
+  assert.ok(bare.next.note.endsWith(`Add --expect FILE with the expected baseline result of each check, kept as .genesis/edd/${CHANGE}/baseline-expectations.json.`), bare.next.note);
+
+  const right = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
+  assert.deepEqual(right.baseline_mismatch, []);
+  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'run_eval');
+  assert.equal(startLoop(repo, CHANGE).loop.baseline, right.run_id);
+});
+
+test('the Genesis review includes untracked files and names the files that were already uncommitted when the loop started', (t) => {
+  const { repo } = readyProject(t, { map: { snapshot_id: 'sha256:loop', analysis_status: 'complete', mode: 'map', flows: [] } });
+  writeFileSync(path.join(repo, 'app/wip.txt'), 'work in progress from before the change\n');
+  startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
+  const { loop } = startLoop(repo, CHANGE);
+  assert.deepEqual(loop.start_code.uncommitted_files, ['app/wip.txt']);
+  // The change adds a module and leaves it untracked.
+  editApp(repo, AFTER, 'Stop the success notice when a submission fails');
+  writeFileSync(path.join(repo, 'app/new_module.txt'), 'a new module\n');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id, { review: false });
+
+  const { next } = loopStatus(repo, CHANGE);
+  assert.equal(next.action, 'final_review');
+  const copy = `openspec/changes/${CHANGE}/business-map.json`;
+  assert.deepEqual(next.genesis_review, {
+    base: loop.base_commit, entries_from: copy,
+    prepare: ['map', 'prepare', '--base', loop.base_commit, '--entries-from', copy, '--include-untracked'],
+    uncommitted_at_start: ['app/wip.txt'],
+  });
+  assert.ok(next.message.includes(`\`genesis map prepare --base ${loop.base_commit} --entries-from ${copy} --include-untracked\``), next.message);
+  assert.ok(next.message.includes(`already uncommitted when the loop started, so a diff from ${loop.base_commit.slice(0, 7)} also shows their edits from before the loop: app/wip.txt. Tell the reviewer those edits are not part of this change; .genesis/edd/${CHANGE}/loop-start.patch holds them.`), next.message);
+});
+
+test('run start past the loop budget warns, and loop accept of a run past it warns and records the budget and what was used', (t) => {
+  const { repo, root } = inLoop(t, { iterations: 1 });
+  const past = /^The loop's budget was used up before this run: 1 of 1 runs, \d+ of 60 minutes\./;
+  changeCode(repo, BEFORE, 'first attempt');
+  const first = fullRun(repo);
+  assert.ok(!first.warnings.some((warning) => past.test(warning)), JSON.stringify(first.warnings));
+  completeReport(repo, first.run_id);
+  assertStopBudget(loopStatus(repo, CHANGE).next, repo);
+
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  const second = fullRun(repo);
+  assert.equal(second.verdict, 'pass');
+  assert.ok(second.warnings.some((warning) => past.test(warning)), JSON.stringify(second.warnings));
+  completeReport(repo, second.run_id);
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'ask_acceptance');
+  const accepted = acceptLoop(repo, CHANGE, { run: second.run_id, by: 'Dana', ref: 'thread 1' });
+  assert.ok(accepted.warnings.includes(`${second.run_id} was made past the budget the user agreed to (run 2 of 1). The acceptance is recorded with the budget and what was used; tell the user.`),
+    JSON.stringify(accepted.warnings));
+  const record = readJSON(path.join(root, 'accepted.json'));
+  assert.deepEqual(record.budget, { iterations: 1, minutes: 60 });
+  assert.equal(record.used.iterations, 2);
+});
+
+test('the minutes stop at an acceptance only while it covers the loop: after the code changed they count on, run start warns, loop extend counts from the extension, and a new acceptance records them', (t) => {
+  const project = inLoop(t, { minutes: 60 });
+  const { repo, root } = project;
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  const first = fullRun(repo);
+  completeReport(repo, first.run_id);
+  acceptLoop(repo, CHANGE, { run: first.run_id, by: 'Dana', ref: 'thread 1' });
+  const file = path.join(root, 'accepted.json');
+  const record = readJSON(file);
+  record.accepted.at = minutesAgo(170);
+  writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
+  editLoop(project, (loop) => { loop.clock_started_at = minutesAgo(180); });
+  let status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  near(status.loop.used.minutes, 10);
+
+  editApp(repo, AFTER, 'a tweak after the acceptance');
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.accepted.outdated, true);
+  near(status.loop.used.minutes, 180);
+  assertStopBudget(status.next, repo);
+
+  // The extension came after the old acceptance: its minutes count from the extension.
+  extendLoop(repo, CHANGE, { iterations: 2, minutes: 30 });
+  editLoop(project, (loop) => { loop.clock_started_at = minutesAgo(120); });
+  status = loopStatus(repo, CHANGE);
+  near(status.loop.used.minutes, 120);
+  assertStopBudget(status.next, repo);
+
+  const second = fullRun(repo);
+  const past = second.warnings.find((warning) => warning.startsWith('The loop\'s budget was used up before this run: 1 of 3 runs, '));
+  assert.ok(past, JSON.stringify(second.warnings));
+  near(Number(past.match(/(\d+) of 30 minutes/)[1]), 120);
+  completeReport(repo, second.run_id);
+  const accepted = acceptLoop(repo, CHANGE, { run: second.run_id, by: 'Dana', ref: 'thread 2' });
+  near(accepted.accepted.used.minutes, 120);
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'done');
+});
+
+test('after acceptance, a later full run that fails keeps the acceptance outdated even once a run of the same code passes again, until the user accepts again', (t) => {
+  const { repo } = inLoop(t);
+  // app/results.json, which the fake verifier records, is left out of the
+  // code, so the results change while the code stays the same.
+  const exclude = path.join(repo, '.git/info/exclude');
+  writeFileSync(exclude, `${existsSync(exclude) ? readFileSync(exclude, 'utf8') : ''}app/results.json\n`);
+  git(repo, ['rm', '-q', '--cached', 'app/results.json']);
+  changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
+  const accepted = fullRun(repo);
+  assert.equal(accepted.verdict, 'pass');
+  completeReport(repo, accepted.run_id);
+  acceptLoop(repo, CHANGE, { run: accepted.run_id, by: 'Dana', ref: 'thread 1' });
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'done');
+
+  setResults(repo, BEFORE);
+  const failed = fullRun(repo);
+  assert.equal(failed.verdict, 'fail');
+  setResults(repo, AFTER);
+  const passed = fullRun(repo);
+  assert.equal(passed.verdict, 'pass');
+  assert.equal(sameCodeAsRun(repo, accepted), true);
+  let status = loopStatus(repo, CHANGE);
+  assert.notEqual(status.next.action, 'done', JSON.stringify(status.next));
+  assert.equal(status.accepted.outdated, true);
+  assert.ok(status.warnings.some((warning) => warning.startsWith(`Run ${failed.run_id}, after the user accepted run ${accepted.run_id}, fails`)), JSON.stringify(status.warnings));
+  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'run_eval');
+
+  completeReport(repo, passed.run_id);
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'ask_acceptance');
+  assert.match(status.next.message, new RegExp(`acceptance of run ${accepted.run_id} no longer covers the loop`));
+  acceptLoop(repo, CHANGE, { run: passed.run_id, by: 'Dana', ref: 'thread 2' });
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.accepted.outdated, undefined);
+  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'loop_done');
+});
+
+test('a run during which the code changed asks to run again before its report or anything its results would show, and stops on budget once the runs are used up', (t) => {
+  const { repo } = inLoop(t, { iterations: 2 });
+  changeCode(repo, BROKEN, 'Fix the failure notice and break the success notice');
+  harborThen(t, "appendFileSync(path.join(repo, 'app/edited.txt'), 'edited during the run\\n');");
+  const first = startRun(repo, CHANGE);
+  assert.equal(first.verdict, 'unverified', JSON.stringify(first));
+  let status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'run_again', JSON.stringify(status.next));
+  assert.deepEqual(status.next.command, ['run', 'start', CHANGE, '--repo', repo]);
+  assert.match(status.next.message, new RegExp(`^The code changed while ${first.run_id} executed`));
+  // Its results show no regression to split, also once its report is written.
+  completeReport(repo, first.run_id);
+  assert.equal(loopStatus(repo, CHANGE).next.action, 'run_again');
+
+  const second = startRun(repo, CHANGE);
+  assert.equal(second.verdict, 'unverified', JSON.stringify(second));
+  status = loopStatus(repo, CHANGE);
+  assertStopBudget(status.next, repo);
+  assert.match(status.next.message, new RegExp(`The code changed while ${second.run_id} executed`));
+});
+
+test('the final review of a loop that started before the first commit points at loop-start.patch, not at a diff', (t) => {
+  const { repo } = withBaseline(t, { commit: false });
+  startLoop(repo, CHANGE);
+  editApp(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id, { review: false });
+  const { next } = loopStatus(repo, CHANGE);
+  assert.equal(next.action, 'final_review');
+  assert.doesNotMatch(next.message, /from none|already uncommitted/);
+  assert.ok(next.message.includes(`The loop started before the project's first commit, so no diff shows this change alone: .genesis/edd/${CHANGE}/loop-start.patch holds the files as they were then.`), next.message);
+});
+
+test('the final review names at most ten of the files that were already uncommitted when the loop started', (t) => {
+  const { repo } = readyProject(t);
+  const wip = Array.from({ length: 12 }, (_, index) => `app/wip-${String(index + 1).padStart(2, '0')}.txt`);
+  for (const file of wip) writeFileSync(path.join(repo, file), 'work in progress from before the change\n');
+  startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
+  startLoop(repo, CHANGE);
+  editApp(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id, { review: false });
+  const { next } = loopStatus(repo, CHANGE);
+  assert.equal(next.action, 'final_review');
+  assert.ok(next.message.includes(`also shows their edits from before the loop: ${wip.slice(0, 10).join(', ')} and 2 more. Tell the reviewer`), next.message);
+});
+
+test('done names the commit once every file of the change is in Git, also files forced past a rule that ignores them, and the warning about the rule stays', (t) => {
+  const { repo } = inLoop(t);
+  writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\n.genesis/\n');
+  editApp(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  commit(repo, 'Commit everything Git does not ignore');
+  acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'thread 1' });
+  const edd = `.genesis/edd/${CHANGE}`;
+  git(repo, ['add', '-f', '.genesis/edd/.gitignore', `${edd}/accepted.json`, `${edd}/baseline-expectations.json`, `${edd}/reports`]);
+  const head = commit(repo, 'Add the change\'s files past the rule');
+  assert.equal(git(repo, ['status', '--porcelain']), '');
+  const status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.next.commit, head, JSON.stringify(status.next));
+  assert.equal(status.next.uncommitted, undefined);
+  assert.ok(status.warnings.some((warning) => warning.startsWith('Git ignores files of this change that must be committed: ')), JSON.stringify(status.warnings));
+});
+
+test('done does not name a commit while openspec/config.yaml and openspec/genesis.json are not in Git', (t) => {
+  const { repo } = inLoop(t);
+  editApp(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'thread 1' });
+  git(repo, ['add', '-A']);
+  git(repo, ['rm', '-q', '--cached', 'openspec/config.yaml', 'openspec/genesis.json']);
+  git(repo, ['commit', '-q', '-m', 'Commit all but the OpenSpec project files']);
+  const status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.next.commit, undefined);
+  assert.deepEqual(status.next.uncommitted, ['openspec/config.yaml', 'openspec/genesis.json']);
+  const all = commit(repo, 'Commit the OpenSpec project files');
+  assert.equal(loopStatus(repo, CHANGE).next.commit, all);
+});
+
+test('a .gitignore that ignores openspec/ is named with the Spec it keeps out, in eval validate, loop accept and loop status, and keeps done from naming a commit', (t) => {
+  const { repo } = inLoop(t);
+  writeFileSync(path.join(repo, '.gitignore'), 'openspec/\n');
+  git(repo, ['rm', '-r', '-q', '--cached', 'openspec']);
+  editApp(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  commit(repo, 'Commit everything Git does not ignore');
+  assert.equal(git(repo, ['ls-files', 'openspec']), '');
+  const ignored = `Git ignores files of this change that must be committed: openspec/changes/${CHANGE}/, openspec/config.yaml, openspec/genesis.json (rule \`openspec/\` in .gitignore:1). Without them a clone has no Spec of this change or OpenSpec project files.`;
+  const named = (warnings) => warnings.some((warning) => warning.startsWith(ignored) && warning.includes('remove `openspec/`, or add `!openspec/` to the project\'s .gitignore after it'));
+  assert.ok(named(validateEval(repo, CHANGE).warnings), JSON.stringify(validateEval(repo, CHANGE).warnings));
+  const accepted = acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'thread 1' });
+  assert.ok(named(accepted.warnings), JSON.stringify(accepted.warnings));
+  assert.equal(accepted.commit, undefined);
+  const status = loopStatus(repo, CHANGE);
+  assert.ok(named(status.warnings), JSON.stringify(status.warnings));
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.next.commit, undefined);
+  assert.deepEqual(status.next.uncommitted, [`.genesis/edd/${CHANGE}/accepted.json`, `openspec/changes/${CHANGE}/`, 'openspec/config.yaml', 'openspec/genesis.json']);
+});
+
+test('a global excludes file whose path holds a colon is read as it is: a `!` rule there keeps a file in Git, and each rule is named by its own line', (t) => {
+  const tools = useFakeTools(t);
+  const repo = projectRoot(mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-project-')));
+  t.after(() => rmSync(repo, { recursive: true, force: true }));
+  git(repo, ['init', '-q', '-b', 'main']);
+  const home = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-home-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const excludes = path.join(home, 'C:', 'ignore');
+  mkdirSync(path.dirname(excludes));
+  writeFileSync(excludes, '*.json\n!accepted.json\n');
+  writeFileSync(tools.gitConfig, `[core]\n\texcludesFile = "${excludes}"\n`);
+  const { paths, warning } = ignoredArtifacts(repo, CHANGE);
+  assert.deepEqual(paths, ['openspec/genesis.json', `.genesis/edd/${CHANGE}/baseline-expectations.json`]);
+  assert.ok(warning.includes(`(rule \`*.json\` in ${excludes}:1)`), warning);
+});
+
+test('done names the commit while a project-wide rule such as `*.log` or `.env` keeps a file inside the change\'s folders out of Git, and does not offer that file', (t) => {
+  const { repo } = inLoop(t);
+  writeFileSync(path.join(repo, '.gitignore'), '*.log\n.env\n');
+  editApp(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'thread 1' });
+  const all = commit(repo, 'Commit the change and its files');
+  const edd = `.genesis/edd/${CHANGE}`;
+  writeFileSync(path.join(repo, edd, 'evals', FAILURE, 'tests/debug.log'), 'output of a local try\n');
+  writeFileSync(path.join(repo, edd, 'evals', FAILURE, '.env'), 'TOKEN=synthetic-test-value\n');
+  const status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.next.commit, all, JSON.stringify(status.next));
+  assert.equal(status.next.uncommitted, undefined);
+  assert.doesNotMatch(status.next.message, /debug\.log|\.env/);
+  assert.ok(!status.warnings.some((warning) => warning.startsWith('Git ignores')), JSON.stringify(status.warnings));
+});
+
+test('new files in a folder of the change that Git partly holds are offered for commit while a rule ignores that folder, and a leftover there is not', (t) => {
+  const { repo } = inLoop(t);
+  editApp(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'thread 1' });
+  const all = commit(repo, 'Commit the change and its files');
+  assert.equal(loopStatus(repo, CHANGE).next.commit, all);
+  // The rule comes after the commit, so Git still holds what it had.
+  writeFileSync(path.join(repo, '.git/info/exclude'), '.genesis/*\n');
+  const edd = `.genesis/edd/${CHANGE}`;
+  mkdirSync(path.join(repo, edd, 'evals/new-case/tests'), { recursive: true });
+  writeFileSync(path.join(repo, edd, 'evals/new-case/tests/test.sh'), 'exit 0\n');
+  writeFileSync(path.join(repo, edd, 'evals', FAILURE, 'tests/extra.txt'), 'more\n');
+  writeFileSync(path.join(repo, edd, 'evals', FAILURE, '.DS_Store'), '');
+  writeFileSync(path.join(repo, edd, 'reports/notes.md'), 'notes\n');
+  const status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.next.commit, undefined, JSON.stringify(status.next));
+  assert.deepEqual(status.next.uncommitted, [`${edd}/evals/new-case/`, `${edd}/evals/${FAILURE}/tests/extra.txt`, `${edd}/reports/notes.md`]);
+  assert.ok(status.warnings.some((warning) => warning.startsWith('Git ignores files of this change that must be committed: ')
+    && warning.includes('add `!.genesis/edd/` after `.genesis/*`')), JSON.stringify(status.warnings));
+});
+
+test('an untracked folder in the change\'s folders that holds only leftovers keeps done naming the commit, and is listed once it holds a file of the change', (t) => {
+  const { repo } = inLoop(t);
+  writeFileSync(path.join(repo, '.gitignore'), '*.log\n');
+  editApp(repo, AFTER, 'Stop the success notice when a submission fails');
+  const run = fullRun(repo);
+  completeReport(repo, run.run_id);
+  acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'thread 1' });
+  const all = commit(repo, 'Commit the change and its files');
+  const extra = path.join(repo, `.genesis/edd/${CHANGE}/evals`, FAILURE, 'extra');
+  mkdirSync(extra);
+  writeFileSync(path.join(extra, '.DS_Store'), '');
+  writeFileSync(path.join(extra, 'notes.md~'), '');
+  writeFileSync(path.join(extra, 'try.log'), 'ignored by the project\n');
+  let status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.action, 'done');
+  assert.equal(status.next.commit, all, JSON.stringify(status.next));
+  assert.equal(status.next.uncommitted, undefined);
+
+  writeFileSync(path.join(extra, 'seed.txt'), 'seed\n');
+  status = loopStatus(repo, CHANGE);
+  assert.equal(status.next.commit, undefined);
+  assert.deepEqual(status.next.uncommitted, [`.genesis/edd/${CHANGE}/evals/${FAILURE}/extra/`]);
+});
+
+test('a run during which the code changed is never the earlier result a regression, lost progress or a stuck loop is measured against', (t) => {
+  const project = inLoop(t, { iterations: 10 });
+  const { repo, tools } = project;
+  const moved = () => {
+    harborThen(t, "appendFileSync(path.join(repo, 'app/edited.txt'), 'edited during the run\\n');");
+    const run = startRun(repo, CHANGE);
+    tools.harbor(true);
+    assert.equal(runRecord(project, run).code_changed_during_run, true);
+    completeReport(repo, run.run_id);
+    return run;
+  };
+  // A pass, a moved run that fails, then a failure: the check passed in the
+  // last run that belongs to one version of the code, so progress was lost.
+  changeCode(repo, AFTER, 'fix the failure notice');
+  completeReport(repo, fullRun(repo).run_id);
+  changeCode(repo, BEFORE, 'undo the fix during a run');
+  moved();
+  changeCode(repo, BEFORE, 'undo the fix');
+  completeReport(repo, fullRun(repo).run_id);
+  let status = loopStatus(repo, CHANGE);
+  assert.deepEqual(status.lost_progress, [{ case: FAILURE, check: 'c1', intent: 'REQ-submit-failure' }]);
+  assert.equal(status.stuck, false);
+
+  // A failure, a moved run that passes, then the same failure on other code:
+  // the loop is stuck, and the moved pass is no progress that was lost.
+  changeCode(repo, AFTER, 'fix the failure notice during a run');
+  moved();
+  changeCode(repo, BEFORE, 'try another way');
+  completeReport(repo, fullRun(repo).run_id);
+  status = loopStatus(repo, CHANGE);
+  assert.deepEqual(status.lost_progress, []);
+  assert.equal(status.stuck, true);
+  assert.equal(status.next.action, 'stop_stuck');
+  assert.match(status.next.message, /failed in \S+ and \S+ \(the run between them is not compared: the code changed while it ran\) on different code/);
+
+  // While the moved run is the latest, it shows no regression either.
+  changeCode(repo, BROKEN, 'fix the failure notice and break the success notice during a run');
+  harborThen(t, "appendFileSync(path.join(repo, 'app/edited.txt'), 'edited during the run\\n');");
+  startRun(repo, CHANGE);
+  status = loopStatus(repo, CHANGE);
+  assert.deepEqual(status.regressions, []);
+  assert.deepEqual(status.lost_progress, []);
+  assert.equal(status.stuck, false);
+});
+
+test('a `.genesis/*` rule with no `!.genesis/edd/` after it is told to add one, and a `.genesis/**` rule to become `.genesis/*`', (t) => {
+  useFakeTools(t);
+  const repo = projectRoot(mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-project-')));
+  t.after(() => rmSync(repo, { recursive: true, force: true }));
+  git(repo, ['init', '-q', '-b', 'main']);
+  const exclude = path.join(repo, '.git/info/exclude');
+  writeFileSync(exclude, '.genesis/*\n');
+  let { warning } = ignoredArtifacts(repo, CHANGE);
+  assert.ok(warning.endsWith('Change the rule so these files are committed: add `!.genesis/edd/` after `.genesis/*`, or ignore only `.genesis/out/` instead.'), warning);
+  for (const rule of ['.genesis/**', '/.genesis/**']) {
+    writeFileSync(exclude, `${rule}\n`);
+    ({ warning } = ignoredArtifacts(repo, CHANGE));
+    assert.ok(warning.endsWith(`Change the rule so these files are committed: instead of \`${rule}\`, ignore \`.genesis/*\` and add \`!.genesis/edd/\` after it, or ignore only \`.genesis/out/\`.`), warning);
+  }
+  writeFileSync(exclude, '.genesis/*\n!.genesis/edd/\n');
+  assert.equal(ignoredArtifacts(repo, CHANGE).warning, null);
 });

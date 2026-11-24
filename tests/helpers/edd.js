@@ -128,6 +128,31 @@ export function useFakeTools(t) {
   return tools;
 }
 
+// Points GENESIS_EDD_HARBOR at a Harbor that runs the fake one and then, after
+// each `run` call, the script body `after`. In its scope: argv, logs (the -o
+// folder of the package), repo (GENESIS_EDD_REPO), path, appendFileSync,
+// readFileSync and writeFileSync. tools.harbor(true) goes back to the plain
+// fake, and useFakeTools restores the command when the test ends.
+export function harborThen(t, after) {
+  useFakeTools(t);
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-harbor-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'harbor.mjs');
+  writeFileSync(file, `import { spawnSync } from 'node:child_process';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+const argv = process.argv.slice(2);
+const done = spawnSync(process.execPath, [${JSON.stringify(FAKE_HARBOR)}, ...argv], { stdio: 'inherit' });
+if (argv[0] === 'run') {
+  const logs = argv[argv.indexOf('-o') + 1];
+  const repo = process.env.GENESIS_EDD_REPO;
+  ${after}
+}
+process.exit(done.status ?? 1);
+`);
+  process.env.GENESIS_EDD_HARBOR = JSON.stringify([process.execPath, file]);
+}
+
 // Git in the project with a fixed test identity. Fails the test on a non-zero exit.
 export function git(repo, args) {
   const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
@@ -198,13 +223,15 @@ finish
 //   commit: true                    commit everything before eval check
 //   check: true                     run checkEval; it must pass when anything is finished
 //   map: null                       a business-map.json object for spec new --map
+//   parent: os.tmpdir()             the folder the project is created in
 // Returns { repo, name, tools, packages: { id: [check ids] }, check (checkEval result
 // or null), root (.genesis/edd/<change>), runs (its runs/ folder) }.
 export function readyProject(t, options = {}) {
-  const { mode = 'existing', spec = 'two', results = BEFORE, unconnected = [], commit: committed = true, check = true, map = null } = options;
+  const { mode = 'existing', spec = 'two', results = BEFORE, unconnected = [], commit: committed = true, check = true, map = null,
+    parent = os.tmpdir() } = options;
   if (!SPECS[spec]) throw new Error(`spec must be one of ${Object.keys(SPECS).join(', ')}.`);
   const tools = useFakeTools(t);
-  const repo = projectRoot(mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-project-')));
+  const repo = projectRoot(mkdtempSync(path.join(parent, 'genesis-edd-project-')));
   t.after(() => rmSync(repo, { recursive: true, force: true }));
   git(repo, ['init', '-q', '-b', 'main']);
   git(repo, ['config', 'user.name', 'Genesis Test']);

@@ -1,6 +1,7 @@
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { ROOT, changeDirectory, digest, listFiles, localPath, readJSON, writeJSON } from './project.js';
+import { parse } from 'yaml';
+import { ROOT, changeDirectory, digest, ignoredArtifacts, isLeftover, listFiles, localPath, readJSON, writeJSON } from './project.js';
 import { frozenSpec } from './spec.js';
 
 const HELPER = readFileSync(path.join(ROOT, 'skills/write-eval/assets/genesis.sh'), 'utf8');
@@ -21,8 +22,10 @@ export function eddDirectory(repo, name) {
 // what is particular to its scenario.
 export const kitDirectory = (repo) => localPath(repo, '.genesis/edd/harness');
 
-// Files that take part in a run. Notes and Python caches do not.
-const executed = (directory, notes) => listFiles(directory).filter((file) =>
+// Finder and Explorer metadata, swap files and backups never take part in a run.
+const ownFiles = (directory) => listFiles(directory).filter((file) => !isLeftover(file));
+// Files that take part in a run. Notes, Python caches and leftovers do not.
+const executed = (directory, notes) => ownFiles(directory).filter((file) =>
   !file.split(path.sep).includes('__pycache__') && path.relative(directory, file) !== notes);
 const lines = (directory, files, prefix = '') => files
   .map((file) => `${prefix}${path.relative(directory, file).split(path.sep).join('/')}\n${digest(readFileSync(file))}`);
@@ -36,7 +39,8 @@ function readKit(repo) {
   return {
     directory, agent: nonempty(agent) ? agent : null, notes: filled(path.join(directory, 'PROJECT.md')),
     lines: lines(directory, executed(directory, 'PROJECT.md'), 'kit/'),
-    verifier: lines(verifier, listFiles(verifier)),
+    verifier: lines(verifier, ownFiles(verifier)),
+    environment: listFiles(path.join(directory, 'environment')),
   };
 }
 
@@ -45,6 +49,55 @@ const scenariosOf = (handoff) => handoff.requirements.flatMap((requirement) =>
     case: `${requirement.id.replace(/^REQ-/, '').toLowerCase()}-s${index + 1}`,
     requirement: requirement.id, requirement_name: requirement.name, ...scenario,
   })));
+const scenarioKey = (scenario) => `${scenario?.requirement}\n${scenario?.name}`;
+// A package is matched to its scenario by the requirement and name its
+// checks.json gives.
+const namesScenario = (checks) => record(checks?.scenario) && nonempty(checks.scenario.requirement) && nonempty(checks.scenario.name);
+
+// Each scenario of the frozen Spec with the folders of the packages whose
+// checks.json names it.
+function packagesOf(root, handoff) {
+  const scenarios = scenariosOf(handoff);
+  const owners = new Map(scenarios.map((item) => [scenarioKey(item), []]));
+  for (const item of readCases(root)) {
+    if (namesScenario(item.checks)) owners.get(scenarioKey(item.checks.scenario))?.push(item.id);
+  }
+  return scenarios.map((item) => ({ ...item, packages: owners.get(scenarioKey(item)) }));
+}
+
+// Folders under evals/ whose tests/checks.json cannot be read or names no
+// scenario. Which scenario such a folder was written for cannot be told: its
+// place may now belong to a scenario inserted before that one. So `eval new`
+// writes nothing while there is one.
+export function unnamedPackages(repo, name) {
+  return readCases(path.join(eddDirectory(repo, name), 'evals')).filter((item) => !namesScenario(item.checks)).map((item) => item.id);
+}
+
+// What is wrong with those folders, and how to repair them.
+export function unnamedMessage(ids) {
+  const one = ids.length === 1;
+  return {
+    problem: `${ids.join(', ')}: tests/checks.json cannot be read or names no scenario, so \`eval new\` cannot tell which scenario ${one ? 'this folder was' : 'these folders were'} written for, and a new package could duplicate ${one ? 'it' : 'one'}.`,
+    repair: `Repair ${one ? 'its tests/checks.json, or delete the folder if it is not a package' : 'each tests/checks.json, or delete a folder that is not a package'}; \`eval validate\` reports ${one ? 'it' : 'them'} as case_invalid and says what is wrong.`,
+  };
+}
+
+// The folder of a new package: the scenario's place in its requirement, or the
+// next free number when another package already holds that name, such as after
+// a scenario was inserted before it. Existing folders are never renamed.
+function freeCase(root, id) {
+  const [, stem, number] = id.match(/^(.*)-s(\d+)$/);
+  let index = Number(number);
+  while (existsSync(path.join(root, `${stem}-s${index}`))) index += 1;
+  return `${stem}-s${index}`;
+}
+
+// The scenarios of the frozen Spec that no package names yet: what `eval new`
+// writes once every folder under evals/ has a checks.json that names one.
+export function unpackagedScenarios(repo, name, handoff) {
+  return packagesOf(path.join(eddDirectory(repo, name), 'evals'), handoff).filter((item) => !item.packages.length)
+    .map((item) => ({ requirement: item.requirement, name: item.name }));
+}
 
 // The current frozen Spec, or the gaps that keep later stages from using it.
 function requireSpec(repo, name, stage) {
@@ -139,15 +192,21 @@ finish
 export function newEval(repo, name) {
   const handoff = requireSpec(repo, name, 'write-eval');
   const root = path.join(eddDirectory(repo, name), 'evals');
+  const unnamed = unnamedPackages(repo, name);
+  if (unnamed.length) {
+    const { problem, repair } = unnamedMessage(unnamed);
+    throw new Error(`${problem} Nothing was written. ${repair} Then run \`eval new\` again.`);
+  }
+  const plan = packagesOf(root, handoff.handoff);
   const kit = kitDirectory(repo);
   mkdirSync(kit, { recursive: true });
   if (!existsSync(path.join(kit, 'PROJECT.md'))) writeFileSync(path.join(kit, 'PROJECT.md'), projectNotes);
-  const covered = new Set(readCases(root).map((item) => `${item.checks?.scenario?.requirement}\n${item.checks?.scenario?.name}`));
   const created = [];
   const kept = [];
-  for (const item of scenariosOf(handoff.handoff)) {
+  for (const scenario of plan) {
+    if (scenario.packages.length) { kept.push(...scenario.packages); continue; }
+    const item = { ...scenario, case: freeCase(root, scenario.case) };
     const directory = path.join(root, item.case);
-    if (covered.has(`${item.requirement}\n${item.name}`) || existsSync(directory)) { kept.push(item.case); continue; }
     const checks = item.then.map((expect, index) => ({ id: `c${index + 1}`, intent: item.requirement, expect, role: 'gating' }));
     mkdirSync(path.join(directory, 'tests'), { recursive: true });
     writeFileSync(path.join(directory, 'task.toml'), taskToml(name, item), { flag: 'wx' });
@@ -172,16 +231,17 @@ export function newEval(repo, name) {
     const tests = path.join(item.directory, 'tests');
     const target = path.join(tests, 'shared');
     const before = [existsSync(path.join(tests, 'genesis.sh')) ? readFileSync(path.join(tests, 'genesis.sh'), 'utf8') : '',
-      ...lines(target, listFiles(target))].join('\n');
-    if (before === [HELPER, ...lines(shared, listFiles(shared))].join('\n')) continue;
+      ...lines(target, ownFiles(target))].join('\n');
+    if (before === [HELPER, ...lines(shared, ownFiles(shared))].join('\n')) continue;
     mkdirSync(tests, { recursive: true });
     writeFileSync(path.join(tests, 'genesis.sh'), HELPER);
     rmSync(target, { recursive: true, force: true });
     if (existsSync(shared)) cpSync(shared, target, { recursive: true });
     if (!created.includes(item.id)) synced.push(item.id);
   }
+  const ignored = ignoredArtifacts(repo, name).warning;
   return {
-    change: name, spec: handoff.id, directory: root, kit, created, kept, synced,
+    change: name, spec: handoff.id, directory: root, kit, created, kept, synced, warnings: ignored ? [ignored] : [],
     note: 'Expected results are copied from the accepted THEN lines. Build the project kit first, then each package; a package can run once `eval check` has proved its verifier.',
     next: { stage: 'write-eval', command: ['eval', 'validate', name, '--repo', repo] },
   };
@@ -212,7 +272,35 @@ function checkRecord(directory, id, current) {
   return last.passed === true ? null : `the last run failed: ${(last.fixtures ?? []).filter((entry) => !entry.ok).map((entry) => entry.name).join(', ')}`;
 }
 
-function validateCase(item, handoff, name, dockerignore, kit, fail) {
+// Whether a path is the folder or inside it.
+const within = (folder, file) => {
+  const relative = path.relative(folder, file);
+  return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+};
+
+// The build contexts of the services in a Compose file, resolved as Compose
+// resolves them during a trial: merge keys (`<<: *fragment`), the variables
+// Genesis sets, and relative paths from the file's folder, which is the
+// project directory Harbor passes. A context that cannot be resolved here,
+// such as a URL or another variable, is left out. Compose's own tags, such as
+// !reset, are not YAML's, so the parser's warnings about them are not shown.
+function buildContexts(file, text, repo, kit) {
+  if (!/\.ya?ml$/.test(file)) return [];
+  let services;
+  try { services = parse(text, { merge: true, logLevel: 'error' })?.services; } catch { return []; }
+  if (!record(services)) return [];
+  return Object.values(services).flatMap((service) => {
+    const build = record(service) ? service.build : undefined;
+    const context = typeof build === 'string' ? build : record(build) ? (build.context ?? '.') : null;
+    if (typeof context !== 'string') return [];
+    const value = context.replace(/\$\{(GENESIS_EDD_REPO|GENESIS_EDD_HARNESS)(?:[:?-][^}]*)?\}|\$(GENESIS_EDD_REPO|GENESIS_EDD_HARNESS)\b/g,
+      (match, braced, bare) => ((braced ?? bare) === 'GENESIS_EDD_REPO' ? repo : kit));
+    if (value.includes('$') || /^[a-z][a-z0-9+.-]*:\/\/|^git@/i.test(value)) return [];
+    return [path.resolve(path.dirname(file), value)];
+  });
+}
+
+function validateCase(repo, item, handoff, name, dockerignore, kit, fail) {
   const { directory, checks } = item;
   const has = (relative) => existsSync(path.join(directory, relative));
   const read = (relative) => (has(relative) ? readFileSync(path.join(directory, relative), 'utf8') : '');
@@ -273,19 +361,26 @@ function validateCase(item, handoff, name, dockerignore, kit, fail) {
     for (const [id, result] of Object.entries(fixture.expect)) produced.get(id).add(result);
   }
   if (!has('task.toml')) fail('task.toml is missing.');
-  if (read('tests/genesis.sh') !== HELPER || lines(path.join(directory, 'tests/shared'), listFiles(path.join(directory, 'tests/shared'))).join('\n') !== kit.verifier.join('\n')) {
+  if (read('tests/genesis.sh') !== HELPER || lines(path.join(directory, 'tests/shared'), ownFiles(path.join(directory, 'tests/shared'))).join('\n') !== kit.verifier.join('\n')) {
     fail('tests/genesis.sh or tests/shared/ differs from the shipped helper and the kit\'s verifier/ folder. Run `eval new` to bring them in line; edit shared verifier code in the kit.');
   }
-  const environment = existsSync(path.join(directory, 'environment'))
-    ? listFiles(path.join(directory, 'environment')) : [];
+  // The package's environment files and the kit's, which a package builds with.
+  const environment = [...listFiles(path.join(directory, 'environment')), ...kit.environment];
   for (const file of environment) {
+    const label = within(kit.directory, file) ? path.relative(repo, file) : path.relative(directory, file);
     const text = /\.(?:ya?ml)$|Dockerfile/.test(file) ? readFileSync(file, 'utf8') : '';
     if (/checks\.json|(?:^|[\s"'/])(?:\.\.\/)+(?:tests|solution)\b/m.test(text)) {
-      fail(`${path.relative(directory, file)} reaches tests/ or solution/. Expected results and the reference path must stay out of the agent's image.`);
+      fail(`${label} reaches tests/ or solution/. Expected results and the reference path must stay out of the agent's image.`);
     }
+    const contexts = buildContexts(file, text, repo, kit.directory);
     // A build from the application root would otherwise copy every package's expected results.
-    if (text.includes('GENESIS_EDD_REPO') && !/^\/?\.genesis\/?\s*$/m.test(dockerignore)) {
-      fail(`${path.relative(directory, file)} builds from the application root. Add .genesis to the project's .dockerignore so expected results stay out of the image.`);
+    if ((text.includes('GENESIS_EDD_REPO') || contexts.includes(repo)) && !/^\/?\.genesis\/?\s*$/m.test(dockerignore)) {
+      fail(`${label} builds from the application root. Add .genesis to the project's .dockerignore so expected results stay out of the image.`);
+    }
+    // Any other folder that holds the package, such as .genesis/ or a folder
+    // above the project, has no .dockerignore that keeps its tests/ out.
+    for (const context of new Set(contexts.filter((entry) => entry !== repo && within(entry, directory)))) {
+      fail(`${label} builds from ${path.relative(repo, context)}, which holds this package's tests/. Build from \${GENESIS_EDD_REPO} with .genesis in .dockerignore, or from the kit, so expected results stay out of the image.`);
     }
   }
   // Whether the package can run is worked out here, never declared by its author.
@@ -320,6 +415,8 @@ export function validateEval(repo, name) {
   const gaps = [...specGaps];
   const warnings = moved?.length
     ? [`impact.md evidence no longer matches the code: ${moved.join(' ')} The exported Spec keeps it as it was.`] : [];
+  const ignored = ignoredArtifacts(repo, name).warning;
+  if (ignored) warnings.push(ignored);
   const report = (cases = [], coverage = null) => {
     const structural = gaps.filter((gap) => gap.kind !== 'business' && gap.code !== 'integration_pending');
     const runnable = cases.filter((item) => item.integration?.state === 'ready' && item.status === 'confirmed' && !item.errors.length);
@@ -348,7 +445,7 @@ export function validateEval(repo, name) {
   const seen = new Set();
   for (const item of items) {
     const errors = [];
-    const summary = validateCase(item, handoff.handoff, name, dockerignore, kit, (message) => errors.push(message));
+    const summary = validateCase(path.resolve(repo), item, handoff.handoff, name, dockerignore, kit, (message) => errors.push(message));
     cases.push({ ...summary, errors });
     for (const message of errors) {
       gaps.push({ code: 'case_invalid', kind: 'technical', owner: 'agent', route: 'write-eval', case: item.id, message: `${item.id}: ${message}` });

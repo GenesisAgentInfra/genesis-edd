@@ -42,10 +42,18 @@ an expected result.
 1. Run `edd workflow check write-eval <change> --repo <app>`. A gap routed to
    `agent-spec` or `spec-export` means the Spec is not exported in its current
    form: resolve it there, then return. Do not write packages against a draft.
+   Once every scenario has a package, its `next.action` is `finish_evals` and
+   its `next.command` is `eval validate` instead of `eval new`. It is the same
+   while a folder under `evals/` has a `tests/checks.json` that cannot be read
+   or names no scenario; `next.note` names those folders.
 2. Run `edd eval new <change> --repo <app>`. It writes one package per scenario
    under `.genesis/edd/<change>/evals/<case>/`, with each expected result copied
    from the scenario's THEN lines, and starts `PROJECT.md` in the kit when the
-   project has none. What an existing package owns is left untouched.
+   project has none. What an existing package owns is left untouched, and no
+   folder is renamed: a scenario added before another one of its requirement
+   takes the next free number, such as `submit-failure-s2`. When a `.gitignore`
+   rule keeps files that must be committed out of Git, such as the packages or
+   the kit, `eval new` and `eval validate` warn: change the rule.
 3. Review each `tests/checks.json`. Keep `expect` faithful to its requirement:
    make it concrete for this scenario, never stricter or broader. Add a
    `diagnostic` check when it helps explain a failure. If a check needs a rule
@@ -93,10 +101,21 @@ report a baseline or a result of the application; this stage runs neither.
 named by `route`; do not relabel a package to pass a check.
 
 - `handoff_missing`, `handoff_invalid`, Spec gaps: return to `agent-spec`.
-- `cases_missing`, `scenario_uncovered`: run `eval new`, or add the package.
+- `cases_missing`, `scenario_uncovered`: run `eval new`. It writes a package
+  for each scenario that no package names in `checks.json`. A package that is
+  `case_stale` covers its scenario again once it is reviewed. While a folder
+  under `evals/` is `case_invalid` because its `checks.json` cannot be read or
+  names no scenario, `eval new` writes nothing: repair that first.
 - `requirement_uncovered`: every accepted requirement needs a gating check in
   some package. Add the scenario's check; do not drop the requirement.
-- `case_invalid`: fix the named file. The message says what is wrong.
+- `case_invalid`: fix the named file. The message says what is wrong. A
+  folder whose `checks.json` cannot be read, or whose `scenario` lacks a
+  `requirement` or a `name`, names no scenario. `eval new` writes nothing
+  while there is one, since it cannot tell which scenario the folder was
+  written for: repair its `checks.json`, or delete the folder if it is not a
+  package. A package that names a scenario no longer in the Spec is for one
+  renamed or removed there: move what still holds into the package
+  `eval new` wrote for the new name, if any, then delete the old package.
 - `case_stale`: the Spec was exported again. Compare the package with the
   current requirements, update what changed, then set `spec_ref.sha256` to the
   current handoff. Do not carry an old expectation over unread.
@@ -118,5 +137,7 @@ blocker in a loop.
 Checks are judged by code in `tests/test.sh`; there is no model judge, so a
 requirement about tone or answer quality cannot be gated yet. Say so instead of
 approximating it with a keyword check. Packages use Harbor's shared verifier
-mode, and each run makes one attempt per package. Fixtures are not supported
-for multi-step packages yet.
+mode, and a run makes one attempt per package unless `run start --attempts`
+asks for more. Fixtures are not supported for multi-step packages yet, so such
+a package stays `awaiting_integration`: every run skips it, and a full run of
+its change cannot pass yet.

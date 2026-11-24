@@ -1,8 +1,10 @@
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { changeDirectory } from './project.js';
 import { frozenSpec } from './spec.js';
-import { validateEval } from './eval.js';
-import { activeLoop, pinnedBase, recordedBaseline, runTools } from './run.js';
-import { hasLoop, loopAcceptance, loopInputs } from './loop.js';
+import { eddDirectory, unnamedMessage, unnamedPackages, unpackagedScenarios, validateEval } from './eval.js';
+import { activeLoop, noRunnableCase, pinnedBase, recordedBaseline, runTools } from './run.js';
+import { hasLoop, loopAcceptance, loopInputs, mismatchMessage } from './loop.js';
 
 const stages = ['spec-export', 'write-eval', 'run-eval', 'loop-and-implement'];
 
@@ -17,12 +19,19 @@ export function checkWorkflow(repo, stage, name) {
   let handoff;
   let evals;
   let accepted = null;
+  let unpackaged = null;
+  let unnamed = null;
+  let baseline = null;
   if (stage === 'spec-export' || stage === 'write-eval') {
     const spec = frozenSpec(repo, name, { exported: stage === 'write-eval' });
     validation = spec.validation;
     gaps.push(...spec.gaps);
     if (spec.handoff) handoff = { id: spec.handoff.id, file: spec.handoff.file };
     inputsReady = gaps.length === 0;
+    if (stage === 'write-eval' && inputsReady) {
+      unnamed = unnamedPackages(repo, name);
+      unpackaged = unpackagedScenarios(repo, name, spec.handoff.handoff);
+    }
   } else if (stage === 'run-eval') {
     evals = validateEval(repo, name);
     // Packages still waiting for a connection are skipped by a run, not a blocker.
@@ -30,18 +39,34 @@ export function checkWorkflow(repo, stage, name) {
     // Once the user has accepted a run of the loop for this Spec, nothing is
     // left to run, so neither the tools nor a runnable package are needed.
     accepted = evals.spec ? loopAcceptance(repo, name, evals.spec) : null;
+    const loop = evals.spec ? activeLoop(repo, name, evals.spec) : null;
     if (!accepted) {
       if (!gaps.length && !evals.ready_for_run) {
-        gaps.push({ code: 'no_runnable_case', kind: 'artifact', owner: 'agent', route: 'write-eval',
-          message: 'No package is ready to run. `eval validate` lists what each one still needs and `eval check` proves a finished one; a project without an implementation records an unavailable baseline instead.' });
+        gaps.push(noRunnableCase());
       }
       // While a loop runs, head runs need the baseline it pinned.
-      const loop = evals.spec ? activeLoop(repo, name, evals.spec) : null;
       const pinned = loop ? pinnedBase(repo, name, loop).gap : null;
       if (pinned) gaps.push(pinned);
       if (!gaps.length) gaps.push(...runTools().gaps);
     }
     inputsReady = gaps.length === 0;
+    // The first run of a Spec export is its baseline; a head run would be
+    // refused. It is recorded again while the recorded one did not behave as
+    // declared, since no loop starts on it. A running loop has pinned its
+    // baseline already.
+    const recorded = evals.spec && !loop ? recordedBaseline(repo, name, evals.spec) : null;
+    if (evals.spec && !loop && (!recorded || recorded.baseline_mismatch?.length)) {
+      // The expected baseline results kept beside the packages go with the
+      // baseline command, so a baseline is never recorded without them by mistake.
+      const expectations = path.join(eddDirectory(repo, name), 'baseline-expectations.json');
+      const expect = existsSync(expectations) ? ['--expect', expectations] : [];
+      const add = `Add --expect FILE with the expected baseline result of each check, kept as .genesis/edd/${name}/baseline-expectations.json`;
+      baseline = { action: 'record_baseline', command: ['run', 'start', name, '--repo', repo, '--baseline', ...expect],
+        note: recorded ? `${mismatchMessage(recorded)}${expect.length ? '' : ` ${add}.`}`
+          : expect.length
+            ? 'The expected baseline result of each check comes from baseline-expectations.json. When nothing can run yet, use --unavailable no_implementation instead of --expect.'
+            : `${add}, or --unavailable no_implementation when nothing can run yet.` };
+    }
   } else if (stage === 'loop-and-implement') {
     const inputs = loopInputs(repo, name);
     evals = inputs.evals;
@@ -52,17 +77,20 @@ export function checkWorkflow(repo, stage, name) {
   const inputGap = gaps.find((gap) => gap.owner === 'agent') ?? gaps[0];
   const proceed = {
     'spec-export': { action: 'export_spec', command: ['spec', 'export', name, '--repo', repo] },
-    'write-eval': { action: 'write_eval', command: ['eval', 'new', name, '--repo', repo] },
-    // The first run of a Spec export is its baseline; a head run would be
-    // refused. A running loop has pinned its baseline already. Once the user
-    // has accepted a run of that loop, another run adds nothing.
+    // Once every scenario has a package, `eval new` has nothing left to write.
+    // While a folder under evals/ names no scenario, it writes nothing.
+    'write-eval': unnamed?.length
+      ? { action: 'finish_evals', command: ['eval', 'validate', name, '--repo', repo],
+        note: `${unnamedMessage(unnamed).problem} ${unnamedMessage(unnamed).repair} \`eval new\` writes nothing until then.` }
+      : unpackaged && !unpackaged.length
+        ? { action: 'finish_evals', command: ['eval', 'validate', name, '--repo', repo],
+          note: 'Every scenario of this Spec has a package, so `eval new` has nothing to write. `eval validate` lists what each package still needs; `eval check` proves the finished ones. Run `eval new` again only after changing the kit\'s verifier/ folder.' }
+        : { action: 'write_eval', command: ['eval', 'new', name, '--repo', repo] },
+    // Once the user has accepted a run of the loop, another run adds nothing.
     'run-eval': accepted
       ? { action: 'loop_done', command: ['loop', 'status', name, '--repo', repo],
         note: `The user accepted run ${accepted.run_id}; the loop for this Spec is finished. \`loop status\` says what is left, such as a commit.` }
-      : evals?.spec && !activeLoop(repo, name, evals.spec) && !recordedBaseline(repo, name, evals.spec)
-        ? { action: 'record_baseline', command: ['run', 'start', name, '--repo', repo, '--baseline'],
-          note: 'Add --expect FILE with the expected baseline result of each check, or --unavailable no_implementation when nothing can run yet.' }
-        : { action: 'run_eval', command: ['run', 'start', name, '--repo', repo] },
+      : baseline ?? { action: 'run_eval', command: ['run', 'start', name, '--repo', repo] },
     'loop-and-implement': evals?.spec && hasLoop(repo, name, evals.spec)
       ? { action: 'loop_status', command: ['loop', 'status', name, '--repo', repo] }
       : { action: 'start_loop', command: ['loop', 'start', name, '--repo', repo],

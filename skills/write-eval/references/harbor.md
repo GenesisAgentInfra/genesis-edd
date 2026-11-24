@@ -1,7 +1,7 @@
 # Harbor, as these packages use it
 
 Harbor runs one package as one trial in local Docker. The CLI starts it; you do
-not call `harbor run` yourself. What follows was checked against Harbor 0.26.
+not call `harbor run` yourself. What follows was checked with Harbor 0.27.0.
 For anything else, `harbor run --help` on this machine is the contract.
 
 ## What happens in a trial
@@ -66,7 +66,9 @@ networks:
 
 - Add `.genesis` to the project's `.dockerignore`. Without it a broad `COPY`
   puts every package's expected results into the agent's image; `eval validate`
-  rejects the package.
+  rejects the package. It also rejects any other build context that holds the
+  package, such as `..` or `${GENESIS_EDD_HARNESS}/..`, and checks the kit's
+  environment files as it checks the package's.
 - Give each stand-in a healthcheck and let `main` wait for `service_healthy`.
 - Keep the evidence where the agent cannot change it: in the stand-in service,
   or on a volume that `main` mounts read-only.

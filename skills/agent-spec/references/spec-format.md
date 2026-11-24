@@ -99,8 +99,9 @@ then apply the user's delta. Include all scenarios that remain valid. v0.1 accep
 ADDED/MODIFIED only; removal/rename lifecycle and main-spec promotion are deferred.
 Do not use automatic OpenSpec archive/sync yet: Genesis provenance metadata must
 also be merged, and v0.1 does not implement that integration. Archive also moves
-the change folder, which the Map path in genesis.json and the EDD records name. Read prior changes
-and handoffs as well as any pre-existing `openspec/specs` documents.
+the change folder, which the Map path in genesis.json and the EDD records name.
+Read prior changes and handoffs as well as any pre-existing `openspec/specs`
+documents.
 
 Each requirement has at least one `#### Scenario:` with a WHEN/GIVEN trigger and
 THEN outcome. Keep descriptions within OpenSpec's strict limit (500 characters).
@@ -114,17 +115,29 @@ preserves both, and archive/sync is unsupported. Every other strict warning or e
 still blocks validation. Raw upstream diagnostics remain in the JSON response.
 
 `genesis.json` beside the specs records project mode, base commit if present, the
-Map (path, digest, snapshot, analysis status, mode and freshness) or an explicit
-absence, and baseline `not_run`. It is technical context, not a source of
-business requirements. `mode` is `map`, or `unknown` for a Map from a Genesis
-that did not say what it maps. A provided Map may be partial or stale.
+Map (path, digest, snapshot, analysis status, mode, freshness and, when the Map
+has them, its entry counts under `coverage`) or an explicit absence, and
+baseline `not_run`. It is technical context, not a source of business
+requirements. `mode` is `map`, or `unknown` for a Map from a Genesis that did
+not say what it maps. A provided Map may be partial or stale.
 `freshness` compares the digests Genesis records under the Map's `source` with
 the same files at the base commit, as Git stores them: `verified` for a Map read
 without uncommitted changes and without files left out, whose every file is
 unchanged; `stale` when a file changed or is gone; `unverified` when the Map has
 no `source`, was read with uncommitted changes, or left files out and every file
 it read is unchanged. A file added after the Map is not listed, so `verified`
-does not cover new files, and `analysis_status` still decides coverage.
+does not cover new files. Uncommitted edits are not compared either: `spec new`
+names the files the Map was read from that have them, because impact evidence
+is read from the working tree.
+
+An `analysis_status` of `complete` means the flows Genesis planned are finished,
+not that the whole project is mapped. `coverage` counts the entries Genesis
+found (`entries_total`) and how many were planned, skipped or not handled;
+`spec new` warns when some are outside the planned flows. `spec validate`,
+`spec export` and `workflow check` repeat what genesis.json records about the
+Map: its freshness at the base commit, mode `unknown`, a partial analysis,
+entries outside the planned flows and how many steps are named from source
+code. They do not check the Map against later commits.
 
 With `--map`, `spec new` copies the Map byte for byte into the change folder as
 `business-map.json`, and genesis.json points at that copy. Genesis's own output
@@ -158,18 +171,24 @@ entries:
 request alters and `may_affect` for neighbours worth a regression check.
 `evidence` is a project file, optionally with a line, that you read. `flow` is
 optional: use the flow ID from the recorded Map and omit it when the Map does
-not cover the entry. The validator rejects a flow ID that is not in the recorded
-Map and evidence that is not a file, or a line, in the project. It cannot check
-that the list is complete. A missing `impact.md` in an existing project is a
-warning, not a blocker.
+not cover the entry or no Map is recorded. Flow IDs are checked against the
+recorded Map when there is one: the validator rejects an ID that is not in it.
+Without a Map it cannot check them and warns instead. It also rejects evidence
+that is not a file, or a line, in the project. It cannot check that the list is
+complete. A missing `impact.md` in an existing project is a warning, not a
+blocker.
 
 ## Handoff
 
 `spec export` writes a content-addressed JSON handoff under the change's `handoffs/`
-directory. It includes the exact Markdown, revisions and context, so edits cannot
-silently change an earlier exported expectation. It also carries `requirements`,
-each with its ID, state, source, statement and scenarios split into `given`,
-`when` and `then`, and the checked `impact`. Later stages read those fields and
-verify the digest; they do not parse the Markdown, so its layout can change
-without breaking them. Export readiness means enough accepted business
-information to design Eval; it does not mean an executable task package exists.
+directory. It includes the Markdown, revisions and context, so edits cannot
+silently change an earlier exported expectation. The Markdown is read with LF
+line ends: a checkout that converts line ends between LF and CRLF, as Git's
+`core.autocrlf` does, keeps the identity of the Spec, its handoff and its Map
+copy. It also carries `requirements`, each with its ID, state, source,
+statement and scenarios split into `given`, `when` and `then`, and the checked
+`impact`. Later
+stages read those fields and verify the digest; they do not parse the Markdown,
+so its layout can change without breaking them. Export readiness means enough
+accepted business information to design Eval; it does not mean an executable
+task package exists.

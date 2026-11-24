@@ -41,10 +41,12 @@ export function runTools() {
   return { harbor, docker, gaps };
 }
 
-function blocked(message, repo, name, gaps) {
+// A refusal resumes at the stage of the command refused: run-eval, or
+// write-eval for `eval check`, which proves the packages before any run.
+function blocked(message, repo, name, gaps, stage = 'run-eval') {
   return Object.assign(new Error(message), {
     code: 'RUN_INPUT_BLOCKED', gaps,
-    resume: { stage: 'run-eval', change: name, command: ['workflow', 'check', 'run-eval', name, '--repo', repo] },
+    resume: { stage, change: name, command: ['workflow', 'check', stage, name, '--repo', repo] },
   });
 }
 
@@ -108,10 +110,53 @@ export function sameCode(a, b, repo) {
   return first && second ? first === second : null;
 }
 
-// The starting code of a loop as loop.json keeps it.
+// The starting code of a loop as loop.json keeps it, with the application
+// files its commit does not hold.
 export function startCode(commit, snapshot, repo, patch) {
   const identity = codeIdentity(snapshot, repo);
-  return { commit, digest: identity, ...(identity ? { digest_of: 'content' } : {}), ...(patch ? { patch } : {}) };
+  return { commit, digest: identity, ...(identity ? { digest_of: 'content' } : {}), ...(patch ? { patch } : {}),
+    ...(snapshot?.changed_files?.length ? { uncommitted_files: snapshot.changed_files } : {}) };
+}
+
+// An acceptance belongs to the loop it was given in: the same Spec, and the
+// same start. Records written before loops were named are matched by run.
+export const acceptedIn = (record, loop, runs) => record?.spec?.sha256 === loop.spec
+  && (record.loop_started_at ? record.loop_started_at === loop.started_at : runs.some((run) => run.run_id === record.run_id));
+
+// The code an acceptance covers, as accepted.json keeps it, for when the
+// accepted run's folder is gone. Records written before the digest named its
+// kind compare by their commit when nothing was uncommitted.
+export const acceptedSnapshot = (record) => ({ commit: record.commit ?? null, changed_files: record.uncommitted_files ?? null,
+  digest: record.code_digest ?? null, ...(record.code_digest_of ? { digest_of: record.code_digest_of } : {}) });
+
+// Whether the user's acceptance still covers its loop: the code now is the
+// accepted run's, and no full run of the loop after the acceptance fails.
+// fullRuns are the loop's full head runs in order. Returns null when the
+// record belongs to no acceptance of this loop, otherwise { holds, run (the
+// accepted run, or null when its folder is gone), keeps (sameCode of its code
+// and now), failed (the latest full run after the acceptance that fails, or
+// null) }.
+export function acceptanceHolds(record, loop, fullRuns, now, repo) {
+  if (!record || !acceptedIn(record, loop, fullRuns)) return null;
+  const run = fullRuns.find((entry) => entry.run_id === record.run_id) ?? null;
+  // Full runs after the accepted run that started after the user accepted it.
+  const at = Date.parse(record.accepted?.at);
+  const after = fullRuns.filter((entry, index) => (!run || index > fullRuns.indexOf(run))
+    && (Number.isFinite(at) ? Date.parse(entry.started_at) > at : Boolean(run)));
+  const failed = after.findLast((entry) => entry.verdict === 'fail') ?? null;
+  const keeps = sameCode(run?.code_snapshot ?? acceptedSnapshot(record), now, repo);
+  return { holds: keeps !== false && !failed, run, keeps, failed };
+}
+
+// What a loop has spent of its budget: its full head runs so far, and the
+// minutes since its clock started. The caller passes acceptedAt only while
+// that acceptance covers the loop: a finished loop spends no more minutes.
+export function budgetUsed(loop, fullRuns, acceptedAt) {
+  const clock = loop.clock_started_at ?? loop.started_at;
+  const stopped = Date.parse(acceptedAt);
+  const used = { iterations: fullRuns.length,
+    minutes: Math.max(0, Math.round(((Number.isFinite(stopped) ? stopped : Date.now()) - Date.parse(clock)) / 60_000)) };
+  return { clock, used, exhausted: used.iterations >= loop.budget.iterations || used.minutes >= loop.budget.minutes };
 }
 
 // Git's diff output follows the user's configuration. A patch that has to
@@ -123,34 +168,58 @@ const PATCH_CONFIG = ['-c', 'core.quotepath=off', '-c', 'diff.noprefix=false', '
 // With the commit, it restores the exact code a run used, so nothing has to be
 // committed for a run to be restorable. A scratch index holds the commit and
 // then every changed path as it is on disk, so the patch is exactly their
-// difference, whatever the real index says.
+// difference, whatever the real index says. The objects Git writes for them go
+// to a scratch object directory that reads the project's own as an alternate,
+// so nothing is written into .git, which may be read-only. The alternate is
+// named in the scratch directory's info/alternates file, not in
+// GIT_ALTERNATE_OBJECT_DIRECTORIES: Git splits that variable at each ':', also
+// one inside a path, and a value the user set stays as it is.
+// Returns { patch, error }: patch is the file name, or null when the commit
+// holds all of the code; error says why a patch that was needed is missing.
 export function savePatch(repo, snapshot, file) {
-  if (!snapshot.changed_files?.length) return null;
+  if (!snapshot.changed_files?.length) return { patch: null, error: null };
+  const failed = (step, result) => {
+    const why = result.error?.code === 'ENOBUFS' ? 'the patch is larger than 256 MB'
+      : (result.error?.message ?? String(result.stderr ?? '')).trim().split('\n').pop() || `exit ${result.status}`;
+    return { patch: null, error: `git ${step} failed: ${why}` };
+  };
+  const objects = spawnSync('git', ['-C', repo, 'rev-parse', '--git-path', 'objects'], { encoding: 'utf8' });
+  if (objects.status !== 0) return failed('rev-parse', objects);
   const scratch = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-index-'));
-  const env = { ...process.env, GIT_INDEX_FILE: path.join(scratch, 'index') };
+  const env = { ...process.env, GIT_INDEX_FILE: path.join(scratch, 'index'), GIT_OBJECT_DIRECTORY: path.join(scratch, 'objects') };
   const git = (args, options = {}) => spawnSync('git', ['-C', repo, ...PATCH_CONFIG, ...args],
     { encoding: 'utf8', env, maxBuffer: 256 * 1024 * 1024, ...options });
   try {
-    if (git(['read-tree', ...(snapshot.commit ? [snapshot.commit] : ['--empty'])]).status !== 0) return null;
+    mkdirSync(path.join(scratch, 'objects/info'), { recursive: true });
+    writeFileSync(path.join(scratch, 'objects/info/alternates'), `${path.resolve(repo, objects.stdout.trim())}\n`);
+    const read = git(['read-tree', ...(snapshot.commit ? [snapshot.commit] : ['--empty'])]);
+    if (read.status !== 0) return failed('read-tree', read);
     const added = git(['--literal-pathspecs', 'add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul'],
       { input: snapshot.changed_files.join('\0') });
-    if (added.status !== 0) return null;
+    if (added.status !== 0) return failed('add', added);
     const base = snapshot.commit ?? git(['hash-object', '-t', 'tree', '/dev/null']).stdout.trim();
     const diff = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames',
       '--src-prefix=a/', '--dst-prefix=b/', base], { encoding: 'buffer' });
-    if (diff.status !== 0 || !diff.stdout.length) return null;
+    if (diff.status !== 0) return failed('diff', diff);
+    // Changed paths whose content is the commit's, such as a staged edit
+    // undone on disk, need no patch.
+    if (!diff.stdout.length) return { patch: null, error: null };
     writeFileSync(file, diff.stdout);
-    return path.basename(file);
+    return { patch: path.basename(file), error: null };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
 }
 
-// Run and check records are evidence of this machine, not source.
+// Run and check records are evidence of this machine, not source. Lines the
+// user added to the file stay; only the missing ones are added.
 export function ignoreRecords(repo) {
   const file = localPath(repo, '.genesis/edd/.gitignore');
-  const wanted = '/*/runs/\n/*/checks/\n/*/loop.json\n/*/loop-start.patch\n__pycache__/\n';
-  if (!existsSync(file) || readFileSync(file, 'utf8') !== wanted) writeFileSync(file, wanted);
+  const wanted = ['/*/runs/', '/*/checks/', '/*/loop.json', '/*/loop-start.patch', '__pycache__/'];
+  const text = existsSync(file) ? readFileSync(file, 'utf8') : '';
+  const present = new Set(text.split('\n').map((line) => line.trim()));
+  const missing = wanted.filter((line) => !present.has(line));
+  if (missing.length) writeFileSync(file, `${text}${text && !text.endsWith('\n') ? '\n' : ''}${missing.join('\n')}\n`);
 }
 
 export function readRuns(directory) {
@@ -159,6 +228,22 @@ export function readRuns(directory) {
     .map((entry) => { try { return readJSON(path.join(directory, entry.name, 'run.json')); } catch { return null; } })
     .filter(Boolean).sort((a, b) => `${a.started_at}${a.run_id}`.localeCompare(`${b.started_at}${b.run_id}`));
 }
+
+// Run folders with no readable run.json. A run writes it last, so these are
+// runs that were interrupted, or one still running. readRuns leaves them out.
+export function unfinishedRuns(directory) {
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory, { withFileTypes: true }).filter((entry) => entry.isDirectory())
+    .filter((entry) => { try { readJSON(path.join(directory, entry.name, 'run.json')); return false; } catch { return true; } })
+    .map((entry) => entry.name).sort();
+}
+
+export const unfinishedWarning = (names) => `Run folders without a readable run.json, left by a run that was interrupted or is still running: ${names.join(', ')}. They are not counted or compared. Delete them once their logs are no longer needed.`;
+
+// No package can run. A head run is refused with this gap, as workflow check
+// run-eval reports it.
+export const noRunnableCase = () => ({ code: 'no_runnable_case', kind: 'artifact', owner: 'agent', route: 'write-eval',
+  message: 'No package is ready to run. `eval validate` lists what each one still needs and `eval check` proves a finished one; a project without an implementation records an unavailable baseline instead.' });
 
 // What the verifier recorded for each declared check. A check with no record,
 // or a verifier that never finished, is unknown: missing evidence, not a failure.
@@ -216,14 +301,24 @@ function runCase(harbor, item, checks, target, options) {
     .filter((entry) => entry.isDirectory() && existsSync(path.join(job, entry.name, 'result.json')))
     .map((entry) => path.join(job, entry.name)).sort() : [];
   let execution = { status: 'completed' };
-  if (trials.length < attempts) {
-    execution = { status: 'error', reason: result.error?.code === 'ETIMEDOUT' ? `Harbor did not finish within ${options.timeout * attempts} minutes.`
-      : `Harbor produced ${trials.length} of ${attempts} trial results (exit ${result.status}). See logs/harbor.log.` };
+  // Stopped at the timeout, Harbor may still write a result for the trial it
+  // was in, recording only that it was cancelled. The timeout is the cause.
+  if (result.error?.code === 'ETIMEDOUT') {
+    execution = { status: 'error', reason: `Harbor did not finish within ${options.timeout * attempts} minutes and was stopped. Raise --timeout, or find what hangs in logs/.` };
+  } else if (trials.length < attempts) {
+    execution = { status: 'error', reason: `Harbor produced ${trials.length} of ${attempts} trial results (exit ${result.status}). See logs/harbor.log.` };
   }
   const warnings = new Set();
   const recorded = trials.map((trial) => {
-    const outcome = readJSON(path.join(trial, 'result.json'));
-    if (outcome.exception_info && execution.status === 'completed') {
+    let outcome;
+    try { outcome = readJSON(path.join(trial, 'result.json')); } catch (error) {
+      // A result Harbor did not finish writing is an attempt without evidence.
+      if (execution.status === 'completed') {
+        execution = { status: 'error', reason: `logs/harbor/${path.basename(trial)}/result.json cannot be read (${error.message}). Harbor may have stopped while writing it; see logs/harbor.log.` };
+      }
+      return [];
+    }
+    if (outcome?.exception_info && execution.status === 'completed') {
       execution = { status: 'error', reason: `${outcome.exception_info.exception_type}: ${outcome.exception_info.exception_message}` };
     }
     const steps = path.join(trial, 'steps');
@@ -312,7 +407,7 @@ export function activeLoop(repo, name, spec) {
 export function checkEval(repo, name, options = {}) {
   const evals = validateEval(repo, name);
   const blocking = evals.gaps.filter((gap) => gap.code !== 'integration_pending');
-  if (blocking.length) throw blocked(`Eval packages are not ready: ${blocking.map((gap) => gap.message).join('; ')}`, repo, name, blocking);
+  if (blocking.length) throw blocked(`Eval packages are not ready: ${blocking.map((gap) => gap.message).join('; ')}`, repo, name, blocking, 'write-eval');
   if (options.case && !evals.cases.some((item) => item.id === options.case)) throw new Error(`No package named ${options.case}.`);
   const root = eddDirectory(repo, name);
   const chosen = evals.cases.filter((item) => !options.case || item.id === options.case);
@@ -324,7 +419,7 @@ export function checkEval(repo, name, options = {}) {
     .map((item) => ({ case: item.id, missing: item.integration.missing, detail: item.integration.detail }));
   if (finished.length) {
     const tools = runTools();
-    if (tools.gaps.length) throw blocked(tools.gaps.map((gap) => gap.message).join(' '), repo, name, tools.gaps);
+    if (tools.gaps.length) throw blocked(tools.gaps.map((gap) => gap.message).join(' '), repo, name, tools.gaps, 'write-eval');
     ignoreRecords(repo);
   }
   const cases = finished.map((item) => {
@@ -386,8 +481,13 @@ export function startRun(repo, name, options = {}) {
     throw blocked(`The loop's baseline ${loop.baseline} is not in runs/.`, repo, name, [pinnedBase(repo, name, loop).gap]);
   }
   if (side === 'head' && !base) {
+    // A completed attempt on code that changed during it did run; only the
+    // change keeps it from being a baseline.
+    const why = !attempt ? ''
+      : attempt.code_changed_during_run && attempt.execution_status === 'completed' ? `The last baseline attempt, ${attempt.run_id}, ran while the code changed, so it is not a baseline; record it again without editing the code during the run. `
+        : `The last baseline attempt, ${attempt.run_id}, did not run; fix the cause and record it again. `;
     throw blocked('No baseline is recorded for this Spec.', repo, name, [{ code: 'baseline_missing', kind: 'artifact', owner: 'agent', route: 'run-eval',
-      message: `${attempt ? `The last baseline attempt, ${attempt.run_id}, did not run; fix the cause and record it again. ` : ''}Record the baseline before changing code: \`run start --baseline\`, or \`--baseline --unavailable no_implementation\` when nothing can run yet. A head run is never promoted to a baseline.` }]);
+      message: `${why}Record the baseline before changing code: \`run start --baseline\`, or \`--baseline --unavailable no_implementation\` when nothing can run yet. A head run is never promoted to a baseline.` }]);
   }
   // Inside a loop the code before the change is known. Every base record,
   // one that runs or one that declares a baseline unavailable, describes that
@@ -405,6 +505,12 @@ export function startRun(repo, name, options = {}) {
   const skipped = cases.filter((item) => item.integration.state !== 'ready')
     .map((item) => ({ case: item.id, reason: 'awaiting_integration', missing: item.integration.missing, detail: item.integration.detail }))
     .concat(cases.filter((item) => item.integration.state === 'ready' && !chosen(item)).map((item) => ({ case: item.id, reason: 'not_selected' })));
+  // A head run with nothing to run would only record that; it is refused
+  // before a folder is written, so it never counts as a run of a loop.
+  if (side === 'head' && !ready.length) {
+    const waiting = skipped.filter((item) => item.reason === 'awaiting_integration').map((item) => `${item.case} (${item.detail.join('; ')})`);
+    throw blocked(`No package is ready to run.${waiting.length ? ` Waiting: ${waiting.join(', ')}.` : ''}`, repo, name, [noRunnableCase()]);
+  }
   const declared = expectations(options.expect, cases);
   const harnessDirectory = kitDirectory(repo);
   let harness = {};
@@ -422,6 +528,7 @@ export function startRun(repo, name, options = {}) {
     if (tools.gaps.length) throw blocked(tools.gaps.map((gap) => gap.message).join(' '), repo, name, tools.gaps);
   }
   const started = new Date();
+  const unfinished = unfinishedRuns(runs);
   // Each run gets a folder of its own; two runs in the same second never share one.
   mkdirSync(runs, { recursive: true });
   let runId;
@@ -433,11 +540,33 @@ export function startRun(repo, name, options = {}) {
   }
   ignoreRecords(repo);
   const code = codeSnapshot(repo);
-  const patch = savePatch(repo, code.snapshot, path.join(directory, 'code.patch'));
   const warnings = [...evals.warnings];
+  if (unfinished.length) warnings.push(unfinishedWarning(unfinished));
+  // The budget is the user's to raise. A head run past it is not refused, but
+  // it says so, as loop status does with stop_budget.
+  if (side === 'head' && loop?.budget) {
+    const ran = earlier.filter((run) => run.side === 'head' && (run.scope ?? 'full') === 'full' && run.started_at >= loop.started_at);
+    let accepted = null;
+    try { accepted = readJSON(path.join(root, 'accepted.json')); } catch { /* none yet */ }
+    // The minutes stop at an acceptance only while it covers the code this run starts on.
+    const holds = acceptanceHolds(accepted, loop, ran, code.snapshot, repo)?.holds;
+    const { used, exhausted } = budgetUsed(loop, ran, holds ? accepted.accepted?.at : undefined);
+    if (exhausted) {
+      warnings.push(`The loop's budget was used up before this run: ${used.iterations} of ${loop.budget.iterations} runs, ${used.minutes} of ${loop.budget.minutes} minutes. Runs past the budget need the user's agreement; \`loop extend\` raises it once they give it.`);
+    }
+  }
+  const { patch, error: patchError } = savePatch(repo, code.snapshot, path.join(directory, 'code.patch'));
+  if (patchError) {
+    warnings.push(`code.patch could not be written (${patchError}), so the code of this run cannot be restored: its commit does not hold the uncommitted files.`);
+  }
   const outcomes = executes ? ready.map((item) => runCase(harborCommand(), item, item.checks, path.join(directory, item.id),
     { agent, model, yes: options.yes === true, timeout: options.timeout ?? 30, harness: harnessDirectory, repo, attempts })) : [];
   warnings.push(...outcomes.flatMap((outcome) => outcome.warnings));
+  // Every package builds from the application as it is when that package
+  // runs. Code that changed during the run gives results that belong to no
+  // single version of it: such a run neither passes nor counts as a baseline.
+  const moved = executes && sameCode(code.snapshot, codeSnapshot(repo).snapshot, repo) === false;
+  if (moved) warnings.push('The code changed while this run executed, so its results do not belong to one version of the code. Do not edit the code during a run; run again once it is stable.');
   const status = options.unavailable ? 'not_run' : !executes ? 'blocked'
     : outcomes.every((outcome) => outcome.execution.status === 'completed') ? 'completed' : 'error';
   const digests = Object.fromEntries(cases.map((item) => [item.id, item.task_digest]));
@@ -446,7 +575,8 @@ export function startRun(repo, name, options = {}) {
     started_at: started.toISOString(), finished_at: new Date().toISOString(),
     execution_status: status, verdict: null,
     code_version: code.version, spec_snapshot: spec,
-    is_baseline: side === 'base' && status === 'completed',
+    code_changed_during_run: moved,
+    is_baseline: side === 'base' && status === 'completed' && !moved,
     baseline: side === 'head' && base.is_baseline ? base.run_id : null,
     // The base record a head run was compared with, also when it records an
     // unavailable baseline.
@@ -460,7 +590,7 @@ export function startRun(repo, name, options = {}) {
   };
   let comparison = null;
   if (side === 'base') {
-    record.baseline_unavailable_reason = options.unavailable ?? (status === 'completed' ? null : 'execution_blocked');
+    record.baseline_unavailable_reason = options.unavailable ?? (record.is_baseline ? null : 'execution_blocked');
     // Every declared check, including packages not connected yet: what the
     // change is expected to do is fixed before the code changes, whether or
     // not the package could run.
@@ -498,8 +628,18 @@ export function startRun(repo, name, options = {}) {
     });
     const gating = results.filter((entry) => entry.role === 'gating');
     // A partial run never passes, even when it names every package.
-    record.verdict = gating.some((entry) => entry.after === 'fail') ? 'fail'
+    record.verdict = moved ? 'unverified' : gating.some((entry) => entry.after === 'fail') ? 'fail'
       : record.scope === 'full' && status === 'completed' && !skipped.length && gating.length && gating.every((entry) => entry.after === 'pass') ? 'pass' : 'unverified';
+    // The comparison holds only when both sides ran the same way. It is shown,
+    // not enforced: the verdicts stay as they are.
+    if (base.is_baseline && base.environment_ref) {
+      const names = { agent: 'agent', model: 'model', attempts: 'attempts', harbor: 'Harbor version' };
+      const differ = Object.keys(names).filter((key) => key in base.environment_ref
+        && (base.environment_ref[key] ?? null) !== (record.environment_ref[key] ?? null));
+      if (differ.length) {
+        warnings.push(`The settings of this run differ from those of the baseline ${base.run_id}: ${differ.map((key) => `${names[key]} ${record.environment_ref[key] ?? 'none'} here, ${base.environment_ref[key] ?? 'none'} in the baseline`).join('; ')}. A different result may come from that, not from the change. Run with the baseline's settings to compare like with like.`);
+      }
+    }
     comparison = { schema_version: '1.0', run_id: runId, baseline: record.baseline, base_run: record.base_run, results };
     writeJSON(path.join(directory, 'compare.json'), comparison);
   }
@@ -516,6 +656,7 @@ export function startRun(repo, name, options = {}) {
       compare_gating: Object.fromEntries(verdicts.map((key) => [key, tally(key, 'gating')])) }),
     next: !['completed', 'not_run'].includes(status)
       ? 'Execution did not complete. Read cases[].execution.reason and each case\'s logs/harbor.log, fix the cause, then run the same command again.'
+      : moved ? 'The code changed while this run executed, so it shows nothing about any one version of the code. Leave the code as it is during a run, and run the same command again.'
       : side === 'base'
         ? record.baseline_mismatch?.length
           ? 'The baseline did not behave as declared (baseline_mismatch). Before changing code, find out why: this is not the code before the change, the expectation is wrong, or the check cannot tell the two apart. Then run the baseline again.'

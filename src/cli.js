@@ -70,22 +70,23 @@ when execution was blocked or failed; a failing business check is a result.
 loop start fixes the Spec, the baseline, the starting commit, the packages and
 the budget (default 5 full runs, 60 minutes) for one implementation loop. It
 needs a Git repository; nothing has to be committed, because every run stores
-its code as the commit it started from plus code.patch. loop status is
-read-only: it follows every check through the loop's runs and names the next
-step: iterate, write the report, split changes after a regression, stop when
-stuck or out of budget, review, or ask the user to accept; after acceptance it
-reports done, and the minutes stop. With a recorded Map, the review step names
-the genesis map prepare arguments (--base, --entries-from) that start a Genesis
+its code as the commit it started from plus code.patch. It refuses a baseline
+with a baseline_mismatch. loop status is read-only: it follows every check
+through the loop's runs and names the next step: iterate, write the report,
+split changes after a regression, stop when stuck or out of budget, review,
+run again after the code changed, or ask the user to accept. After acceptance
+it reports done, and the minutes stop, while the code is still the accepted
+run's and no later run fails. With a recorded Map, the review step names the
+genesis map prepare arguments (--base, --entries-from) that start a Genesis
 review from the Spec's Map (--entries-from needs Genesis 9c0c914 or later).
-loop extend raises the budget once the
-user agrees: N more full runs and M minutes from now (default 5 and 60),
-keeping runs and the baseline.
+loop extend raises the budget once the user agrees: N more full runs and M
+minutes from now (default 5 and 60), keeping runs and the baseline.
 loop start --restart starts the loop over, keeping its starting code; while a
 loop runs, every base record must be on that code. loop report writes a
 run's report skeleton under .genesis/edd/NAME/reports/ and never overwrites
 one. loop accept records the user's acceptance of a passing run whose report
-is complete, for the code that ran. An earlier loop's acceptance is kept in the
-record under earlier.
+is complete, for the code that ran. An earlier acceptance, of an earlier loop or
+one that no longer covers this loop, is kept in the record under earlier.
 workflow check is read-only and returns gaps, repair routes and a resume command.
 Stages: spec-export, write-eval, run-eval, loop-and-implement. Blocked checks
 exit 1. No stage is executed by a check.

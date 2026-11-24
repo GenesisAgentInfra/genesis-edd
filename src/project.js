@@ -31,36 +31,46 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:9d037e3bc2c705df8abf1ecc8a64d9bd56397b9aeca081ffe34f1017932d5993',
     'sha256:469c2182dfc7f4e4b5c2252a28891379daaa7b4f873da1a149035aaea1e5d171',
     'sha256:8778cd7d6dc3c144e96c758f1f149b1ae35c530a3a52df42a5305a832c113142',
+    'sha256:5bb03c4d492792be8498845b79b50593f3cac3d191bc0717620b0f913733f872',
   ],
   'agent-spec/scripts/run.mjs': ['sha256:881a4b48652d858fa99c6cccacd9549910b64631152884beef6bb88a70fc1e9a'],
   'write-eval/SKILL.md': [
     'sha256:390f4c0a47e84b7d73a6317dbf9ed054d1879944fcfa38bd94016fd171bf889d',
     'sha256:51b2afec0e56f6e2cac81c2392a56917b356e44635ff4dbda80350c0daa93e12',
+    'sha256:fb44a892188d2e01bcbc295d5119edd97bde2c63ce22f8bedb52e2d5f76d339a',
   ],
+  'write-eval/references/task-package.md': ['sha256:45ea9802b29191f985ea5b88227ebdd8ba6099355d80e3e90a68d2cdf97791df'],
   'run-eval/SKILL.md': [
     'sha256:ffb9e10f3f25bffc007ed9381df23cb3d1e31b64dc8088352302158215f75ba7',
     'sha256:0f46f119fcc49a84dff2fd55274aee5ae5c80c9b4c7c99b5d3bc4999d01bded8',
     'sha256:8559cf63ec10a5d6323d1e620ab163f6c0619018536ec5653efb4507c070d021',
     'sha256:296897d67a464063536748a9365e914689072f50cf7b0decd3aceb929bc5b7e3',
+    'sha256:6d91c065e882409f53dbc19356d718dd8bcb3fbd54f44e439c67d4f17d953b39',
   ],
   'run-eval/references/run-records.md': [
     'sha256:0f2bafd0cf20299e5ab7d0f28ffbdbc657450d986d56cd708352ec1e761c5c61',
     'sha256:389a8ae7e97bd9e0ef6716f17c15fbddaf193a27f65bd4799cd825ef5ecd3024',
     'sha256:c187814a77aa95d7a820159ac7475d86fca61b492ac6e025494a2c443b846998',
     'sha256:c907c59be9416c241534a85affd4475e4848f5ada7213ec5e596365d779c047d',
+    'sha256:21a0764116d0cf70248da814001ee1ad252d4f70a620beb37224aef2fcbcdb66',
   ],
-  'write-eval/references/harbor.md': ['sha256:560385a1e4ac0c91e0a1699c52b15ef5038181ec6cc9cf3e47bedaedebbabbfa'],
+  'write-eval/references/harbor.md': [
+    'sha256:560385a1e4ac0c91e0a1699c52b15ef5038181ec6cc9cf3e47bedaedebbabbfa',
+    'sha256:bd52fadcf7d57fd7312862e0c401172e09ccfdc13fd12fe85331c9d915dd0887',
+  ],
   'write-eval/references/environment.md': ['sha256:50b827232d9df5f55ed603fc8d670440f5cd877b33f581b82aa7ee0768aaa964'],
   'loop-and-implement/SKILL.md': [
     'sha256:02d47d51ad3bcb6f8899622e70526fbf750a5047ce98661fd4df55e034356921',
     'sha256:1a71597ec5058d525133aec2936dec054800dc665d2769c9b1736417bce7ff9d',
     'sha256:bfa2ba559def320af39c227eaa3e4356ebeba2434585906c564cabe32f977450',
+    'sha256:ea1eb703dbfd3abb9298d0f340a6d417a8c3c726ba2b1f9dbe638d58d100753b',
   ],
   'agent-spec/references/spec-format.md': [
     'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
     'sha256:99a3389ea7a87d2c61077a5f81252d39f594d6e86d5ad21f939c779020b56619',
     'sha256:7fc70e45daeb8334e30c2c40d0dd18de1f8593f3987bbc4275fba63de4af8a58',
     'sha256:72dcc8e43234509dac8eec197e670fd4dd43a5111deba5a0a8eb4bdd88cb88e4',
+    'sha256:6fb88d1b37864df50c624b2b4715edbc22a4f1135ec6c3a17f0fba34be3f2636',
   ],
 };
 // Files Genesis itself writes are not changes to the application.
@@ -227,36 +237,148 @@ export function changeDirectory(repo, name) {
   return localPath(repo, `openspec/changes/${name}`);
 }
 
+// What `git status` lists under the given paths, or everywhere: [{ code, file }]
+// with Git's two-letter code ('??' for untracked). Ignored files are not
+// listed. untracked 'normal' lists a wholly untracked folder once, as `dir/`.
+// null where Git cannot say.
+export function gitStatus(repo, paths = [], untracked = 'all') {
+  // -z gives every path as it is, without the quoting Git applies to names
+  // with quotes, backslashes or control characters.
+  const status = spawnSync('git', ['-C', repo, 'status', '--porcelain', '-z', `--untracked-files=${untracked}`, ...(paths.length ? ['--', ...paths] : [])],
+    { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 * 1024 });
+  if (status.status !== 0) return null;
+  const entries = status.stdout.split('\0');
+  const listed = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (entry.length < 4) continue;
+    const code = entry.slice(0, 2);
+    listed.push({ code, file: entry.slice(3) });
+    // A rename or copy is followed by its source path. A renamed file is
+    // gone from its old place, which is a change too.
+    if (/[RC]/.test(code)) {
+      index += 1;
+      if (code.includes('R') && entries[index]) listed.push({ code, file: entries[index] });
+    }
+  }
+  return listed;
+}
+
 // Commit and application files changed since it; null where Git cannot say.
 export function codeState(repo) {
   const git = (args) => {
     const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 * 1024 });
     return result.status === 0 ? result.stdout.trim() : null;
   };
-  // -z gives every path as it is, without the quoting Git applies to names
-  // with quotes, backslashes or control characters.
-  const status = spawnSync('git', ['-C', repo, 'status', '--porcelain', '-z', '--untracked-files=all'],
-    { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 * 1024 });
-  let changed = null;
-  if (status.status === 0) {
-    const entries = status.stdout.split('\0');
-    const files = [];
-    for (let index = 0; index < entries.length; index += 1) {
-      const entry = entries[index];
-      if (entry.length < 4) continue;
-      const code = entry.slice(0, 2);
-      files.push(entry.slice(3));
-      // A rename or copy is followed by its source path. A renamed file is
-      // gone from its old place, which is a change too.
-      if (/[RC]/.test(code)) {
-        index += 1;
-        if (code.includes('R') && entries[index]) files.push(entries[index]);
-      }
-    }
-    // Sorted, so the identity of the code does not depend on what is staged.
-    changed = [...new Set(files)].filter((file) => !isGenerated(file)).sort();
-  }
+  const listed = gitStatus(repo);
+  // Sorted, so the identity of the code does not depend on what is staged.
+  const changed = listed === null ? null : [...new Set(listed.map((entry) => entry.file))].filter((file) => !isGenerated(file)).sort();
   return { head: git(['rev-parse', '--verify', 'HEAD']), changed, git };
+}
+
+// Files the operating system or an editor leaves beside the real ones: Finder
+// and Explorer metadata, swap files and backups. They never take part in a run
+// and are not files of a change.
+export const isLeftover = (file) => /^(?:\.DS_Store|Thumbs\.db)$|\.sw[op]$|~$/.test(path.basename(file));
+
+// Files of a change that belong in Git, each with what a clone lacks without
+// it: the change's Spec folder, the OpenSpec project files, the .gitignore
+// that keeps only the run records out, the project kit, and the change's eval
+// packages, expected baseline results, reports and acceptance.
+const committedArtifacts = (name) => ({
+  [`openspec/changes/${name}/`]: 'Spec of this change',
+  'openspec/config.yaml': 'OpenSpec project files',
+  'openspec/genesis.json': 'OpenSpec project files',
+  '.genesis/edd/.gitignore': null,
+  '.genesis/edd/harness/': 'project kit',
+  [`.genesis/edd/${name}/evals/`]: 'eval packages',
+  [`.genesis/edd/${name}/baseline-expectations.json`]: 'expected baseline results',
+  [`.genesis/edd/${name}/reports/`]: 'reports',
+  [`.genesis/edd/${name}/accepted.json`]: 'acceptance record',
+});
+
+const either = (items) => (items.length > 1 ? `${items.slice(0, -1).join(', ')} or ${items.at(-1)}` : items.join(''));
+
+// How to change one rule that ignores files of the change. A rule that ignores
+// a folder keeps out everything in it, and Git cannot take back a file whose
+// parent folder is ignored, so only the folder itself can be taken back.
+// `.genesis/*` ignores what is in .genesis/, so a later `!.genesis/edd/` takes
+// that folder back. `.genesis/**` also ignores each file below it on its own,
+// which `!.genesis/edd/` does not take back.
+function ruleFix(pattern) {
+  const folder = pattern.replace(/^\//, '').replace(/\/$/, '');
+  if (folder === '.genesis/*') return `add \`!.genesis/edd/\` after \`${pattern}\`, or ignore only \`.genesis/out/\` instead`;
+  if (folder === '.genesis' || folder === '.genesis/**') return `instead of \`${pattern}\`, ignore \`.genesis/*\` and add \`!.genesis/edd/\` after it, or ignore only \`.genesis/out/\``;
+  if (folder === 'openspec') return `remove \`${pattern}\`, or add \`!openspec/\` to the project's .gitignore after it`;
+  return `narrow \`${pattern}\` so it matches none of these files`;
+}
+
+// Which of those files a .gitignore rule keeps out of Git, such as a project
+// that ignores all of `.genesis/` or `openspec/`. Files already tracked still
+// count: the rule keeps every new package, report or acceptance out.
+// Read-only; nothing outside Git is ignored. Returns { paths, warning }: the
+// ignored ones, and a warning, or null.
+export function ignoredArtifacts(repo, name) {
+  const artifacts = committedArtifacts(name);
+  // -z gives each match as four fields, source, line, pattern and path, so a
+  // source with a colon in it, such as a Windows path with its drive letter,
+  // is read as it is. -v also prints a path a `!` rule matched last, which is
+  // not ignored.
+  const result = spawnSync('git', ['-C', repo, 'check-ignore', '--no-index', '-v', '-z', '--stdin'],
+    { input: Object.keys(artifacts).join('\0'), encoding: 'utf8', timeout: 10_000 });
+  const fields = [0, 1].includes(result.status) ? result.stdout.split('\0') : [];
+  const matches = [];
+  for (let index = 0; index + 3 < fields.length; index += 4) {
+    const [source, line, pattern, file] = fields.slice(index, index + 4);
+    if (!pattern.startsWith('!')) matches.push({ path: file, pattern, rule: `\`${pattern}\` in ${source}:${line}` });
+  }
+  if (!matches.length) return { paths: [], warning: null };
+  const paths = matches.map((entry) => entry.path);
+  const rules = [...new Set(matches.map((entry) => entry.rule))];
+  const lacks = [...new Set(paths.map((file) => artifacts[file]).filter(Boolean))];
+  const fixes = [...new Set(matches.map((entry) => ruleFix(entry.pattern)))];
+  return {
+    paths,
+    warning: `Git ignores files of this change that must be committed: ${paths.join(', ')} (${rules.length === 1 ? 'rule' : 'rules'} ${rules.join(', ')}).${lacks.length ? ` Without them a clone has no ${either(lacks)}.` : ''} Change ${rules.length === 1 ? 'the rule' : 'the rules'} so these files are committed: ${fixes.join('; ')}.`,
+  };
+}
+
+// Which of the given paths Git ignores and does not hold. Git lists a wholly
+// ignored, untracked folder once, even one that holds more than was asked for,
+// such as all of `.genesis/` with its run records: the paths asked for inside
+// it are named instead. A file deeper inside one of them is named only when a
+// rule ignores that folder itself (`ignoredFolders`, which the warning of
+// ignoredArtifacts names), as with new packages in a partly tracked folder.
+// Under a rule such as `*.log` or `.env` that keeps one file out on its own it
+// is not: no warning names that rule, and the file may hold a secret.
+function ignoredUntracked(repo, paths, ignoredFolders) {
+  const result = spawnSync('git', ['-C', repo, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory', '--', ...paths],
+    { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 * 1024 });
+  if (result.status !== 0) return [];
+  const folders = ignoredFolders.filter((item) => item.endsWith('/'));
+  return result.stdout.split('\0').filter(Boolean).flatMap((entry) => {
+    if (paths.includes(entry)) return [entry];
+    if (folders.some((folder) => entry.startsWith(folder))) return isLeftover(entry) ? [] : [entry];
+    return paths.filter((item) => item.startsWith(entry) && existsSync(path.join(repo, item)));
+  });
+}
+
+// The files of this change that Git does not hold as they are now: its Spec
+// folder, the OpenSpec project files, its eval packages, expected baseline
+// results, reports and acceptance, the project kit and the .gitignore of the
+// run records, including those a .gitignore rule keeps out. Ignored run
+// records, other ignored files and leftovers are not listed; a wholly
+// untracked folder is listed once, unless it holds only leftovers. null
+// without Git.
+export function uncommittedArtifacts(repo, name) {
+  const listed = gitStatus(repo, [`openspec/changes/${name}/`, 'openspec/config.yaml', 'openspec/genesis.json', `.genesis/edd/${name}/`,
+    '.genesis/edd/harness/', '.genesis/edd/.gitignore'], 'normal');
+  if (listed === null) return null;
+  // Git lists an untracked folder by its name alone, so its files are read.
+  const own = (entry) => !isLeftover(entry.file) && !(entry.code === '??' && entry.file.endsWith('/')
+    && (gitStatus(repo, [entry.file]) ?? [entry]).every((inside) => isLeftover(inside.file)));
+  const ignored = ignoredUntracked(repo, Object.keys(committedArtifacts(name)), ignoredArtifacts(repo, name).paths);
+  return [...new Set([...listed.filter(own).map((entry) => entry.file), ...ignored])].sort();
 }
 
 // The Map a Spec is written against is copied into its change folder, so it is
@@ -293,21 +415,68 @@ export function readMap(repo, mapFile, name) {
   }
   const freshness = mapFreshness(repo, document.source);
   if (freshness.warning) warnings.push(freshness.warning);
-  // Until Genesis describes a flow, its steps are named by lines of source code.
-  const steps = (Array.isArray(document.flows) ? document.flows : []).flatMap((flow) => (Array.isArray(flow?.steps) ? flow.steps : []));
-  const coded = steps.filter((step) => step?.support === 'static_fact').length;
+  const edited = editedMapFiles(repo, document.source);
+  if (edited) warnings.push(edited);
+  const coverage = mapCoverage(document.coverage);
+  if (coverage && coverage.entries_planned < coverage.entries_total) warnings.push(outsideFlows(coverage, skipReasons(document.coverage)));
+  const { coded, total } = codeNamedSteps(document.flows);
   if (coded) {
-    warnings.push(`${coded} of the ${steps.length} steps in this Map belong to flows Genesis has not described yet and are named from the source code: by a line of code, or by the entry point for a flow's trigger. The copy at ${mapCopy(name)} is committed with the Spec, so that code goes into Git too. If it should not, tell the user before anything is committed: describing those flows with \`/genesis map\` replaces those names.`);
+    warnings.push(`${coded} of the ${total} steps in this Map belong to flows Genesis has not described yet and are named from the source code: by a line of code, or by the entry point for a flow's trigger. The copy at ${mapCopy(name)} is committed with the Spec, so that code goes into Git too. If it should not, tell the user before anything is committed: describing those flows with \`/genesis map\` replaces those names.`);
   }
   return {
     bytes,
     record: {
       status: 'available', path: mapCopy(name), sha256: digest(bytes),
       snapshot_id: document.snapshot_id, analysis_status: document.analysis_status,
-      mode: mode ?? 'unknown', freshness: freshness.status,
+      mode: mode ?? 'unknown', freshness: freshness.status, ...(coverage ? { coverage } : {}),
     },
     warnings,
   };
+}
+
+// Until Genesis describes a flow, its steps are named by lines of source code.
+export function codeNamedSteps(flows) {
+  const steps = (Array.isArray(flows) ? flows : []).flatMap((flow) => (Array.isArray(flow?.steps) ? flow.steps : []));
+  return { coded: steps.filter((step) => step?.support === 'static_fact').length, total: steps.length };
+}
+
+// The entry counts of a Map's `coverage`, or null when it has none in the form
+// Genesis writes. Genesis marks a Map complete once the flows it planned are
+// finished, even when entries were left out of them.
+const COVERAGE = ['entries_total', 'entries_planned', 'entries_skipped', 'entries_unhandled'];
+function mapCoverage(coverage) {
+  if (typeof coverage !== 'object' || coverage === null || COVERAGE.some((key) => !Number.isInteger(coverage[key]) || coverage[key] < 0)) return null;
+  return Object.fromEntries(COVERAGE.map((key) => [key, coverage[key]]));
+}
+
+// How many skipped entries each reason covers, such as `2 budget, 1 test_helper`.
+function skipReasons(coverage) {
+  const reasons = (Array.isArray(coverage?.skipped_entries) ? coverage.skipped_entries : [])
+    .map((entry) => entry?.reason).filter((reason) => typeof reason === 'string' && reason);
+  const counts = new Map();
+  for (const reason of reasons.sort()) counts.set(reason, (counts.get(reason) ?? 0) + 1);
+  return counts.size ? [...counts].map(([reason, count]) => `${count} ${reason}`).join(', ') : null;
+}
+
+// The warning for entries outside a Map's planned flows, from its recorded
+// coverage counts.
+export function outsideFlows(coverage, reasons = null) {
+  const { entries_total: total, entries_planned: planned, entries_skipped: skipped, entries_unhandled: unhandled } = coverage;
+  const parts = [...(skipped ? [`${skipped} skipped${reasons ? ` (${reasons})` : ''}`] : []), ...(unhandled ? [`${unhandled} not handled`] : [])];
+  return `This Map's planned flows cover ${planned} of the ${total} entries Genesis found${parts.length ? `: ${parts.join(' and ')}` : ''}. Its analysis_status says whether those flows are finished, not whether the whole project is mapped. If the request touches an entry outside them, read its code, or map it with \`/genesis map\`.`;
+}
+
+// Files the Map was read from that have edits not committed yet. Freshness
+// compares the commit, while impact.md evidence is read from the working tree.
+function editedMapFiles(repo, source) {
+  const files = source?.files;
+  if (typeof files !== 'object' || files === null || Array.isArray(files)) return null;
+  const { head, changed } = codeState(repo);
+  if (!head || !changed) return null;
+  const edited = changed.filter((file) => Object.hasOwn(files, file));
+  if (!edited.length) return null;
+  const named = `${edited.slice(0, 5).join(', ')}${edited.length > 5 ? ', …' : ''}`;
+  return `${edited.length} of the files this Map was read from ${edited.length === 1 ? 'has' : 'have'} uncommitted edits (${named}). Its freshness compares commit ${short(head)}, not those edits, while impact.md evidence is read from the working tree. If the edits are not part of this request, the Map and that evidence may describe different code: tell the user.`;
 }
 
 const short = (commit) => commit.slice(0, 7);
@@ -393,11 +562,19 @@ function committedDigests(repo, commit, paths) {
 // A Genesis review of a finished change starts from the Map the Spec was
 // written against: it carries that Map's entries and flows, so the change
 // lands on the same flows on every clone. Null without a Map or a base commit.
-export function genesisReview(repo, name, map, base) {
+// Genesis leaves untracked files out unless told to include them, so new
+// modules the evals ran are reviewed only with --include-untracked. Genesis
+// compares the base commit with the working tree, so files that were already
+// uncommitted when the loop started are listed: their edits from before the
+// loop are not part of the change.
+export function genesisReview(repo, name, map, base, { untracked = false, uncommittedAtStart = [] } = {}) {
   if (!map || map.status !== 'available' || !base) return null;
   const copy = mapCopy(name);
   const from = existsSync(path.join(repo, copy)) ? copy : String(map.path).replaceAll('\\', '/');
-  return { base, entries_from: from, prepare: ['map', 'prepare', '--base', base, '--entries-from', from] };
+  return {
+    base, entries_from: from, prepare: ['map', 'prepare', '--base', base, '--entries-from', from, ...(untracked ? ['--include-untracked'] : [])],
+    ...(uncommittedAtStart.length ? { uncommitted_at_start: uncommittedAtStart } : {}),
+  };
 }
 
 export function captureContext(repo, mode, map = null) {

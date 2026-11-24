@@ -141,8 +141,9 @@ were sent" passes on missing evidence.
 ## Package identity
 
 A run records a digest of each package together with the kit; `Task.md` and
-`PROJECT.md` are prose and are left out. Results are compared only between runs
-of an identical package and kit, so changing an input, a check, the verifier,
-the adapter or a stand-in starts a new comparison instead of silently reusing an
-old baseline. The same digest decides whether the last `eval check` still
-counts.
+`PROJECT.md` are prose and are left out, and so are Python caches and the files
+an operating system or editor leaves behind: `.DS_Store`, `Thumbs.db`, `*.swp`,
+`*.swo` and `*~`. Results are compared only between runs of an identical
+package and kit, so changing an input, a check, the verifier, the adapter or a
+stand-in starts a new comparison instead of silently reusing an old baseline.
+The same digest decides whether the last `eval check` still counts.
