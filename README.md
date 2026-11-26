@@ -1,109 +1,123 @@
 # Genesis EDD
 
-Evaluation-driven development for coding agents: agree on what a feature must
-do, turn that into evals, and check your change against them.
+Turn a feature request into acceptance tests **before your coding agent changes the code**.
+Genesis EDD is an evaluation-driven development plugin for Claude Code and Codex.
+Agree on what the feature should do, then run the same checks on the original
+code and the agent's change. The results show what the change fixed and which
+behaviors still pass.
 
-Genesis EDD is a set of skills for Claude Code and Codex. Your coding agent does
-the reasoning; Genesis keeps what it produces structured and checks it. No
-Genesis service or extra model key is needed.
+## A failed report still sent a success notification
 
-## How it works
+Reportbot told the team their report was submitted even when the reporting
+service rejected it. The fix had to stop that message and keep the notification
+people expected after a successful submission. Here's what the two evals showed.
 
-1. **agent-spec.** Describe a feature in plain words. The agent writes a spec
-   with requirements and acceptance scenarios, asks only about decisions that
-   change what is accepted, and exports a fixed version.
-2. **write-eval.** Each scenario becomes a [Harbor](https://docs.harborframework.com)
-   task package with expected results taken from the spec. What all packages
-   of a project share, such as how your agent is started and what stands in for
-   its dependencies, is built once in a project kit. A package can run only
-   after its checking script has been proved against results whose verdict is
-   known.
-3. **run-eval.** Run the packages on the code before your change and after it,
-   and compare them check by check. A run that could not execute is reported as
-   such, never as a failed check.
-4. **loop-and-implement.** Change the code until the checks pass, within a
-   budget the user agrees to. The spec, the expected results and the baseline
-   stay fixed while the code changes. Every full run gets a short report; the
-   loop stops when the checks pass, the budget runs out, the same checks keep
-   failing, or the user must decide. Acceptance is the user's.
+| What the team should see | Before the fix | After the fix |
+| --- | --- | --- |
+| Submission rejected (HTTP 503) → no success notification | Fail · 1 sent | Pass · 0 sent |
+| Submission accepted (HTTP 201) → one success notification | Pass · 1 sent | Pass · 1 sent |
 
-The loop needs the project in Git. It records the code of every run and never
-commits for you.
-The skills start from ordinary requests. Each stage checks its inputs first and
-sends the agent back to the stage that owns a gap. It works in a new project or
-an existing one, and uses a Genesis Map when you have one: a copy goes into Git
-with the spec, with a note of whether the Map still matched the code. When the
-loop's final review asks Genesis to review the change, Genesis starts from that
-copy, so every clone puts the change on the same flows. Both need a Map and a
-Genesis from commit `9c0c914` on
-([GenesisAgentInfra/genesis#45](https://github.com/GenesisAgentInfra/genesis/pull/45)),
-which records what a Map covers (`mode`) and the code it was read from
-(`source`), and lets a review start from a committed Map (`--entries-from`). A
-Map from an earlier Genesis is still accepted, recorded with mode `unknown` and
-freshness `unverified`.
+The check reads the service’s record of submissions and notifications. If the bot
+never submits the report, zero notifications alone would look correct. Genesis
+records that case as `unknown`. The example includes the two evals, seven fixtures
+with known answers, and the results of running them locally with Docker and Harbor.
+[See the worked example and recorded run](skills/write-eval/examples/reportbot/README.md#what-ran).
 
-## Install
+## Quick start
 
-You need **Node.js 22.20.0 or later**.
+### Install
 
-### Claude Code
+You'll need **Node.js 22.20.0 or later**. Choose the plugin for your coding agent.
+
+**Claude Code** — enter these in a Claude Code session, then start a new session.
 
 ```text
 /plugin marketplace add GenesisAgentInfra/genesis-edd
 /plugin install genesis-edd@genesis-edd
 ```
 
-Or from your shell:
+From a shell, the equivalent Claude Code commands are
+`claude plugin marketplace add GenesisAgentInfra/genesis-edd` and
+`claude plugin install genesis-edd@genesis-edd`.
 
-```bash
-claude plugin marketplace add GenesisAgentInfra/genesis-edd
-```
+**Codex** — run these in your terminal, then open a new Codex session.
 
-```bash
-claude plugin install genesis-edd@genesis-edd
-```
-
-Start a new session afterwards.
-
-### Codex
-
-```bash
+```sh
 codex plugin marketplace add GenesisAgentInfra/genesis-edd
-```
-
-```bash
 codex plugin add genesis-edd@genesis-edd
 ```
 
-The first time a skill runs, it installs two pinned npm packages inside the
-plugin folder. Codex's sandbox cannot write there, so Codex may ask you to
-approve that one command.
+On first use the plugin installs its pinned npm dependencies. Codex may ask for
+permission to write them into the plugin directory.
 
-### In your project
+### Use
 
-Nothing to set up with the plugin. The first time you use `agent-spec` in a
-project, the agent creates an `openspec/` folder there.
+Open your project in Claude Code or Codex. Give it one behavior you want to
+change and one you want to preserve. For a project like Reportbot, you could ask the following.
+
+```text
+When a report submission fails, nobody should get a success notification.
+When it succeeds, the team should still get exactly one. Write the spec
+and acceptance scenarios for these two cases before changing the code.
+```
+
+The agent creates an OpenSpec change under `openspec/changes/`. Read the
+scenarios and settle any open questions. You can do this part with just the plugin.
+To select the skill explicitly, use `/genesis-edd:agent-spec` in Claude Code
+(`/agent-spec` for a checkout install), or type `$` in Codex and choose `agent-spec`.
+
+To run the evals, start **Docker** and install **[Harbor](https://docs.harborframework.com)**
+with `uv tool install harbor`. For the implementation loop, work in a Git repository.
+Continue in the same session.
+
+```text
+Write the evals for the agreed spec and check them against known outcomes.
+Run them on the current code to record a baseline. Then implement the fix
+and run the same evals again. Stop after five runs and show me what changed.
+```
+
+Read the before-and-after results in `.genesis/edd/<change>/reports/`.
+The spec, checks and baseline stay fixed during the loop. You decide whether
+to accept the change.
+
+## How it works
+
+| Skill | What it gives you |
+| --- | --- |
+| [agent-spec](skills/agent-spec/SKILL.md) | An OpenSpec feature spec with the source of each requirement, acceptance scenarios and a validated export. |
+| [write-eval](skills/write-eval/SKILL.md) | One Harbor task per scenario. The tasks share a project harness and each verifier is checked against fixtures with known outcomes. |
+| [run-eval](skills/run-eval/SKILL.md) | A baseline and a check-by-check comparison with the changed code. The record distinguishes a failed expectation from an eval that could not run. |
+| [loop-and-implement](skills/loop-and-implement/SKILL.md) | An implementation and a report for each full run. The agent stops when the checks pass, the agreed budget runs out, progress stalls or it needs your decision. |
+
+The loop records the Git revision and local changes for each run. You control
+commits and acceptance. Genesis uses your coding agent for reasoning and does
+not require a separate Genesis service or model key.
+
+## Setup options
 
 ### Docker and Harbor
 
-Writing specs and packages works without them. Proving packages
-(`eval check`), running them and the implementation loop need:
+You can write specs and task packages before setting up Docker. Checking the
+verifiers (`eval check`), running evals and iterating on the results require
+a running Docker daemon and Harbor. You can also run Harbor through `uvx` by setting
+this environment variable in the shell where you launch your agent.
 
-- Docker, running.
-- Harbor. Install it with `uv tool install harbor`, or run it without a global
-  install by setting
-  `GENESIS_EDD_HARBOR='["uvx","--from","harbor","harbor"]'`.
+```sh
+export GENESIS_EDD_HARBOR='["uvx","--from","harbor","harbor"]'
+```
 
 ### Genesis Map
 
-Optional: Genesis EDD works without a Map. To use one, install
-[Genesis](https://github.com/GenesisAgentInfra/genesis) and map the project
-with it before writing a spec. A Map that records what it covers (`mode`) and
-the code it was read from (`source`), and a final review that starts from the
-Map's committed copy (`--entries-from`), need a Genesis from commit `9c0c914`
-on. If `genesis map prepare` rejects `--entries-from`, update Genesis as its
-[install guide](https://github.com/GenesisAgentInfra/genesis/blob/main/docs/install.md#update)
-says.
+If you already use [Genesis Map](https://github.com/GenesisAgentInfra/genesis),
+map your project before writing the spec. EDD saves a copy of the map with the
+spec so a final change review can use the same business flows. The four EDD
+skills also work on their own.
+
+Map coverage, source information and reviews based on a committed map require
+Genesis Map commit `9c0c914` or later. EDD accepts older maps with coverage
+marked `unknown` and freshness marked `unverified`. If `genesis map prepare`
+rejects `--entries-from`, follow the
+[Genesis Map update instructions](https://github.com/GenesisAgentInfra/genesis/blob/main/docs/install.md#update).
 
 <details>
 <summary>Install into one project from a checkout</summary>
@@ -152,33 +166,11 @@ earlier install's skill folders are in Git, `init` names them and the
 
 </details>
 
-## Use
-
-Ask for what you want; the matching skill starts.
-
-```text
-I want to add report notifications. When report submission fails, do not send a
-success notification. Help me write the requirements and acceptance scenarios.
-```
-
-```text
-Write evals for the report notifications spec.
-```
-
-```text
-Record the baseline, then implement the change until the evals pass. Stop after
-five runs.
-```
-
-Whether a skill starts on its own is up to your coding agent. To choose one
-explicitly, use `/genesis-edd:agent-spec` in Claude Code (`/agent-spec` for a
-project install), or type `$` in Codex and pick the skill.
-
 ## What it writes in your project
 
 | Path | Holds | In Git |
 | --- | --- | --- |
-| `openspec/` | specs, their exported versions, and the Genesis Map each was written against (`business-map.json`) | yes |
+| `openspec/` | specs, their exported versions, and any Genesis Map they were written against (`business-map.json`) | yes |
 | `.genesis/edd/.gitignore` | keeps the package proofs, run records and loop state below out of Git; lines you add are kept | yes |
 | `.genesis/edd/harness/` | the project kit shared by every eval package | yes |
 | `.genesis/edd/<change>/evals/` | one Harbor task package per scenario | yes |
@@ -199,15 +191,6 @@ Do not ignore `openspec/` or all of `.genesis/` in your `.gitignore`: the
 files marked yes would stay out of Git, and Genesis EDD warns when they do. To
 keep other output under `.genesis/` out of Git, ignore `.genesis/*` and add
 `!.genesis/edd/` after it, or ignore only `.genesis/out/`.
-
-## Skills
-
-| Skill | Purpose | Status |
-| --- | --- | --- |
-| `agent-spec` | Clarify requirements, write acceptance scenarios, export a validated spec | Available |
-| `write-eval` | Turn an exported spec into eval packages and prove their checks | Available |
-| `run-eval` | Run eval packages and compare the baseline with later runs | Available |
-| `loop-and-implement` | Implement the change and iterate on eval results until the checks pass | Available |
 
 ## Update
 
