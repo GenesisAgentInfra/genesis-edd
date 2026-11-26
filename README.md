@@ -1,4 +1,4 @@
-# Genesis EDD
+# Genesis EDD is the world’s first eval-driven development framework for software products.
 
 Genesis EDD is a **spec-driven development** plugin for Claude Code and Codex.
 Use OpenSpec to describe the scenarios a feature should handle. Your coding agent
