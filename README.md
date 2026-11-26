@@ -1,10 +1,10 @@
 # Genesis EDD
 
-Turn a feature request into acceptance tests **before your coding agent changes the code**.
-Genesis EDD is an evaluation-driven development plugin for Claude Code and Codex.
-Agree on what the feature should do, then run the same checks on the original
-code and the agent's change. The results show what the change fixed and which
-behaviors still pass.
+Genesis EDD is a **spec-driven development** plugin for Claude Code and Codex.
+Use OpenSpec to describe the scenarios a feature should handle. Your coding agent
+turns those scenarios into runnable acceptance tests before it changes the code.
+On an existing project, run the same tests before and after the change to see
+what it fixed and which behaviors still pass.
 
 ## A failed report still sent a success notification
 
@@ -77,8 +77,8 @@ and run the same evals again. Stop after five runs and show me what changed.
 ```
 
 Read the before-and-after results in `.genesis/edd/<change>/reports/`.
-The spec, checks and baseline stay fixed during the loop. You decide whether
-to accept the change.
+During this evaluation-driven development (EDD) loop, the spec, checks and
+baseline stay fixed. You decide whether to accept the change.
 
 ## How it works
 
