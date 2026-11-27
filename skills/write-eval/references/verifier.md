@@ -58,3 +58,9 @@ the evidence store directly.
 
 A script that exits nonzero is a broken fixture, and the check fails. Record the
 evidence for each check; a result without evidence cannot be audited.
+
+A reviewer adds a counterexample for every line a program checks, written
+without reading the verifier (`review.md`). It fails only its line: the
+gating checks of that line expect `fail`, every other gating check `pass` or
+`unknown`. When the verifier does not return what a counterexample expects,
+the verifier is wrong: fix the verifier, never the counterexample.

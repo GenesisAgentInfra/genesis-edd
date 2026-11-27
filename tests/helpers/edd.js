@@ -4,14 +4,15 @@
 // the verifier's results (see fake-harbor.mjs). Rewriting it is changing the code.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ROOT, initProject, projectRoot, readJSON } from '../../src/project.js';
 import { exportSpec, newSpec } from '../../src/spec.js';
-import { newEval } from '../../src/eval.js';
+import { newEval, reviewFile } from '../../src/eval.js';
 import { checkEval } from '../../src/run.js';
+import { confirmEval, reviewEval } from '../../src/confirm.js';
 
 export const CHANGE = 'report-notifications';
 export const AGENT = 'app_agent:AppAgent';
@@ -153,6 +154,31 @@ process.exit(done.status ?? 1);
   process.env.GENESIS_EDD_HARBOR = JSON.stringify([process.execPath, file]);
 }
 
+// Points GENESIS_EDD_HARBOR at a Harbor that, while the `run` call of package
+// id runs the fake one, has file (a path in the project) hold text, and puts
+// the file back as it was once that call is done: an edit made and undone
+// from another shell during a run. tools.harbor(true) goes back to the plain
+// fake, and useFakeTools restores the command when the test ends.
+export function harborWhile(t, id, file, text) {
+  useFakeTools(t);
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-harbor-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const wrapper = path.join(directory, 'harbor.mjs');
+  writeFileSync(wrapper, `import { spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+const argv = process.argv.slice(2);
+const at = argv.indexOf('-p');
+const target = argv[0] === 'run' && at >= 0 && path.basename(argv[at + 1]) === ${JSON.stringify(id)} ? path.join(process.env.GENESIS_EDD_REPO, ${JSON.stringify(file)}) : null;
+const kept = target ? readFileSync(target) : null;
+if (kept) writeFileSync(target, ${JSON.stringify(text)});
+const done = spawnSync(process.execPath, [${JSON.stringify(FAKE_HARBOR)}, ...argv], { stdio: 'inherit' });
+if (kept) writeFileSync(target, kept);
+process.exit(done.status ?? 1);
+`);
+  process.env.GENESIS_EDD_HARBOR = JSON.stringify([process.execPath, wrapper]);
+}
+
 // Git in the project with a fixed test identity. Fails the test on a non-zero exit.
 export function git(repo, args) {
   const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
@@ -189,18 +215,75 @@ export function connect(repo, id) {
   writeFileSync(path.join(packageDirectory(repo, id), 'instruction.md'), `Submit the weekly report for scenario ${id}, then stop.\n`);
 }
 
-// Fills every file eval validate needs, except instruction.md when connected is false.
-function fillPackage(repo, id, connected) {
+// Rewrites a package's tests/checks.json with change(declared), which edits it
+// in place or returns the new content. Returns what was written.
+export function editChecks(repo, id, change) {
+  const file = path.join(packageDirectory(repo, id), 'tests/checks.json');
+  const declared = readJSON(file);
+  const written = change(declared) ?? declared;
+  writeFileSync(file, `${JSON.stringify(written, null, 2)}\n`);
+  return written;
+}
+
+// checks.json as a package written in checks.json 1.0 has it: no then, no
+// scenario.manual, and no fixture origin or note.
+export function toLegacy(declared) {
+  const { manual, ...scenario } = declared.scenario ?? {};
+  return { ...declared, schema_version: '1.0', scenario,
+    checks: declared.checks.map(({ then, ...check }) => check),
+    fixtures: declared.fixtures.map(({ origin, note, ...fixture }) => fixture) };
+}
+
+// Takes a check out of checks.json, and out of what each fixture expects.
+export function dropCheck(declared, id) {
+  declared.checks = declared.checks.filter((check) => check.id !== id);
+  for (const fixture of declared.fixtures) delete fixture.expect[id];
+  return declared;
+}
+
+// The warning eval validate gives for packages still in checks.json 1.0.
+export function legacyWarning(ids) {
+  const one = ids.length === 1;
+  return `${ids.join(', ')} ${one ? 'uses' : 'use'} checks.json 1.0: ${one ? 'its' : 'their'} checks do not name the THEN lines they verify, so whether every line is checked is not known, and ${one ? 'it has' : 'they have'} no reviewer counterexamples; \`eval confirm\` needs 1.1. This is a warning until the next \`loop start\`, which refuses 1.0 packages. Upgrade ${one ? 'it' : 'them'} to 1.1 before recording the baseline; task-package.md says how. The upgrade changes ${one ? 'the package' : 'each package'}, so a baseline recorded before it compares nothing with ${one ? 'it' : 'them'}.`;
+}
+
+// The dependency a package declares in these tests when it is live.
+export const LIVE_DEPENDENCY = { name: 'model', mode: 'live', note: 'Synthetic model call.' };
+
+// The reviewer's counterexamples of a package's checks.json: for each THEN line
+// its gating checks verify, review-<first check> fails that line's checks and
+// passes every other gating check. Returns the fixtures, without scripts.
+export function reviewFixtures(declared) {
+  const gating = declared.checks.filter((check) => check.role === 'gating' && typeof check.then === 'string');
+  const lines = [...new Set(gating.map((check) => check.then))];
+  return lines.map((then) => {
+    const own = gating.filter((check) => check.then === then).map((check) => check.id);
+    return { name: `review-${own[0].toLowerCase()}`, origin: 'review', note: `Synthetic counterexample for ${then}.`,
+      expect: Object.fromEntries(gating.map((check) => [check.id, own.includes(check.id) ? 'fail' : 'pass'])) };
+  });
+}
+
+// Writes a synthetic script for each named fixture of a package.
+export function writeFixtureScripts(repo, id, names) {
+  const directory = path.join(packageDirectory(repo, id), 'tests/fixtures');
+  mkdirSync(directory, { recursive: true });
+  for (const name of names) {
+    writeFileSync(path.join(directory, `${name}.sh`), `#!/bin/sh\n# Synthetic fixture: leaves a state the verifier judges as ${name}.\nexit 0\n`, { mode: 0o755 });
+  }
+}
+
+// Fills every file eval validate needs, except instruction.md when connected is
+// false. A live package declares LIVE_DEPENDENCY. Every gating line gets a
+// reviewer's counterexample (reviewFixtures).
+function fillPackage(repo, id, connected, live) {
   const directory = packageDirectory(repo, id);
   const file = path.join(directory, 'tests/checks.json');
   const declared = readJSON(file);
   const ids = declared.checks.map((check) => check.id);
-  declared.fixtures = FIXTURES.map((name) => ({ name, expect: Object.fromEntries(ids.map((check) => [check, name])) }));
+  declared.fixtures = [...FIXTURES.map((name) => ({ name, expect: Object.fromEntries(ids.map((check) => [check, name])) })), ...reviewFixtures(declared)];
+  if (live) declared.dependencies = [LIVE_DEPENDENCY];
   writeFileSync(file, `${JSON.stringify(declared, null, 2)}\n`);
-  mkdirSync(path.join(directory, 'tests/fixtures'), { recursive: true });
-  for (const name of FIXTURES) {
-    writeFileSync(path.join(directory, 'tests/fixtures', `${name}.sh`), `#!/bin/sh\n# Synthetic fixture: leaves a state the verifier judges as ${name}.\nexit 0\n`, { mode: 0o755 });
-  }
+  writeFixtureScripts(repo, id, declared.fixtures.map((fixture) => fixture.name));
   mkdirSync(path.join(directory, 'environment'), { recursive: true });
   writeFileSync(path.join(directory, 'environment/Dockerfile'), 'FROM alpine:3.20\nWORKDIR /app\n');
   writeFileSync(path.join(directory, 'tests/test.sh'), `#!/bin/sh
@@ -224,15 +307,40 @@ finish
 //   check: true                     run checkEval; it must pass when anything is finished
 //   map: null                       a business-map.json object for spec new --map
 //   parent: os.tmpdir()             the folder the project is created in
+//   live: []                        package ids that declare a live dependency
+//                                   (LIVE_DEPENDENCY), so a baseline needs --attempts
+//   model: null                     the model harness.json names beside the agent
+//   confirm: check                  confirm the checks after eval check (confirmChecks),
+//                                   committing review.json and confirmed.json with commit
+//   attempts: 3 when live or model  the number of attempts the confirmation fixes
 // Returns { repo, name, tools, packages: { id: [check ids] }, check (checkEval result
-// or null), root (.genesis/edd/<change>), runs (its runs/ folder) }.
+// or null), confirmation (confirmEval result or null), root (.genesis/edd/<change>),
+// runs (its runs/ folder) }.
+//
+// Building a project takes about two seconds, so each test process builds every
+// distinct set of options once, as a template, and gives each test its own copy
+// of it (see copyTemplate). A copy is the project a build would give: no file in
+// it holds its own path, and the template's Harbor calls are added to this
+// test's tools.calls() with the copy's paths. Options that are not plain data, a
+// parent, a changed Harbor or Docker, or a Git configuration build the project
+// as before.
 export function readyProject(t, options = {}) {
   const { mode = 'existing', spec = 'two', results = BEFORE, unconnected = [], commit: committed = true, check = true, map = null,
-    parent = os.tmpdir() } = options;
+    parent = os.tmpdir(), live = [], model = null } = options;
+  const { confirm = check, attempts = live.length || model ? 3 : undefined } = options;
   if (!SPECS[spec]) throw new Error(`spec must be one of ${Object.keys(SPECS).join(', ')}.`);
   const tools = useFakeTools(t);
+  const settings = { mode, spec, results, unconnected, committed, check, map, live, model, confirm, attempts };
+  const key = options.parent === undefined ? templateKey(settings, tools) : null;
+  const template = key === null ? null : templates.get(key) ?? makeTemplate(key, settings, tools);
+  if (template?.copyable) return copyTemplate(t, template, tools);
   const repo = projectRoot(mkdtempSync(path.join(parent, 'genesis-edd-project-')));
   t.after(() => rmSync(repo, { recursive: true, force: true }));
+  return buildProject(repo, tools, settings);
+}
+
+function buildProject(repo, tools, settings) {
+  const { mode, spec, results, unconnected, committed, check, map, live, model, confirm, attempts } = settings;
   git(repo, ['init', '-q', '-b', 'main']);
   git(repo, ['config', 'user.name', 'Genesis Test']);
   git(repo, ['config', 'user.email', 'test@example.invalid']);
@@ -250,13 +358,13 @@ export function readyProject(t, options = {}) {
   newEval(repo, CHANGE);
   const root = path.join(repo, '.genesis/edd', CHANGE);
   const kit = path.join(repo, '.genesis/edd/harness');
-  writeFileSync(path.join(kit, 'harness.json'), `${JSON.stringify({ agent: AGENT }, null, 2)}\n`);
+  writeFileSync(path.join(kit, 'harness.json'), `${JSON.stringify({ agent: AGENT, ...(model ? { model } : {}) }, null, 2)}\n`);
   writeFileSync(path.join(kit, 'PROJECT.md'), '# Eval notes for this project\n\nSynthetic project. app/results.json stands in for the application.\n');
   const ids = readdirSync(path.join(root, 'evals')).sort();
-  for (const id of unconnected) if (!ids.includes(id)) throw new Error(`No package named ${id}; packages are ${ids.join(', ')}.`);
+  for (const id of [...unconnected, ...live]) if (!ids.includes(id)) throw new Error(`No package named ${id}; packages are ${ids.join(', ')}.`);
   const packages = {};
   for (const id of ids) {
-    fillPackage(repo, id, !unconnected.includes(id));
+    fillPackage(repo, id, !unconnected.includes(id), live.includes(id));
     packages[id] = readJSON(path.join(root, 'evals', id, 'tests/checks.json')).checks.map((entry) => entry.id);
   }
   setResults(repo, results);
@@ -266,7 +374,141 @@ export function readyProject(t, options = {}) {
     checked = checkEval(repo, CHANGE);
     if (checked.cases.length) assert.equal(checked.passed, true, `eval check failed: ${JSON.stringify(checked, null, 2)}`);
   }
-  return { repo, name: CHANGE, tools, packages, check: checked, root, runs: path.join(root, 'runs') };
+  const project = { repo, name: CHANGE, tools, packages, check: checked, confirmation: null, root, runs: path.join(root, 'runs') };
+  if (confirm) {
+    project.confirmation = confirmChecks(project, { attempts });
+    if (committed) commitConfirmation(repo);
+  }
+  return project;
+}
+
+// Templates of this test process by key, and the folder that holds them until
+// the process exits.
+const templates = new Map();
+let templateFolder = null;
+const FAKE_HARBOR_COMMAND = JSON.stringify([process.execPath, FAKE_HARBOR]);
+// Variables useFakeTools sets for every test, or that hold a path of the test.
+const PER_TEST = new Set(['GENESIS_EDD_HARBOR', 'FAKE_HARBOR_LOG', 'FAKE_DOCKER_DOWN', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'PATH']);
+
+// Numbers, strings, booleans, null, and arrays and plain objects of them.
+function plainData(value) {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean' || value === undefined) return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(plainData);
+  if (typeof value !== 'object') return false;
+  const prototype = Object.getPrototypeOf(value);
+  return (prototype === Object.prototype || prototype === null) && Object.values(value).every(plainData);
+}
+
+// The template key of a build, or null when the build must not be shared: the
+// options are not plain data, or the test changed what a build reads besides
+// them (the Harbor command, Docker, its Git configuration).
+function templateKey(settings, tools) {
+  if (!plainData(settings)) return null;
+  if (process.env.GENESIS_EDD_HARBOR !== FAKE_HARBOR_COMMAND || process.env.FAKE_DOCKER_DOWN !== undefined) return null;
+  if (process.env.FAKE_HARBOR_LOG !== tools.log || readFileSync(tools.gitConfig, 'utf8') !== '') return null;
+  // Everything else the build or Git could read from the environment is part of the key.
+  const env = Object.fromEntries(Object.keys(process.env).sort()
+    .filter((name) => !PER_TEST.has(name) && /^(GIT_|GENESIS_EDD_|FAKE_|PYTHON)/.test(name)).map((name) => [name, process.env[name]]));
+  return JSON.stringify({ settings, env, path: process.env.PATH.split(path.delimiter).slice(1) });
+}
+
+// Builds the project of these settings in the template folder, with its Harbor
+// calls logged apart. A template is copyable when no file in it, Git's own
+// files included, names the template folder or the builder's tools folder, and
+// none is a symbolic link. Otherwise every test builds its project as before.
+function makeTemplate(key, settings, tools) {
+  if (!templateFolder) {
+    templateFolder = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-templates-'));
+    const folder = templateFolder;
+    process.on('exit', () => rmSync(folder, { recursive: true, force: true }));
+  }
+  const given = mkdtempSync(path.join(templateFolder, 'genesis-edd-project-'));
+  const repo = projectRoot(given);
+  const log = `${repo}.harbor-calls.jsonl`;
+  const saved = process.env.FAKE_HARBOR_LOG;
+  process.env.FAKE_HARBOR_LOG = log;
+  let project;
+  try {
+    project = buildProject(repo, tools, settings);
+  } catch (error) {
+    rmSync(repo, { recursive: true, force: true });
+    throw error;
+  } finally {
+    process.env.FAKE_HARBOR_LOG = saved;
+  }
+  // The template's folders, and the tools folder of the test that built it.
+  const marks = [...new Set([path.basename(templateFolder), path.basename(repo), path.basename(path.dirname(tools.log))])];
+  const data = Object.fromEntries(Object.entries(project).filter(([name]) => name !== 'tools'));
+  const template = { repo, given, data, calls: existsSync(log) ? readFileSync(log, 'utf8') : '', marks, copyable: !mentions(repo, marks) };
+  templates.set(key, template);
+  return template;
+}
+
+// Whether any file under the folder holds one of the marks, or is a symbolic link.
+function mentions(folder, marks) {
+  for (const entry of readdirSync(folder, { withFileTypes: true })) {
+    const file = path.join(folder, entry.name);
+    if (entry.isSymbolicLink()) return true;
+    if (entry.isDirectory() ? mentions(file, marks) : marks.some((mark) => readFileSync(file, 'latin1').includes(mark))) return true;
+  }
+  return false;
+}
+
+// A test's own copy of a template, in a new folder of os.tmpdir() as a build
+// makes it. Paths of the template, as given and as resolved (/var and
+// /private/var on macOS), become the copy's in the returned project and in the
+// Harbor calls added to tools.calls(). Git's index is refreshed, since the
+// copied files have other inodes and times than the index recorded.
+function copyTemplate(t, template, tools) {
+  const given = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-project-'));
+  const repo = projectRoot(given);
+  t.after(() => rmSync(repo, { recursive: true, force: true }));
+  cpSync(template.repo, repo, { recursive: true, verbatimSymlinks: true });
+  if (existsSync(path.join(repo, '.git/index'))) {
+    const refreshed = spawnSync('git', ['-C', repo, 'update-index', '-q', '--refresh'], { encoding: 'utf8' });
+    assert.equal(refreshed.error, undefined, `git update-index: ${refreshed.error?.message}`);
+  }
+  const pairs = [[template.repo, repo], [template.given, given]];
+  const rewrite = (text) => pairs.reduce((value, [from, to]) => value.replaceAll(from, to), text);
+  const copy = (value) => (typeof value === 'string' ? rewrite(value) : Array.isArray(value) ? value.map(copy)
+    : value !== null && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([name, item]) => [name, copy(item)])) : value);
+  const calls = rewrite(template.calls);
+  const data = copy(template.data);
+  const left = template.marks.filter((mark) => calls.includes(mark) || JSON.stringify(data).includes(mark));
+  if (left.length) throw new Error(`readyProject: the copy of a template still names ${left.join(', ')}; build this project without the template.`);
+  if (calls) appendFileSync(tools.log, calls);
+  const { name, packages, check, confirmation, root, runs } = data;
+  return { repo, name, tools, packages, check, confirmation, root, runs };
+}
+
+// Commits review.json and confirmed.json, and nothing else.
+export function commitConfirmation(repo, message = 'Confirm the checks') {
+  const files = [reviewFile(repo, CHANGE), path.join(repo, '.genesis/edd', CHANGE, 'confirmed.json')].map((file) => path.relative(repo, file));
+  git(repo, ['add', '--', ...files]);
+  git(repo, ['commit', '-q', '-m', message, '--', ...files]);
+}
+
+// Records the user's confirmation of the checks as the skills do: review.json
+// written from eval review's review_template, with every line faithful (a
+// scenario.manual line not_observable) unless verdict(line) says otherwise,
+// and every changed package answered as not loosening a line. Options: reason
+// (for a revision), verdict, origin ('review'), attempts, agent, model,
+// iterations, minutes, by ('Test User'), ref ('test setup'). Returns the
+// confirmEval result; it throws a refusal as confirmEval does.
+export function confirmChecks(project, options = {}) {
+  const { repo } = project;
+  const { verdict = () => undefined, origin = 'review', by = 'Test User', ref = 'test setup', ...plan } = options;
+  const review = reviewEval(repo, CHANGE);
+  const manual = new Set(review.lines.filter((line) => line.status === 'manual').map((line) => `${line.package}\n${line.then}`));
+  const answers = { ...review.review_template, review: { origin, note: 'Synthetic review.' },
+    lines: review.review_template.lines.map((line) => ({ ...line,
+      verdict: verdict(line) ?? (manual.has(`${line.package}\n${line.then}`) ? 'not_observable' : 'faithful'), note: line.note ?? 'Synthetic verdict.' })),
+    ...(review.review_template.packages ? { packages: review.review_template.packages.map((item) => ({ ...item, loosens: false, note: 'Synthetic diff review.' })) } : {}) };
+  const file = reviewFile(repo, CHANGE);
+  writeFileSync(file, `${JSON.stringify(answers, null, 2)}\n`);
+  const defined = Object.fromEntries(Object.entries(plan).filter(([, value]) => value !== undefined));
+  return confirmEval(repo, CHANGE, { verdicts: file, by, ref, ...defined });
 }
 
 // An --expect file for a baseline. expected is { '<case>/<check>': 'pass' | 'fail' | 'any' },

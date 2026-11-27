@@ -49,7 +49,7 @@ reportbot/__main__.py                 the program, before the change
 
 ## What ran
 
-With Harbor 0.26 in local Docker:
+With Harbor 0.26 in local Docker, and again with Harbor 0.27.0:
 
 | Step | Result |
 | --- | --- |
@@ -57,3 +57,11 @@ With Harbor 0.26 in local Docker:
 | `run start --baseline --expect …` | `submit-failure-s1` c1 `fail`, `submit-success-s1` c1 `pass`; no mismatch |
 | the fix: notify only after a 2xx response | 4 lines in `reportbot/__main__.py` |
 | `run start` | verdict `pass`; c1 `fail` to `pass` and c1 `pass` to `pass`, both `holds` |
+
+The packages ran as checks.json 1.0. They are shown in 1.1, which names the
+THEN line each check verifies (`then`) and says who wrote each fixture and what
+it leaves (`origin`, `note`); the checks a run reads are the same. Every
+fixture here is the author's: the packages have no reviewer's counterexample
+yet, which a checks.json 1.1 package needs before it is ready, so
+`eval validate` reports them missing `review` until a reviewer adds one per
+line, as `references/review.md` says.

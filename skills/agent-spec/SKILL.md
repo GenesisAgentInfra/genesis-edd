@@ -122,7 +122,10 @@ then proceed to writing and validation without a routine final approval round.
    scenarios and stable headings. Increment a file's revision when its meaning
    changes. When the user adds or corrects rules for the request you just
    exported, edit the same change, increment the revision and export again: the
-   earlier handoff stays as history and one feature keeps one spec. For a later,
+   earlier handoff stays as history and one feature keeps one spec. Exporting
+   again while an implementation loop runs for the change ends that loop: tell
+   the user. The eval packages are then updated in `write-eval` and confirmed
+   again before a new loop. For a later,
    separate iteration, prefer a new change and reference the accepted earlier
    spec; never silently replace the old expectation.
    Before validating, compare every `explicit` and `confirmed` block with its

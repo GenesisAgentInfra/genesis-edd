@@ -32,20 +32,28 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:469c2182dfc7f4e4b5c2252a28891379daaa7b4f873da1a149035aaea1e5d171',
     'sha256:8778cd7d6dc3c144e96c758f1f149b1ae35c530a3a52df42a5305a832c113142',
     'sha256:5bb03c4d492792be8498845b79b50593f3cac3d191bc0717620b0f913733f872',
+    'sha256:fd565bd5caf5b245490ad42877f15b860b5fa19784b00e4d94325503aa270338',
   ],
   'agent-spec/scripts/run.mjs': ['sha256:881a4b48652d858fa99c6cccacd9549910b64631152884beef6bb88a70fc1e9a'],
   'write-eval/SKILL.md': [
     'sha256:390f4c0a47e84b7d73a6317dbf9ed054d1879944fcfa38bd94016fd171bf889d',
     'sha256:51b2afec0e56f6e2cac81c2392a56917b356e44635ff4dbda80350c0daa93e12',
     'sha256:fb44a892188d2e01bcbc295d5119edd97bde2c63ce22f8bedb52e2d5f76d339a',
+    'sha256:bec188e1bf562a8129071249582ebf02b9caee890a2ba7658ab9dcbdfc165182',
+    'sha256:87be146556882da7a407d04acb24421ebe392c9d7aae689c97d73584c197e07d',
   ],
-  'write-eval/references/task-package.md': ['sha256:45ea9802b29191f985ea5b88227ebdd8ba6099355d80e3e90a68d2cdf97791df'],
+  'write-eval/references/task-package.md': [
+    'sha256:45ea9802b29191f985ea5b88227ebdd8ba6099355d80e3e90a68d2cdf97791df',
+    'sha256:d3b6a64a7a87de2785377f2f08374515ca822798c5e6244155aeb5fd4f1c41de',
+  ],
   'run-eval/SKILL.md': [
     'sha256:ffb9e10f3f25bffc007ed9381df23cb3d1e31b64dc8088352302158215f75ba7',
     'sha256:0f46f119fcc49a84dff2fd55274aee5ae5c80c9b4c7c99b5d3bc4999d01bded8',
     'sha256:8559cf63ec10a5d6323d1e620ab163f6c0619018536ec5653efb4507c070d021',
     'sha256:296897d67a464063536748a9365e914689072f50cf7b0decd3aceb929bc5b7e3',
     'sha256:6d91c065e882409f53dbc19356d718dd8bcb3fbd54f44e439c67d4f17d953b39',
+    'sha256:92517345f833a0de9a74347cf857391b6b9910aa87dedd70e7ab2a04c36762dc',
+    'sha256:9e3f1fc5a30250626efd6aa149966e98a7c6155599eb381cf7f38ecd98f65f80',
   ],
   'run-eval/references/run-records.md': [
     'sha256:0f2bafd0cf20299e5ab7d0f28ffbdbc657450d986d56cd708352ec1e761c5c61',
@@ -53,24 +61,41 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:c187814a77aa95d7a820159ac7475d86fca61b492ac6e025494a2c443b846998',
     'sha256:c907c59be9416c241534a85affd4475e4848f5ada7213ec5e596365d779c047d',
     'sha256:21a0764116d0cf70248da814001ee1ad252d4f70a620beb37224aef2fcbcdb66',
+    'sha256:7f402c9906fe836e36cc56dc5af0b6585a976dff37e895a7ca0e3ca1ee202a9d',
   ],
   'write-eval/references/harbor.md': [
     'sha256:560385a1e4ac0c91e0a1699c52b15ef5038181ec6cc9cf3e47bedaedebbabbfa',
     'sha256:bd52fadcf7d57fd7312862e0c401172e09ccfdc13fd12fe85331c9d915dd0887',
+    'sha256:ba2a636a5a9b63c032e89d61a831c30ae2d4dcb66dcb0daaaad9aec4b7cb0e99',
   ],
-  'write-eval/references/environment.md': ['sha256:50b827232d9df5f55ed603fc8d670440f5cd877b33f581b82aa7ee0768aaa964'],
+  'write-eval/examples/reportbot/README.md': ['sha256:bf5dd52a3ba5841323e7eac5907e852d8855fe6d3f277b9fd91ee112d8ee01f2'],
+  'write-eval/references/verifier.md': ['sha256:e39ea228b886880a82e39b1289db236ac8f454ed489219a0efe4739a2792d95a'],
+  'write-eval/references/environment.md': [
+    'sha256:50b827232d9df5f55ed603fc8d670440f5cd877b33f581b82aa7ee0768aaa964',
+    'sha256:2fdf829960bd1d0f9fe3f381f6991aa460ff828cbd6df72eb7ee513060c7eb77',
+  ],
   'loop-and-implement/SKILL.md': [
     'sha256:02d47d51ad3bcb6f8899622e70526fbf750a5047ce98661fd4df55e034356921',
     'sha256:1a71597ec5058d525133aec2936dec054800dc665d2769c9b1736417bce7ff9d',
     'sha256:bfa2ba559def320af39c227eaa3e4356ebeba2434585906c564cabe32f977450',
     'sha256:ea1eb703dbfd3abb9298d0f340a6d417a8c3c726ba2b1f9dbe638d58d100753b',
+    'sha256:e79cd72a62901799677e08255b33d091e99468ec43ea41bf11f4fb32211ced66',
+    'sha256:1e9e8d9d5d2b3b444fb229160fc26c9734dd5ebb4b4a4cb55d17c73b776eb9a4',
   ],
+  'loop-and-implement/references/causes.md': ['sha256:3f5b896818485b047912cbf99ee6f37e8595d9b8c9fa3a18d987c9c4eae5e6f1'],
   'agent-spec/references/spec-format.md': [
     'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
     'sha256:99a3389ea7a87d2c61077a5f81252d39f594d6e86d5ad21f939c779020b56619',
     'sha256:7fc70e45daeb8334e30c2c40d0dd18de1f8593f3987bbc4275fba63de4af8a58',
     'sha256:72dcc8e43234509dac8eec197e670fd4dd43a5111deba5a0a8eb4bdd88cb88e4',
     'sha256:6fb88d1b37864df50c624b2b4715edbc22a4f1135ec6c3a17f0fba34be3f2636',
+    'sha256:9405b14ef77b98654219f003e4a3d455efc77e70be2faa0546d562e3b1c18f8c',
+  ],
+  'write-eval/examples/reportbot/.genesis/edd/report-submission-notifications/evals/submit-failure-s1/tests/checks.json': [
+    'sha256:45dc740258bd10610c08cf72d899d076bc69a8563652eb1fd0ef641de375f7b2',
+  ],
+  'write-eval/examples/reportbot/.genesis/edd/report-submission-notifications/evals/submit-success-s1/tests/checks.json': [
+    'sha256:1d8f1d55c8505c1ee7df003995e12d4131d7e6622eea9d5caeb4ddb19329d472',
   ],
 };
 // Files Genesis itself writes are not changes to the application.
@@ -141,6 +166,13 @@ export function requireProject(repo) {
   const project = readJSON(file);
   if (project.version !== 1 || !['new', 'existing'].includes(project.mode)) {
     throw new Error('Invalid openspec/genesis.json.');
+  }
+  // A clone of a project committed without its schema cannot write or read a Spec.
+  const schemaRoot = path.join(ROOT, 'schemas', SCHEMA);
+  const missing = listFiles(schemaRoot).map((file) => `openspec/schemas/${SCHEMA}/${path.relative(schemaRoot, file)}`)
+    .filter((file) => !existsSync(localPath(repo, file)));
+  if (missing.length) {
+    throw new Error(`${missing.length === listFiles(schemaRoot).length ? `openspec/schemas/${SCHEMA}/ is missing` : `${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} missing`}, so OpenSpec cannot read this project's Specs. Run \`init --repo <app> --mode ${project.mode} --agent none\`: it restores the schema, keeps existing work and installs no skills. Then commit openspec/schemas/, so every clone has it.`);
   }
   return project;
 }
@@ -282,17 +314,21 @@ export function codeState(repo) {
 export const isLeftover = (file) => /^(?:\.DS_Store|Thumbs\.db)$|\.sw[op]$|~$/.test(path.basename(file));
 
 // Files of a change that belong in Git, each with what a clone lacks without
-// it: the change's Spec folder, the OpenSpec project files, the .gitignore
-// that keeps only the run records out, the project kit, and the change's eval
-// packages, expected baseline results, reports and acceptance.
+// it: the change's Spec folder, the OpenSpec project files and the Spec schema
+// they name, the .gitignore that keeps only the run records out, the project
+// kit, and the change's eval packages, expected baseline results, the
+// reviewer's verdicts, the user's checks confirmation, reports and acceptance.
 const committedArtifacts = (name) => ({
   [`openspec/changes/${name}/`]: 'Spec of this change',
   'openspec/config.yaml': 'OpenSpec project files',
   'openspec/genesis.json': 'OpenSpec project files',
+  [`openspec/schemas/${SCHEMA}/`]: 'Spec schema',
   '.genesis/edd/.gitignore': null,
   '.genesis/edd/harness/': 'project kit',
   [`.genesis/edd/${name}/evals/`]: 'eval packages',
   [`.genesis/edd/${name}/baseline-expectations.json`]: 'expected baseline results',
+  [`.genesis/edd/${name}/review.json`]: 'reviewer verdicts',
+  [`.genesis/edd/${name}/confirmed.json`]: 'checks confirmation',
   [`.genesis/edd/${name}/reports/`]: 'reports',
   [`.genesis/edd/${name}/accepted.json`]: 'acceptance record',
 });
@@ -364,15 +400,15 @@ function ignoredUntracked(repo, paths, ignoredFolders) {
 }
 
 // The files of this change that Git does not hold as they are now: its Spec
-// folder, the OpenSpec project files, its eval packages, expected baseline
-// results, reports and acceptance, the project kit and the .gitignore of the
-// run records, including those a .gitignore rule keeps out. Ignored run
+// folder, the OpenSpec project files and schema, its eval packages, expected
+// baseline results, reports and acceptance, the project kit and the .gitignore
+// of the run records, including those a .gitignore rule keeps out. Ignored run
 // records, other ignored files and leftovers are not listed; a wholly
 // untracked folder is listed once, unless it holds only leftovers. null
 // without Git.
 export function uncommittedArtifacts(repo, name) {
-  const listed = gitStatus(repo, [`openspec/changes/${name}/`, 'openspec/config.yaml', 'openspec/genesis.json', `.genesis/edd/${name}/`,
-    '.genesis/edd/harness/', '.genesis/edd/.gitignore'], 'normal');
+  const listed = gitStatus(repo, [`openspec/changes/${name}/`, 'openspec/config.yaml', 'openspec/genesis.json', `openspec/schemas/${SCHEMA}/`,
+    `.genesis/edd/${name}/`, '.genesis/edd/harness/', '.genesis/edd/.gitignore'], 'normal');
   if (listed === null) return null;
   // Git lists an untracked folder by its name alone, so its files are read.
   const own = (entry) => !isLeftover(entry.file) && !(entry.code === '??' && entry.file.endsWith('/')

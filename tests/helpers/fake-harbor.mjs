@@ -28,6 +28,14 @@
 // leaves the check out of check-results.json; any other value is written as
 // given. "$reward" in a case object overrides the reward the verifier writes.
 // The reward is otherwise 1 when every gating check passed, else 0.
+// "$usage" in a case object, such as { "n_input_tokens": 10, "cost_usd": 0.01 },
+// is written as the trial's agent_result, as an adapter reports what it used.
+//
+// Every trial's result.json has started_at and finished_at, as Harbor writes
+// them: trial-<i> starts one second after trial-<i-1> finished. A trial takes
+// one second, or n seconds with "$seconds": n in its case object; under eval
+// check, with "$seconds": n on the fixture in checks.json (beside its name and
+// expect, which names check ids only). Nothing waits: only the times say so.
 //
 // When FAKE_HARBOR_LOG names a file, every call appends one JSON line with its
 // arguments and the environment Genesis EDD passes, so tests can assert on it.
@@ -86,9 +94,13 @@ function fixturePlan() {
     return { kind: 'exception', type: 'FileNotFoundError', message: `fixture script not found: ${script ?? '(GENESIS_EDD_FIXTURE is not set)'}` };
   }
   const name = path.basename(script).replace(/\.sh$/, '');
-  const expect = (declared.fixtures ?? []).find((fixture) => fixture?.name === name)?.expect ?? {};
-  return { kind: 'results', values: Object.fromEntries(checks.map((check) => [check.id, expect[check.id] ?? 'unknown'])) };
+  const fixture = (declared.fixtures ?? []).find((entry) => entry?.name === name);
+  const expect = fixture?.expect ?? {};
+  return { kind: 'results', values: Object.fromEntries(checks.map((check) => [check.id, expect[check.id] ?? 'unknown'])), ...seconds(fixture) };
 }
+
+// The seconds a trial takes, when the object gives them.
+const seconds = (given) => (typeof given?.$seconds === 'number' && given.$seconds >= 0 ? { seconds: given.$seconds } : {});
 
 function applicationResults() {
   const repo = process.env.GENESIS_EDD_REPO;
@@ -106,12 +118,18 @@ function applicationPlan(entry, attempt) {
     const value = given[check.id];
     return [check.id, (Array.isArray(value) ? value[attempt - 1] : value) ?? 'unknown'];
   }));
-  return { kind: 'results', values, ...(typeof given.$reward === 'number' ? { reward: given.$reward } : {}) };
+  return { kind: 'results', values, ...(typeof given.$reward === 'number' ? { reward: given.$reward } : {}),
+    ...(given.$usage !== null && typeof given.$usage === 'object' ? { usage: given.$usage } : {}), ...seconds(given) };
 }
 
 const fixture = options['-a'] === FIXTURE_AGENT;
 const results = fixture ? null : applicationResults();
 const job = path.join(options['-o'], options['--job-name'] ?? 'harbor');
+// The first attempt starts with this call; each later one, one second after
+// the one before it finished.
+const clock = Date.now();
+const at = (offset) => new Date(clock + offset * 1000).toISOString();
+let offset = 0;
 let status = 0;
 let written = 0;
 for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -128,7 +146,11 @@ for (let attempt = 1; attempt <= attempts; attempt += 1) {
   }
   const trial = path.join(job, `trial-${attempt}`);
   mkdirSync(trial, { recursive: true });
-  const outcome = { task_name: caseId, trial_name: `trial-${attempt}`, agent: options['-a'], model: options['-m'] ?? null };
+  const took = plan.seconds ?? 1;
+  const outcome = { task_name: caseId, trial_name: `trial-${attempt}`, agent: options['-a'], model: options['-m'] ?? null,
+    started_at: at(offset), finished_at: at(offset + took) };
+  offset += took + 1;
+  if (plan.usage) outcome.agent_result = plan.usage;
   if (plan.kind === 'exception') {
     outcome.exception_info = { exception_type: plan.type, exception_message: plan.message };
   } else {
