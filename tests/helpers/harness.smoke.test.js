@@ -15,9 +15,10 @@ test('the harness builds a ready project that a baseline and a head run compare 
   assert.equal(check.passed, true);
   assert.deepEqual(check.cases.map((item) => item.case), Object.keys(PACKAGES));
   assert.deepEqual(validateEval(repo, CHANGE).cases.map((item) => item.integration.state), ['ready', 'ready']);
-  // eval check ran every fixture with the fixture agent and the application root.
+  // eval check ran every fixture with the fixture agent and the application root:
+  // pass, fail and unknown, and a reviewer's counterexample for each of the three lines.
   const fixtures = tools.runs().filter((call) => call.argv.includes('genesis_fixture:FixtureAgent'));
-  assert.equal(fixtures.length, 6);
+  assert.equal(fixtures.length, 9);
   assert.ok(fixtures.every((call) => call.env.GENESIS_EDD_REPO === repo && call.env.GENESIS_EDD_FIXTURE.endsWith('.sh')));
 
   const expect = writeExpectations(repo, { 'submit-failure-s1/c1': 'fail', 'submit-success-s1/c1': 'pass', 'submit-success-s1/c2': 'pass' });
@@ -70,4 +71,17 @@ test('the fake tools can report Docker down, Harbor missing and Harbor errors', 
   const retry = startRun(repo, CHANGE, { baseline: true });
   assert.equal(retry.execution_status, 'error');
   assert.match(retry.cases[0].execution.reason, /^RuntimeError: /);
+});
+
+test('the fake Harbor writes increasing trial times and an adapter\'s reported usage', (t) => {
+  const { repo, runs } = readyProject(t, { spec: 'example', live: ['submit-failure-s1'],
+    results: { 'submit-failure-s1': { c1: 'fail', $usage: { n_input_tokens: 10, n_output_tokens: 4, cost_usd: 0.002 } } } });
+  const base = startRun(repo, CHANGE, { baseline: true, attempts: 3 });
+  const trials = path.join(runs, base.run_id, 'submit-failure-s1/logs/harbor');
+  const outcomes = ['trial-1', 'trial-2', 'trial-3'].map((trial) => readJSON(path.join(trials, trial, 'result.json')));
+  for (const [index, outcome] of outcomes.entries()) {
+    assert.ok(outcome.started_at <= outcome.finished_at, JSON.stringify(outcome));
+    if (index) assert.ok(outcomes[index - 1].finished_at < outcome.started_at);
+    assert.deepEqual(outcome.agent_result, { n_input_tokens: 10, n_output_tokens: 4, cost_usd: 0.002 });
+  }
 });

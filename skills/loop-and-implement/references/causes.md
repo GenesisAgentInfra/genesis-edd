@@ -23,12 +23,32 @@ How to tell them apart:
   at the code.
 - A check that fails in some attempts and passes in others is still a failure
   of a requirement that must always hold. Look for what differs between the
-  attempts before calling it noise.
+  attempts before calling it noise: `<case>/attempts.json` names each
+  attempt's trial folder under `logs/harbor/`, so compare a failing attempt's
+  logs with a passing one's. The same holds across runs: a failure on some
+  code counts for that code however many runs of it pass, in a later loop of
+  the same Spec export too. The count reads `runs/`, which Git does not hold,
+  so it covers the runs of this machine.
+- A check that passed in a screen run and fails in the final run of the same
+  code varies: nothing changed between the two runs. Compare the final run's
+  failing attempts with its passing ones and with the screen run's attempt,
+  each through `<case>/attempts.json`, and find what makes the result vary
+  before changing anything. That code can never be accepted, so the fix is a
+  change of the code, or of the package or environment when the evidence
+  points there; a fix to a package or the environment ends the loop
+  (`packages_changed`).
 
 After a `write-eval` fix:
 
 - Run `eval check` for the package; it is not ready until it passes.
-- The package's digest changes, so its checks compare with no baseline result
-  (`head_only`). Say in the report's Cause what was wrong with the package and
-  what evidence showed it.
+- Inside a loop, the fix ends the loop (`packages_changed`): a loop's packages
+  and kit are fixed. Run `eval review`, have the reviewer answer for the
+  changed package, and let the user confirm it with `eval confirm --reason`.
+  The baseline of the next loop is recorded again on the start code, so it
+  runs the fixed package, and earlier results of the old package do not count
+  against the new one.
+- When you ask the user for that confirmation, tell them what was wrong with
+  the package, what evidence showed it and which checks failed before the
+  fix. Say the same in the report's Cause; its Changes lists the package and
+  kit files that changed.
 - Never make a check easier to hide a defect in the code.

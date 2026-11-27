@@ -31,7 +31,10 @@ file is about what to build.
 | `simulated` | The scenario writes, fails, checks permissions or time, or state must reset | placing an order, filing a ticket, sending a notification | a stateful service in `docker-compose.yaml`, reached by its service name |
 
 Default to local, controlled dependencies. An eval never writes to production.
-A `live` dependency makes two runs less comparable; say so when reporting.
+A `live` dependency makes two runs less comparable; say so when reporting. A
+package that declares one runs the number of attempts the user chooses before
+the baseline, and every other package runs once. When the kit's `harness.json`
+names a model, declare it as `live` in every package whose scenario calls it.
 
 A simulated dependency must hold state:
 

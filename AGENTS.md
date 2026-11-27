@@ -20,6 +20,19 @@ functionality. Harbor and Docker are separate tools that run-eval needs; do not
 vendor Harbor. Keep baseline unavailability and blocked execution distinct from
 a failing business check.
 
-Use Node's built-in test runner. Run `npm run check` and `npm test` after changes.
-Exercise the real pinned OpenSpec CLI in integration tests. No model credentials,
-runtime evidence, private project data or machine-specific paths belong in Git.
+Use Node's built-in test runner. Exercise the real pinned OpenSpec CLI in
+integration tests. No model credentials, runtime evidence, private project data
+or machine-specific paths belong in Git.
+
+While iterating, run `npm run check`, then only the tests of the area you
+changed: `node --test tests/<file>.test.js`, or one test with
+`node --test --test-name-pattern "<test name>" tests/<file>.test.js`.
+`npm run test:quick` runs the files of the main path in about a minute. Run
+`npm run check` and the full `npm test`, which takes a few minutes, once before
+a commit or a pull request. `tests/README.md` says which file covers what.
+
+Versions follow releases, not commits. Bump the minor version for a change of
+behavior or of a file format, and the patch version for a fix. A release that
+changes shipped files bumps every manifest together: `package.json`,
+`package-lock.json`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`
+and the version in `src/cli.js`.

@@ -11,7 +11,7 @@
     {
       "name": "genesis-edd",
       "source": "./",
-      "description": "Turn a feature request into a testable spec, eval packages, and a before-and-after comparison",
+      "description": "Turn a feature request into a testable spec and eval packages, then implement it in a loop until its checks pass against a baseline",
       "homepage": "https://github.com/GenesisAgentInfra/genesis-edd"
     }
   ]

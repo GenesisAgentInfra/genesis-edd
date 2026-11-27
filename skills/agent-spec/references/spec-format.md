@@ -108,6 +108,12 @@ THEN outcome. Keep descriptions within OpenSpec's strict limit (500 characters).
 New capabilities include a meaningful `## Purpose` (at least 50 characters).
 No design or task-list artifact is required.
 
+Each THEN or AND line states one observable result. An eval check verifies
+exactly one line, so a line with two results cannot tell which one failed:
+split it. Two lines that can only fail together state one result: write them as
+one. A line about tone or answer quality is fine to write; no program judges it,
+so the user does at acceptance.
+
 OpenSpec 2.1.0 strict validation warns that archive drops text before the first
 section, including YAML frontmatter. Genesis reports that exact warning as advisory
 only when the preamble contains just frontmatter and an optional title: its handoff

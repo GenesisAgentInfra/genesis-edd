@@ -1,7 +1,7 @@
 {
   "name": "genesis-edd",
-  "version": "0.1.0",
-  "description": "Turn a feature request into a testable spec, eval packages, and a before-and-after comparison",
+  "version": "0.2.0",
+  "description": "Turn a feature request into a testable spec and eval packages, then implement it in a loop until its checks pass against a baseline",
   "author": {
     "name": "Genesis Agent Infra",
     "url": "https://github.com/GenesisAgentInfra"
@@ -14,14 +14,14 @@
   "interface": {
     "displayName": "Genesis EDD",
     "shortDescription": "Specs and evals before you build",
-    "longDescription": "Clarify a feature request into a spec with acceptance scenarios, turn each scenario into a Harbor eval package, and compare runs before and after a change.",
+    "longDescription": "Clarify a feature request into a spec with acceptance scenarios, turn each scenario into a Harbor eval package, compare runs before and after a change, and implement the change in a loop until the checks pass, with the user accepting the result.",
     "developerName": "Genesis Agent Infra",
     "category": "Developer Tools",
     "capabilities": ["Interactive", "Read", "Write"],
     "defaultPrompt": [
       "Help me write the spec and acceptance scenarios for this feature.",
       "Write evals for the exported spec.",
-      "Run the evals before and after my change."
+      "Record the baseline, then implement the change until the evals pass."
     ],
     "websiteURL": "https://github.com/GenesisAgentInfra/genesis-edd"
   }

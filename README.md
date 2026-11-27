@@ -67,7 +67,7 @@ To select the skill explicitly, use `/genesis-edd:agent-spec` in Claude Code
 (`/agent-spec` for a checkout install), or type `$` in Codex and choose `agent-spec`.
 
 To run the evals, start **Docker** and install **[Harbor](https://docs.harborframework.com)**
-with `uv tool install harbor`. For the implementation loop, work in a Git repository.
+with `uv tool install harbor==0.27.0`. For the implementation loop, work in a Git repository.
 Continue in the same session.
 
 ```text
@@ -76,18 +76,23 @@ Run them on the current code to record a baseline. Then implement the fix
 and run the same evals again. Stop after five runs and show me what changed.
 ```
 
+Before the baseline, a reviewer in a fresh context writes, for each outcome line
+a program checks, a counterexample the checks must reject. The agent then asks
+you to confirm the checks, the number of attempts, the model and the budget.
 Read the before-and-after results in `.genesis/edd/<change>/reports/`.
-During this evaluation-driven development (EDD) loop, the spec, checks and
-baseline stay fixed. You decide whether to accept the change.
+During this evaluation-driven development (EDD) loop, the spec, checks,
+baseline and confirmed plan stay fixed. If one of them changes, the loop ends,
+says why and hands back to your coding agent. You decide whether to accept the
+change.
 
 ## How it works
 
 | Skill | What it gives you |
 | --- | --- |
 | [agent-spec](skills/agent-spec/SKILL.md) | An OpenSpec feature spec with the source of each requirement, acceptance scenarios and a validated export. |
-| [write-eval](skills/write-eval/SKILL.md) | One Harbor task per scenario. The tasks share a project harness and each verifier is checked against fixtures with known outcomes. |
-| [run-eval](skills/run-eval/SKILL.md) | A baseline and a check-by-check comparison with the changed code. The record distinguishes a failed expectation from an eval that could not run. |
-| [loop-and-implement](skills/loop-and-implement/SKILL.md) | An implementation and a report for each full run. The agent stops when the checks pass, the agreed budget runs out, progress stalls or it needs your decision. |
+| [write-eval](skills/write-eval/SKILL.md) | One Harbor task per scenario. The tasks share a project harness and each verifier is checked against fixtures with known outcomes. A reviewer writes counterexamples the checks must reject, and you confirm the checks before the baseline. |
+| [run-eval](skills/run-eval/SKILL.md) | A baseline and a check-by-check comparison with the changed code. The record distinguishes a failed expectation from an eval that could not run. A package with a live dependency, such as a model call, runs the number of attempts you confirm, and a check passes only when every attempt passes. |
+| [loop-and-implement](skills/loop-and-implement/SKILL.md) | An implementation and a report for each full run. The agent stops when the checks pass, the agreed budget runs out, progress stalls or it needs your decision. A failure on the same code always counts. With more than one attempt, only a passing final run can be accepted. Every stop is final, and a new loop needs your go-ahead. |
 
 The loop records the Git revision and local changes for each run. You control
 commits and acceptance. Genesis uses your coding agent for reasoning and does
@@ -103,8 +108,14 @@ a running Docker daemon and Harbor. You can also run Harbor through `uvx` by set
 this environment variable in the shell where you launch your agent.
 
 ```sh
-export GENESIS_EDD_HARBOR='["uvx","--from","harbor","harbor"]'
+export GENESIS_EDD_HARBOR='["uvx","--from","harbor==0.27.0","harbor"]'
 ```
+
+Harbor needs the Docker Compose plugin (`docker compose`). Genesis EDD is
+checked with Harbor 0.27.0. Proving a package and running it each take a minute
+or more per package, so a small change spends some minutes in Docker for each
+run. Each run records its time, and the cost and tokens your agent adapter
+reports, so the loop can tell whether the agreed budget fits.
 
 ### Genesis Map
 
@@ -175,9 +186,11 @@ earlier install's skill folders are in Git, `init` names them and the
 | `.genesis/edd/harness/` | the project kit shared by every eval package | yes |
 | `.genesis/edd/<change>/evals/` | one Harbor task package per scenario | yes |
 | `.genesis/edd/<change>/baseline-expectations.json` | the expected baseline result of each check, written by the agent before the baseline runs | yes |
+| `.genesis/edd/<change>/review.json` | the reviewer's answers: a verdict on each outcome line, and on each package changed since your last confirmation | yes |
+| `.genesis/edd/<change>/confirmed.json` | your confirmation of the checks and the run plan (attempts, agent, model, budget), with earlier ones | yes |
 | `.genesis/edd/<change>/checks/` | proofs that each package's checks work | no |
-| `.genesis/edd/<change>/runs/` | run records and before/after comparisons, each with its code as a commit plus `code.patch` | no |
-| `.genesis/edd/<change>/loop.json`, `loop-start.patch` | the running loop: its Spec, baseline, budget and starting code, with what the starting commit does not hold | no |
+| `.genesis/edd/<change>/runs/` | run records and before/after comparisons, with every attempt of each package, each with its code as a commit plus `code.patch` and the digest of every eval package and kit file it ran; the failures counted for the same code come from here, so they are per machine | no |
+| `.genesis/edd/<change>/loop.json`, `loop-start.patch` | the current loop (its Spec, baseline, budget and starting code, with what the starting commit does not hold) and the earlier loops of the change, whose starting code and usage a new loop takes; do not delete it: only it keeps the budget and the earlier loops | no |
 | `.genesis/edd/<change>/reports/` | one report per full run of the implementation loop | yes |
 | `.genesis/edd/<change>/accepted.json` | the user's acceptance of a passing run, with earlier ones | yes |
 | `.dockerignore` | a `.genesis` line, which the agent adds when a package builds from the project root, so expected results stay out of the image | yes |
@@ -196,12 +209,20 @@ keep other output under `.genesis/` out of Git, ignore `.genesis/*` and add
 
 - **Claude Code:** run `/plugin marketplace update genesis-edd`, then start a
   new session. To update automatically, open `/plugin`, choose
-  **Marketplaces**, select `genesis-edd` and enable auto-update.
+  **Marketplaces**, select `genesis-edd` and enable auto-update. A plugin
+  update arrives with a new plugin version.
 - **Codex:** run `codex plugin marketplace upgrade genesis-edd`, then start a
   new session.
 - **Checkout:** run `git pull` and `npm ci --ignore-scripts`, then run `init`
   again for each project. Installed files you edited are left as they are.
   Read its `warnings`: it names skill folders an earlier install committed.
+- **Eval packages:** version 0.2.0 writes checks.json 1.1, which earlier
+  versions of Genesis EDD reject, so update every checkout and plugin that
+  works on a project. Packages in 1.0 keep working with a warning, but a loop
+  does not start on them until they are upgraded. Version 0.2.0 also no
+  longer restarts a loop or raises its budget in place: a loop that ends
+  hands back to your coding agent, and `loop start` begins a new one, with
+  the budget you give it.
 
 ## License
 

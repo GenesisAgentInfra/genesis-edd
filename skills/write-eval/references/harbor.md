@@ -151,8 +151,8 @@ whose inputs did not change.
 
 The CLI runs `harbor` from the `PATH`. When it is not installed there, set
 `GENESIS_EDD_HARBOR` to the command as a JSON array, for example
-`GENESIS_EDD_HARBOR='["uvx","--from","harbor","harbor"]'`. That needs no global
-install.
+`GENESIS_EDD_HARBOR='["uvx","--from","harbor==0.27.0","harbor"]'`. That needs no
+global install. Use Harbor 0.27.0, the version this release is checked with.
 
 ## Reading a trial
 

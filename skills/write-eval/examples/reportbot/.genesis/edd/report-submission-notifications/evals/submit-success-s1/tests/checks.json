@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "status": "confirmed",
   "spec_ref": {
     "id": "report-submission-notifications",
@@ -7,7 +7,8 @@
   },
   "scenario": {
     "requirement": "REQ-submit-success",
-    "name": "报告提交成功"
+    "name": "报告提交成功",
+    "manual": []
   },
   "dependencies": [
     {
@@ -25,6 +26,7 @@
     {
       "id": "c1",
       "intent": "REQ-submit-success",
+      "then": "本次提交发送的成功通知数量为一",
       "expect": "本次提交发送的成功通知数量为一",
       "role": "gating"
     }
@@ -32,24 +34,32 @@
   "fixtures": [
     {
       "name": "one-notification",
+      "origin": "author",
+      "note": "报告提交成功，发出了一条成功通知",
       "expect": {
         "c1": "pass"
       }
     },
     {
       "name": "no-notification",
+      "origin": "author",
+      "note": "报告提交成功，却没有发出成功通知",
       "expect": {
         "c1": "fail"
       }
     },
     {
       "name": "two-notifications",
+      "origin": "author",
+      "note": "报告提交成功，却发出了两条成功通知",
       "expect": {
         "c1": "fail"
       }
     },
     {
       "name": "no-submission",
+      "origin": "author",
+      "note": "没有提交报告，这个场景没有发生",
       "expect": {
         "c1": "unknown"
       }

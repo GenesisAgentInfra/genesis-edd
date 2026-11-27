@@ -887,6 +887,20 @@ test('init is idempotent, preserves existing config and preflights conflicts', (
   assert.throws(() => newSpec(repo, 'external-change'), /external stores/);
 });
 
+test('the plugin manifests, the lock file and the CLI carry the package version, so a plugin update reaches its users', () => {
+  // A plugin manager keeps users on the cached copy until the manifest version changes.
+  const { version } = readJSON(path.join(ROOT, 'package.json'));
+  assert.equal(readJSON(path.join(ROOT, '.claude-plugin/plugin.json')).version, version);
+  assert.equal(readJSON(path.join(ROOT, '.codex-plugin/plugin.json')).version, version);
+  const lock = readJSON(path.join(ROOT, 'package-lock.json'));
+  assert.deepEqual([lock.version, lock.packages[''].version], [version, version]);
+  const result = spawnSync(process.execPath, [path.join(ROOT, 'bin/genesis-edd.js'), '--version'], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).version, version);
+  const help = spawnSync(process.execPath, [path.join(ROOT, 'bin/genesis-edd.js'), '--help'], { encoding: 'utf8' });
+  assert.ok(help.stdout.startsWith(`Genesis EDD ${version} `), help.stdout.slice(0, 80));
+});
+
 test('agent-spec installs for both agents and runs the pinned CLI', (t) => {
   const repo = project(t, 'new', 'both');
   for (const directory of ['.agents', '.claude']) {
@@ -983,6 +997,25 @@ test('init updates an untouched earlier agent-spec and leaves an edited one alon
   writeFileSync(path.join(skill, 'SKILL.md'), `${previous}\nTeam note\n`);
   assert.throws(() => initProject(repo, 'new', 'claude'), /differs; left unchanged/);
   assert.match(readFileSync(path.join(skill, 'SKILL.md'), 'utf8'), /Team note/);
+});
+
+test('init updates the released skills, their references and example files included, when they are untouched', (t) => {
+  const repo = project(t, 'new', 'claude');
+  // The files as the last release shipped them.
+  const previous = path.join(ROOT, 'tests/fixtures/previous-skills');
+  const example = 'write-eval/examples/reportbot/.genesis/edd/report-submission-notifications/evals';
+  const files = ['agent-spec/SKILL.md', 'agent-spec/references/spec-format.md', 'loop-and-implement/SKILL.md', 'loop-and-implement/references/causes.md', 'run-eval/SKILL.md',
+    'run-eval/references/run-records.md', 'write-eval/SKILL.md', 'write-eval/references/task-package.md', 'write-eval/references/verifier.md', 'write-eval/references/environment.md',
+    'write-eval/references/harbor.md', 'write-eval/examples/reportbot/README.md', `${example}/submit-failure-s1/tests/checks.json`,
+    `${example}/submit-success-s1/tests/checks.json`];
+  for (const file of files) {
+    assert.notEqual(readFileSync(path.join(previous, file), 'utf8'), readFileSync(path.join(ROOT, 'skills', file), 'utf8'), file);
+    writeFileSync(path.join(repo, '.claude/skills', file), readFileSync(path.join(previous, file)));
+  }
+  const result = initProject(repo, 'new', 'claude');
+  assert.deepEqual([...result.updated].sort(), files.map((file) => `.claude/skills/${file}`).sort());
+  for (const file of files) assert.equal(readFileSync(path.join(repo, '.claude/skills', file), 'utf8'), readFileSync(path.join(ROOT, 'skills', file), 'utf8'), file);
+  assert.deepEqual(initProject(repo, 'new', 'claude').updated, []);
 });
 
 test('bad names and symlink destinations cannot escape the selected project', (t) => {
@@ -1253,4 +1286,22 @@ test('later stage entries return diagnostics without claiming readiness or runni
   assert.equal(existsSync(path.join(repo, 'openspec/changes/report-notifications/handoffs')), false);
   assert.throws(() => checkWorkflow(repo, 'unknown', 'report-notifications'), /Unknown stage/);
   assert.throws(() => checkWorkflow(repo, 'spec-export', '../escape'), /kebab-case/);
+});
+
+test('a project whose Spec schema is missing, as in a clone committed without openspec/schemas/, is told to run init again, which restores it', (t) => {
+  const repo = project(t, 'existing');
+  newSpec(repo, 'report-notifications');
+  writeSpec(repo);
+  rmSync(path.join(repo, 'openspec/schemas'), { recursive: true, force: true });
+  const check = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  assert.equal(check.status, 'blocked');
+  const gap = check.gaps.find((entry) => entry.code === 'project_invalid');
+  assert.ok(gap, JSON.stringify(check.gaps));
+  assert.equal(gap.route, 'init');
+  assert.ok(gap.message.startsWith(`openspec/schemas/${SCHEMA}/ is missing, so OpenSpec cannot read this project's Specs. Run \`init --repo <app> --mode existing --agent none\``), gap.message);
+  assert.throws(() => newSpec(repo, 'another-change'), /openspec\/schemas\/genesis-spec\/ is missing/);
+
+  initProject(repo, 'existing', 'none');
+  assert.ok(existsSync(path.join(repo, `openspec/schemas/${SCHEMA}/schema.yaml`)));
+  assert.equal(validateSpec(repo, 'report-notifications').valid, true);
 });

@@ -1,8 +1,8 @@
 {
   "name": "genesis-edd",
   "displayName": "Genesis EDD",
-  "version": "0.1.0",
-  "description": "Turn a feature request into a testable spec, eval packages, and a before-and-after comparison",
+  "version": "0.2.0",
+  "description": "Turn a feature request into a testable spec and eval packages, then implement it in a loop until its checks pass against a baseline",
   "author": {
     "name": "Genesis Agent Infra",
     "url": "https://github.com/GenesisAgentInfra"
