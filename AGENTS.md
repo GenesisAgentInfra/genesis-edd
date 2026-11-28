@@ -34,5 +34,5 @@ a commit or a pull request. `tests/README.md` says which file covers what.
 Versions follow releases, not commits. Bump the minor version for a change of
 behavior or of a file format, and the patch version for a fix. A release that
 changes shipped files bumps every manifest together: `package.json`,
-`package-lock.json`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`
-and the version in `src/cli.js`.
+`package-lock.json`, `.claude-plugin/plugin.json` and `.codex-plugin/plugin.json`.
+`src/cli.js` reads its version from `package.json`.

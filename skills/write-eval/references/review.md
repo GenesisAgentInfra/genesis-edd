@@ -1,31 +1,42 @@
 # Reviewing the checks
 
 Before the user confirms the checks, a second reader tests them against the
-Spec. The reviewer writes a counterexample for every THEN or AND line a
-program checks, then judges whether each check says what its line says. The
-user reads the result and confirms the checks, the number of attempts, the
-model and the budget once, before the baseline. In a new project no package
-can run before the loop connects it: the reviewer judges the checks first, and
-writes the counterexamples once the packages are connected. Connecting them
-ends that first loop, and the user confirms the connected packages before a
-new loop (the end of the next section says how). A loop compares every run
+Spec. The reviewer writes a counterexample for each line that needs one, and
+judges whether each line's checks say what the line says. The user reads the
+result and confirms the checks and the run plan. A loop compares every run
 with the checks the user confirmed, and ends when they change.
 
-The reviewer works in a fresh context: a subagent if you have one, given
-`reviewer_brief` from `eval review` and nothing else. Without a subagent, do
-the review yourself as a separate pass and mark it `self-review`: the user is
-told that only the author read the checks.
+## Who reviews
 
-## The two passes
+The default reviewer is a fresh context, for example a subagent, given
+`reviewer_brief` from `eval review` and nothing else. A person, or two
+reviewers, is at least as independent and is fine too. Whoever reviews is
+`review`, provided they did not write the checks and wrote their
+counterexamples without reading the verifier. Say who reviewed in
+`review.note`. When you review alone, as a separate pass, mark what you write
+`self-review`, never `review`. The user is told which lines rest only on a
+self-review (`self_review_only`, `self_review_verdict`).
 
-1. **Counterexamples, without the verifier.** The reviewer reads only what
-   `reviewer_brief.give` lists: the Spec, each package's `checks.json`,
-   `PROJECT.md`, the environment files with the stand-in services, and the
-   author's pass fixtures. They do not read `tests/test.sh`, `tests/shared/`
-   or the kit's `verifier/` (`reviewer_brief.withhold`). For every line a
-   program checks, they write a fixture that leaves a realistic result that
-   breaks that line and no other, as a fixture script in `tests/fixtures/`
-   and an entry in `checks.json`:
+`reviewer_brief` gives these:
+
+- `first`: what to write before reading the verifier;
+- `then`: what to answer after it;
+- `lines`: the lines that need a counterexample;
+- `give`: the Spec, each package's `checks.json`, the environment files, the
+  kit's `PROJECT.md` and `environment/`, the author's pass fixtures and, in
+  the light tier, the evidence the baseline left;
+- `withhold`: `tests/test.sh`, `tests/shared/` and the kit's `verifier/`.
+
+## What a review holds
+
+A review has two parts. The order between them keeps the counterexamples
+independent of the verifier.
+
+1. **Counterexamples, written without the verifier.** For each line in
+   `reviewer_brief.lines`, the reviewer writes a fixture that leaves a
+   realistic result which breaks that line and no other. That is a script in
+   `tests/fixtures/`, or a code patch for a line a code test checks, with an
+   entry in `checks.json`:
 
    ```json
    { "name": "notice-after-rejection", "origin": "review",
@@ -33,42 +44,72 @@ told that only the author read the checks.
      "expect": { "c1": "fail" } }
    ```
 
-   Run `eval check`. A counterexample that does not get `fail` shows that the
-   verifier misses what the line rules out: fix the verifier, never the
+   `eval check` proves new fixtures on their own; the probe does not run
+   again for them. A counterexample that does not get `fail` shows that the
+   verifier misses what the line rules out. Fix the verifier, never the
    counterexample.
-2. **Verdicts, with the verifier.** Run `eval review` again once `eval check`
-   passes. The counterexamples changed each package's `task_digest`, so
-   answers written into the first `review_template` are stale
-   (`review_stale`). Now the reviewer reads the verifier and answers each
-   question of this second `eval review` into `review.json`, written from its
-   `review_template`.
+2. **Verdicts, given after reading the verifier.** The reviewer answers each
+   question of `eval review` into `.genesis/edd/<change>/review.json`, written
+   from its `review_template`. They also answer, for each package changed
+   since the last confirmation, whether its diff loosens a THEN line. For a
+   line proved by its failure before the change, the reviewer also checks
+   that the baseline failed for the behavior this line changes, not for
+   another reason.
 
-In a new project no package can run before the loop connects it, so no
-counterexample can be proved yet, and `eval review` says so in its `next` and
-`reviewer_brief`. The reviewer judges now, from `checks.json`, whether the
-`expect` of each check says what its line says, and answers into
-`review.json`. Once the loop connects a package, `eval review` gives the
-brief of an existing project again: they write its counterexamples as in the
-first pass, prove them with `eval check`, and answer a second `eval review`.
-Connecting the package changed it, which ended the loop, so the user confirms
-it with `eval confirm --reason` before the baseline is recorded again and a
-new loop starts with their go-ahead.
+The template names each package by its `run_digest`. A counterexample leaves
+that digest as it was, so the template stays current while counterexamples
+are added. A fix to the verifier changes the package, and the next
+`eval review` gives a template for it.
+
+## Which lines need a counterexample
+
+- **Full tier:** every line a program checks.
+- **Light tier:** every line a program checks that has no other proof that it
+  can fail. A line's real failure at the baseline proves it when all of these
+  hold:
+  - every gating check of the line failed, with evidence, in an attempt that
+    completed;
+  - that baseline ran the package as it is now;
+  - every baseline of this Spec export expected `fail` for it;
+  - no run on that code saw it pass;
+  - no check of the line is shared with another line.
+
+  A line a code test checks is proved this way too. A trial never proves a
+  line. `eval review` names each line's proof so far (`lines[].proof`).
+- A line whose check several lines share, as a `then_group` check is,
+  always needs its own counterexample, which names it in `then`. A failure
+  of that check at a baseline never proves any of its lines.
+- In a new project the baseline runs on an entry skeleton and proves nothing,
+  so every line needs a counterexample. It can be proved only once the
+  package is connected.
+- A line in `scenario.manual` needs none: the user judges it. A judge check
+  of such a line that stays diagnostic needs none either.
+- A line whose judge check the user makes gating (`--judge-gating`) needs a
+  proof in either tier: its judge checks' failure at the baseline, under the
+  conditions above, or a reviewer's counterexample of the line.
 
 ## What counts as a counterexample
 
-A fixture is a counterexample of a line when:
+A fixture is a counterexample of a line when all of these hold:
 
 - its `origin` is `review`, or `self-review` when the author reviews alone;
-- its `expect` names every gating check of the package;
-- every gating check whose `then` is that line expects `fail`;
-- every other gating check expects `pass` or `unknown`.
+- its `expect` names every gating check of the package, though a script may
+  leave out a code test of another line;
+- every gating check of that line expects `fail`;
+- every other gating check expects `pass` or `unknown`;
+- when `then` is given, it names that line.
 
-An author's fixture never counts, even one that fails only the line. A
-package in checks.json 1.1 is ready only when every line a program checks has
-a counterexample, and `eval check` proves it like any other fixture, after
-every change to the package. A line in `scenario.manual` needs none: the user
-judges it. A package in checks.json 1.0 needs none either, and cannot be
-confirmed.
+The counterexample of a line a code test checks is a code patch: a fixture
+`eval validate` lists in its case's `code_patches`. For a line whose judge
+check is made gating, the counterexample's `then` names that line, it
+expects `fail` for the line's judge checks and `pass` or `unknown` for every
+other gating check, and the last `eval check` proved it. An author's fixture
+never counts, even one that fails only the line. In the full tier, a package
+in checks.json 1.1 is ready only when every line a program checks has a
+counterexample that `eval check` proved. In the light tier, `eval confirm`
+refuses a gating line with no proof (`line_unproven`), and `loop accept`
+checks each line's proof again. Both do the same, in either tier, for a line
+whose judge check is made gating.
 
 ## Verdicts
 
@@ -81,10 +122,19 @@ confirmed.
 | `vacuous` | cannot fail, or cannot pass |
 | `not_observable` | no program can judge this line |
 
-`eval confirm` takes only `faithful` for a line a program checks, and only
-`not_observable` for a line in `scenario.manual`. Any other verdict sends the
-package back to write-eval: fix the check and prove it with `eval check`, or
-move a line no program can judge into `scenario.manual`; then review again.
+`eval confirm` takes `faithful` for a line a program checks, a line whose
+judge check is made gating included. It takes `weaker` or `stronger` only
+when the user accepts that line as it is, with a reason
+(`--accept-verdict`); `eval review` lists such lines as
+`verdict_acceptable`. It never takes `different` or `vacuous`
+(`line_not_faithful`). For any other line in `scenario.manual` it takes only
+`not_observable` (`manual_disputed` otherwise). A verdict the user does not
+accept means the package needs work: fix the check and prove it, or move a
+line no program can judge into `scenario.manual`. Then review again. Write
+the note of a `weaker` or `stronger` verdict so the user can decide from it
+alone: which results the check lets through, or rejects, that the line does
+not. Also say whether every check that passes when something is not found
+carries `"absence": true`.
 
 ## review.json
 
@@ -94,143 +144,86 @@ move a line no program can judge into `scenario.manual`; then review again.
 {
   "schema_version": "1.0",
   "spec": "sha256:<handoff id>",
-  "review": { "origin": "review", "note": "A fresh subagent read the Spec, then the verifier." },
+  "review": { "origin": "review", "note": "A fresh subagent wrote the counterexamples, then read the verifier." },
   "lines": [
     { "package": "submit-failure-s1", "then": "本次提交发送的成功通知数量为零",
-      "task_digest": "sha256:…", "verdict": "faithful", "note": "Counts the success notices of this submission." }
+      "run_digest": "sha256:…", "verdict": "faithful", "note": "Counts the success notices of this submission." }
   ],
   "packages": [
-    { "package": "submit-failure-s1", "task_digest": "sha256:…", "loosens": false, "note": "The diff only adds a build step." }
+    { "package": "submit-failure-s1", "run_digest": "sha256:…", "loosens": false, "note": "The diff only adds a build step." }
   ]
 }
 ```
 
-Write it from `review_template`: it lists every line with its package's
-`task_digest`, and a line of a package unchanged since the last confirmation
-keeps the verdict confirmed then. `packages` answers, for each package changed
-since the last confirmation, whether its diff loosens a THEN line. A
-`task_digest` names the package as it was reviewed, so an answer goes stale
-when the package changes.
+Write it from `review_template`, and keep each digest as the template gives
+it. A line keeps the verdict confirmed before while what its package checks
+did not change: the check entries of `checks.json`, the rest of `tests/`
+apart from the fixtures, and the kit's `verifier/`. The template carries such
+a verdict (`carried`). `packages` answers, for each package changed since the
+last confirmation, whether its diff loosens a THEN line. An answer goes stale
+when its package changes, but not when only a fixture does.
 
 ## eval review
 
-`edd eval review <change> --repo <app>` is read-only and returns:
+`edd eval review <change> --repo <app>` is read-only and needs the current
+export. It returns these:
 
 - `lines`: every THEN and AND line with its requirement, scenario, package,
-  status (`gating`, `manual`, `uncovered` or `unbound`), checks, fixtures by
-  origin, counterexamples, the expected and recorded baseline result of each
-  gating check, and the review answer so far.
-- `must_decide`, most severe first: `then_uncovered`, `manual_line`,
-  `expect_differs` (an `expect` worded otherwise than its line),
-  `self_review_only`, `changed_since_confirmation` (with the files),
-  `plan_changed_since_confirmation` (`harness.json` changed since the last
-  confirmation and names another agent or model),
-  `baseline_plan_recorded` (before any loop of the Spec export, a baseline
-  recorded while no confirmation covered the packages, with another plan than
-  `eval confirm` records without plan flags, as with `--attempts`, `--agent`
-  or `--model`; `keys` names what differs, and `loop start` takes that
-  baseline only once the user confirms the plan it ran),
-  `spec_changed_since_confirmation` (lines added and removed since the last
-  confirmed export) and `failed_with_old_package` (a check that failed with an earlier version of
-  its package and passed with this one on the same code).
-- `questions` for the reviewer, `reviewer_brief`, and `review_template`.
-- `run_plan`: the packages with a live dependency, those that declare none
-  while the kit names a model, the agent and the model, whether the user must
-  fix a number of attempts, the proposal of 5, or 3 when the budget is tight,
-  what 1, 3 and 5 attempts rule out, and the budget. `estimate` gives the
-  minutes of the baseline, a screen run and the final run for 1, 3 and 5
-  attempts, by the attempt times of the last `eval check`, with its `basis`;
-  it counts only ready packages, and `estimate_missing` names the others.
-  `not_counted` names what the CLI cannot see, such as the reviewer's passes
-  and model calls.
-- `confirmation` and `current`: the latest confirmation of this Spec export,
-  and whether it covers the packages as they are.
+  status, checks, fixtures by origin, counterexamples, expected and recorded
+  baseline result, proof, and the review answer so far.
+- `must_decide`: the decisions that are the user's. Each item has a code, a
+  message and its facts:
+  - lines and checks: `then_uncovered`, `manual_line`, `expect_differs`,
+    `then_group`, `judge_check`;
+  - who reviewed: `self_review_only`, `self_review_verdict`;
+  - what changed since the last confirmation: `changed_since_confirmation`,
+    `plan_changed_since_confirmation`, `spec_changed_since_confirmation`,
+    `package_rebound`;
+  - baselines and runs: `baseline_plan_recorded`,
+    `expectation_changed_after_baseline`, `expectation_added_after_baseline`,
+    `code_changed_before_baseline`, `trial_before_baseline`,
+    `cost_approved_runs`, `failed_with_old_package`;
+  - the ledger and the network: `ledger_runs_lost`, `ledger_incomplete`,
+    `network_undeclared`;
+  - hints that decide nothing: `variability_signals`.
+- `must_show`: what the user must see before confirming:
+  - `lines` and `must_decide`;
+  - `run_plan`: the tier with its reasons, the agent and model, whether
+    attempts are needed (with the proposal and what 1, 3 and 5 attempts rule
+    out), the minute estimates, what the CLI does not count, the budget and
+    the cost cap;
+  - `adapters`, `rebound`, `dependencies`, `code_checks`, `judge_checks`,
+    `then_groups`, `recorded_choices` and `ledger`.
+
+  `shown` is the digest of `must_show`. The wording and the number of
+  messages are yours. Add your own estimate of what `run_plan.not_counted`
+  names, and say that the CLI does not count it.
+- `questions`, `reviewer_brief`, `review_template`, `run_plan` and `spec_diff`.
+- `confirmation` and `current`: the latest confirmation of this export, and
+  whether it covers the packages as they are.
+- `gaps`, `warnings`, `confirm` (what a confirmation needs and which flags it
+  takes), `loop`, and `change_lock` when the change is locked.
 
 ## Confirming
 
-Show the user, in one message: the line table, `must_decide`, the expected
-baseline results, the number of attempts with its cost from
-`run_plan.estimate` and what it rules out, the model, and the budget. Add your
-own estimate of what `run_plan.not_counted` names, and say that the CLI does
-not count it. When `estimate_missing` names a package, prove it with
-`eval check` and run `eval review` again before you give the cost. When the
-CLI has no estimate yet, as in a new project, give your own and say so. After
-their own words, run:
+`eval confirm` reads this `review.json` and records the user's confirmation
+of the checks and the run plan, only after their own words. The run-eval
+skill explains its flags, what it refuses and what it records
+([run-eval/SKILL.md](../../run-eval/SKILL.md), "Confirming the checks").
 
-```sh
-edd eval confirm <change> --repo <app> --verdicts .genesis/edd/<change>/review.json \
-  --by <name> --ref <where they said so> [--attempts N] [--agent NAME] [--model MODEL] \
-  [--max-iterations N] [--max-minutes M]
-```
+## Revisions and loops
 
-`--verdicts` is a path in the project, or an absolute one. The agent and the
-model default to the kit's `harness.json`, the budget to 5 full runs and 60
-minutes. A revision keeps the run plan confirmed before, unless flags give
-other values; once `harness.json` has changed since that confirmation, its
-agent and model count again, and `run_plan` and `must_decide` show them.
-`--attempts` is needed while a package declares a live dependency, or while
-the agent runs with a model and a ready package declares none. A baseline
-reads the plan: run it without `--attempts`, `--agent` and `--model`. Before
-any loop of the Spec export it refuses other values (`run_plan_differs`);
-once a loop has started for it, `run start` refuses those flags whatever
-their values (`run_plan_fixed`).
+A package changed after the confirmation is a revision; a new fixture alone
+is not. To confirm a revision, prove the changed package with `eval check`
+and run `eval review` again. A line whose checks did not change keeps its
+verdict. The reviewer reads each changed package's diff and says whether it
+loosens a THEN line. Then the user confirms again. Tell the user what
+changed, why, and the diff.
 
-`eval confirm` refuses, with `CONFIRM_INPUT_BLOCKED` and nothing written:
-
-| Gap | Why |
-| --- | --- |
-| eval gaps | a package is invalid, stale, a draft, or leaves a line uncovered |
-| `then_unbound` | a package is still in checks.json 1.0 |
-| `review_unreadable` | `review.json` is no review, or a line has no verdict |
-| `review_stale` | answers for another export, for another version of a package, a line missing or extra, or a changed package without its answer |
-| `line_not_faithful` | a line a program checks was judged other than `faithful` |
-| `manual_disputed` | a `scenario.manual` line was judged other than `not_observable` |
-| `package_loosens` | the reviewer found that a package's diff loosens a THEN line |
-| `reason_missing` | this export was confirmed before; a new confirmation is a revision, of the packages or of the run plan |
-| `attempts_undecided` | the user's number of attempts is needed |
-| `confirmation_unreadable` | `confirmed.json` cannot be read; restore it from Git |
-
-`--by` and `--ref` are required. It warns about lines only a self-review
-counterexample stands behind, about packages changed since their last
-`eval check`, which a run skips until it is run again, and names packages not
-connected yet: their counterexamples are proved once they are connected, and
-connecting them changes them, so the user confirms them again, and inside a
-loop that ends it. In a new project whose packages are not
-connected yet, no package declares its dependencies, so it also warns when
-the confirmation fixes no number of attempts: if a scenario may call a model,
-ask the user for N before the baseline, as `eval review`'s `next` says.
-
-## confirmed.json
-
-`.genesis/edd/<change>/confirmed.json`, committed. The newest confirmation is
-at the top level; earlier ones are under `earlier`, oldest first.
-
-| Field | Meaning |
-| --- | --- |
-| `id` | Digest of the entry without `id` and `earlier`. An entry edited by hand no longer matches: `confirmation_invalid`. Restore the file from Git, or confirm again, which starts a new file. |
-| `spec` | The change and the exported Spec it confirms. |
-| `packages` | Each package's `task_digest`, the digest of each of its files, and whether it was ready. |
-| `kit` | The digest of each file of the project kit. |
-| `lines` | Each line with its requirement, scenario, status, checks, their `expect`, its counterexamples, the reviewer's verdict and note, and for a manual line its reason. |
-| `review`, `package_reviews` | Who reviewed (`review` or `self-review`) and the answers about changed packages. |
-| `baseline_expectations` | `baseline-expectations.json` as the user saw it, or `[]`. |
-| `run_plan` | `attempts`, `pass_rule` (`all`), `agent`, `model` and `budget` (`iterations`, `minutes`). |
-| `confirmed` | `by`, `ref`, `at`, `kind` (`initial` or `revision`) and, for a revision, `reason`. |
-
-## Revisions
-
-A package changed after the confirmation, inside a loop or before it, is a
-revision. Prove it with `eval check`, run `eval review` again: its lines lose
-their verdicts, and the reviewer reads its diff and says whether it loosens a
-THEN line. The user confirms it with `eval confirm --reason <why the packages
-changed>`. Inside a loop the change has ended the loop (`packages_changed`),
-so this comes before a new loop, never with the acceptance; the baseline is
-recorded again on the loop's start code, and a new loop starts with the
-user's go-ahead.
-
-While a loop runs, its run plan is fixed. A confirmation with another plan or
-other packages than the loop's ends it (`confirmation_changed`), and a new
-loop needs a baseline of that plan on its start code. A confirmation with the
-same plan and packages, such as one with a new budget, leaves the loop as it
-is, with its own budget; a bigger budget goes to a new loop, given to
-`loop start`.
+While a loop runs, its packages and its plan are fixed. A package change ends
+the loop (`packages_changed`). So does a confirmation with another plan,
+another tier or other packages (`confirmation_changed`). A confirmation with
+the same plan and packages, such as one with a new budget, leaves the loop
+running with its own budget. A running loop's budget is changed with
+`loop budget` and the user's `--by` and `--ref`. A new loop needs the user's
+consent and a baseline of the confirmed plan on its start code.

@@ -1,7 +1,7 @@
 {
   "name": "genesis-edd",
   "displayName": "Genesis EDD",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Turn a feature request into a testable spec and eval packages, then implement it in a loop until its checks pass against a baseline",
   "author": {
     "name": "Genesis Agent Infra",
