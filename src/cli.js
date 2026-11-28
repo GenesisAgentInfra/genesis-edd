@@ -89,8 +89,9 @@ Eval packages
       where they differ. This changes the packages.
   eval check NAME [--case ID]... [--timeout MINUTES] [--yes | --allow-env NAME[,NAME]]
       Proves finished packages one at a time: their fixtures through Harbor
-      with the real verifier, and in the light tier a probe with Harbor's nop
-      agent under which every gating check must come out unknown. A package
+      with the real verifier, and, for checks.json 1.1 in both tiers, a probe
+      with Harbor's nop agent under which every gating check must come out
+      unknown. A package
       that changed while it was checked keeps no proof; a package whose
       shared code differs from the kit is refused. Exits 1 unless every
       checked package passed.
