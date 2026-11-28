@@ -122,7 +122,11 @@ process.stdout.write(lines.join('\\n') + (lines.length ? '\\n' : ''));
 `;
 // Git reads the user's own configuration and location variables; the tests
 // run Git with none of them, so they behave the same on every machine.
-const GIT_KEYS = ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CEILING_DIRECTORIES'];
+// Git's background maintenance is off: started by a commit, it would write
+// and remove lock files under .git while a test copies or reads the folder.
+const GIT_KEYS = ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CEILING_DIRECTORIES',
+  'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1'];
+const GIT_SETTINGS = [['maintenance.auto', 'false'], ['gc.auto', '0']];
 const ENV_KEYS = ['GENESIS_EDD_HARBOR', 'GENESIS_EDD_PROGRESS', 'PATH', 'FAKE_HARBOR_LOG', 'FAKE_DOCKER_DOWN', 'FAKE_DOCKER_OBJECTS', 'FAKE_DOCKER_LOG', ...GIT_KEYS];
 let active = null;
 
@@ -168,6 +172,11 @@ export function useFakeTools(t) {
   writeFileSync(gitConfig, '');
   process.env.GIT_CONFIG_GLOBAL = gitConfig;
   process.env.GIT_CONFIG_NOSYSTEM = '1';
+  process.env.GIT_CONFIG_COUNT = String(GIT_SETTINGS.length);
+  GIT_SETTINGS.forEach(([key, value], index) => {
+    process.env[`GIT_CONFIG_KEY_${index}`] = key;
+    process.env[`GIT_CONFIG_VALUE_${index}`] = value;
+  });
   const calls = () => readLines(log);
   const tools = {
     directory, log, calls, gitConfig,
@@ -581,12 +590,22 @@ function makeTemplate(key, settings, tools) {
   return template;
 }
 
-// Whether any file under the folder holds one of the marks, or is a symbolic link.
+// Whether any file under the folder holds one of the marks, or is a symbolic
+// link. A file or folder that is gone by the time it is read holds nothing.
 function mentions(folder, marks) {
-  for (const entry of readdirSync(folder, { withFileTypes: true })) {
+  const gone = (error) => { if (error?.code !== 'ENOENT') throw error; return null; };
+  let entries;
+  try { entries = readdirSync(folder, { withFileTypes: true }); } catch (error) { return gone(error) ?? false; }
+  for (const entry of entries) {
     const file = path.join(folder, entry.name);
     if (entry.isSymbolicLink()) return true;
-    if (entry.isDirectory() ? mentions(file, marks) : marks.some((mark) => readFileSync(file, 'latin1').includes(mark))) return true;
+    if (entry.isDirectory()) {
+      if (mentions(file, marks)) return true;
+      continue;
+    }
+    let text;
+    try { text = readFileSync(file, 'latin1'); } catch (error) { gone(error); continue; }
+    if (marks.some((mark) => text.includes(mark))) return true;
   }
   return false;
 }
