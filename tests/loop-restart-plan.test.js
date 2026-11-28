@@ -1,29 +1,20 @@
 // Loop tests: the end of a loop when its plan or packages change, revisions, and the model and agent
 // every named run start carries.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import os from 'node:os';
+import { appendFileSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { ignoredArtifacts, initProject, projectRoot, readJSON } from '../src/project.js';
-import { exportSpec, newSpec, validateSpec } from '../src/spec.js';
-import { newEval, validateEval } from '../src/eval.js';
-import { checkEval, codeSnapshot, startRun } from '../src/run.js';
-import { acceptLoop, loopStatus, reportGaps, startLoop, writeReport } from '../src/loop.js';
-import { checkWorkflow } from '../src/workflow.js';
+import { checkEval, startRun } from '../src/run.js';
+import { acceptLoop, loopStatus } from '../src/loop.js';
+import { workflowStatus } from '../src/workflow.js';
 import { reviewEval } from '../src/confirm.js';
+import { AFTER, BEFORE, CHANGE, APPROVAL, confirmChecks, readyProject, setResults, writeExpectations } from './helpers/edd.js';
 import {
-  AFTER, AGENT, BEFORE, CHANGE, FIXTURES, LIVE_DEPENDENCY, SPECS, cli, commit, commitConfirmation, confirmChecks, connect, dropCheck, editChecks, git, harborThen, legacyWarning, readRecord,
-  readyProject, reviewFixtures, setResults, toLegacy, useFakeTools, writeExpectations, writeFixtureScripts, writeSpec,
-} from './helpers/edd.js';
-import {
-  EXPECT, TEMPLATE_MARK, codes, blockedWith, refusedWith, withBaseline, inLoop, changeCode, fullRun, completeReport, FAILURE, SUCCESS, loopPath,
-  loopRecord, editApp, restoreStart, resultsOutsideCode, liveLoop, gapOf, finalsLoop,
-  refusedBeforeRun, assertEnded, assertStopBudget,
+  EXPECT, codes, inLoop, changeCode, fullRun, completeReport, FAILURE, SUCCESS, loopRecord, finalsLoop,
+  refusedBeforeRun, assertEnded, reviewRun, startLoop, assertGapShape, assertNoRoutes,
 } from './helpers/loop.js';
 
-const HARNESS = (model) => `${JSON.stringify({ agent: AGENT, model }, null, 2)}\n`;
+const confirmAction = (status) => status.actions.find((entry) => entry.command[0] === 'eval' && entry.command[1] === 'confirm');
 
 test('loop accept gives not_final only for a screen run that passed: a failing run is refused as not passing alone', (t) => {
   const project = finalsLoop(t);
@@ -39,50 +30,84 @@ test('loop accept gives not_final only for a screen run that passed: a failing r
   });
 });
 
-test('in a new project, the first iterate of a loop says to write the entry point, and that connecting the packages ends the loop', (t) => {
+test('in a new project, the first loop says no package is connected yet, and that connecting the packages ends the loop', (t) => {
   const project = readyProject(t, { mode: 'new', unconnected: [FAILURE, SUCCESS], confirm: false, results: {} });
   const { repo } = project;
-  confirmChecks(project, { attempts: 3 });
+  confirmChecks(project, { tier: 'full', attempts: 3 });
   startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
   startLoop(repo, CHANGE);
   const status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.next.route], ['iterate', undefined], JSON.stringify(status.next));
-  assert.ok(status.next.message.startsWith('No package is connected yet, so `run start` has nothing to run. Write the code\'s entry point. Connecting the packages in write-eval changes them, which ends this loop (packages_changed); the user then confirms them, and a new loop follows with their go-ahead.'), status.next.message);
-  assert.deepEqual(status.next.pending_packages, [FAILURE, SUCCESS]);
+  assert.equal(status.phase, 'live');
+  const { situation } = status;
+  assert.deepEqual([situation.code, situation.no_package_connected, situation.pending_packages], ['open', true, [FAILURE, SUCCESS]], JSON.stringify(situation));
+  assert.ok(situation.message.startsWith('No package is connected yet, so a run has nothing to run; connecting the packages changes them, which ends this loop.'), situation.message);
+  assertNoRoutes(situation, 'situation');
+  // A head run has nothing to run until a package is connected.
+  refusedBeforeRun(project, {}, 'no_runnable_case');
 });
 
-test('after the user accepted the loop, workflow check write-eval says a package changed since only warns', (t) => {
-  const project = inLoop(t);
+test('loop status and workflow status suggest no head run while no package is connected, since run start refuses it', (t) => {
+  const project = readyProject(t, { mode: 'new', unconnected: [FAILURE, SUCCESS], confirm: false, results: {} });
   const { repo } = project;
+  confirmChecks(project, { tier: 'full', attempts: 3 });
+  startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
+  startLoop(repo, CHANGE);
+  const status = loopStatus(repo, CHANGE);
+  assert.equal(status.situation.no_package_connected, true);
+  // A suggestion is never an action the CLI lists as refused.
+  const work = workflowStatus(repo, CHANGE);
+  const suggested = work.actions.find((entry) => JSON.stringify(entry.command) === JSON.stringify(work.suggestion?.command));
+  assert.ok(!suggested || suggested.allowed, JSON.stringify({ suggestion: work.suggestion, blocked_by: suggested?.blocked_by }));
+  assert.notDeepEqual(status.suggestion?.command?.slice(0, 2), ['run', 'start'], JSON.stringify(status.suggestion));
+});
+
+test('after the user accepted the loop, a package change no longer ends it: loop status only warns', (t) => {
+  const project = inLoop(t);
+  const { repo, root } = project;
   changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
   const run = fullRun(repo);
   completeReport(repo, run.run_id);
-  const before = checkWorkflow(repo, 'write-eval', CHANGE).next.note;
-  assert.ok(before.endsWith('a loop runs for this Spec, and changing a package or the kit while it runs ends it (packages_changed): `eval review` and the user\'s `eval confirm`, then a new loop once they agree.'), before);
+  assert.equal(workflowStatus(repo, CHANGE).layers.packages.editing_ends_loop, true);
+  reviewRun(project, run.run_id);
   acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'thread 1' });
-  const note = checkWorkflow(repo, 'write-eval', CHANGE).next.note;
-  assert.ok(note.endsWith('the user accepted the loop for this Spec, so `loop status` only warns about a package changed since: tell the user what changed and why.'), note);
+  assert.equal(workflowStatus(repo, CHANGE).layers.packages.editing_ends_loop, false);
+  appendFileSync(path.join(root, 'evals', FAILURE, 'tests/test.sh'), '# a fix to the verifier\n');
+  const status = loopStatus(repo, CHANGE);
+  assert.equal(status.phase, 'done', JSON.stringify(status.situation));
+  assert.equal(status.ended, null);
+  assert.ok(status.warnings.some((warning) => warning.startsWith(`The eval packages changed after the accepted run ${run.run_id}: ${FAILURE}. The acceptance stays as it was given.`)), JSON.stringify(status.warnings));
 });
 
-test('outside a loop, the steps after a package changed since the confirmation name eval confirm --reason, as a revision needs', (t) => {
+test('outside a loop, a package changed since the confirmation is a revision the user confirms, with an optional reason', (t) => {
   const project = readyProject(t, { live: [FAILURE], attempts: 3 });
   const { repo, root } = project;
   startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
   appendFileSync(path.join(root, 'evals', FAILURE, 'tests/test.sh'), '# a fix to the verifier\n');
   const checked = checkEval(repo, CHANGE);
   assert.equal(checked.passed, true);
-  assert.ok(checked.next.endsWith('so they confirm the revision before the baseline (`eval review`, `eval confirm --reason`).'), checked.next);
-  const workflow = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(workflow.next.action, 'confirm_checks');
-  assert.ok(workflow.next.note.includes('as a revision') && workflow.next.note.endsWith('record their words with `eval confirm --reason`.'), workflow.next.note);
+  const work = workflowStatus(repo, CHANGE);
+  assert.deepEqual([work.layers.confirmation.current, work.layers.confirmation.changed_since], [false, [FAILURE]]);
+  const unconfirmed = work.layers.confirmation.gaps.find((entry) => entry.code === 'checks_unconfirmed');
+  assertGapShape(unconfirmed, { owner: 'user', layer: 'confirmation', cases: [FAILURE], files: [`${FAILURE}/tests/test.sh`] });
+  const confirm = confirmAction(work);
+  assert.deepEqual([confirm.by, confirm.allowed, confirm.needed], ['user', true, true], JSON.stringify(confirm));
+  // A baseline recorded now runs, but takes the plan as its own: the user has not confirmed these packages.
   const again = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
-  assert.ok(again.next.includes('Have the user confirm the checks first (`eval review`, `eval confirm --reason`)'), again.next);
+  assert.equal(again.confirmation_current, false);
+  assert.ok(again.warnings.includes(unconfirmed.message), JSON.stringify(again.warnings));
   const review = reviewEval(repo, CHANGE);
-  assert.ok(review.next.includes('run `eval confirm` with --by and --ref, --reason, since this Spec export was confirmed before, and the plan they agreed.'), review.next);
-  assert.equal(confirmChecks(project, { reason: 'The verifier of the failure case was fixed.' }).confirmation.confirmed.kind, 'revision');
+  assert.deepEqual([review.confirm.owner, review.confirm.revision, review.confirm.reason], ['user', true, 'optional']);
+  assert.deepEqual(review.confirm.needs, ['--by', '--ref', '--verdicts']);
+  assert.ok(review.must_decide.some((item) => item.code === 'changed_since_confirmation' && item.package === FAILURE), JSON.stringify(review.must_decide));
+  const confirmed = confirmChecks(project, { reason: 'The verifier of the failure case was fixed.' }).confirmation.confirmed;
+  assert.deepEqual([confirmed.kind, confirmed.reason], ['revision', 'The verifier of the failure case was fixed.']);
+  // The reason is optional.
+  appendFileSync(path.join(root, 'evals', FAILURE, 'tests/test.sh'), '# another fix\n');
+  assert.equal(checkEval(repo, CHANGE).passed, true);
+  assert.equal(confirmChecks(project).confirmation.confirmed.kind, 'revision');
 });
 
-test('while the loop\'s baseline is missing from runs/, the loop has ended and says how to restore it, and restoring it lifts the end', (t) => {
+test('while the loop\'s baseline is missing from runs/, the loop has ended for the agent to restore, and restoring it lifts the end', (t) => {
   const project = readyProject(t, { model: 'synthetic/m1' });
   const { repo, root } = project;
   const base = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
@@ -92,45 +117,65 @@ test('while the loop\'s baseline is missing from runs/, the loop has ended and s
   renameSync(folder, away);
   const missing = loopStatus(repo, CHANGE);
   assertEnded(missing, 'baseline_missing');
-  assert.equal(missing.next.route, 'run-eval');
-  assert.deepEqual([missing.ended.baseline, missing.ended.start_code], [base.run_id, loopRecord(project).start_code]);
-  assert.ok(missing.next.message.startsWith(`The loop for this Spec compares every run with ${base.run_id}, which is no longer in runs/, so the loop has ended (baseline_missing). Restore that run folder to go on with it`), missing.next.message);
+  assertGapShape(missing.gates.head_run, { owner: 'agent', layer: 'baseline' });
+  const { start_code: start } = loopRecord(project);
+  assert.deepEqual([missing.ended.baseline, missing.ended.start_code], [base.run_id, { commit: start.commit, digest: start.digest, patch: null, uncommitted_files: [] }]);
+  assert.equal(missing.ended.message, `The loop's baseline ${base.run_id} is no longer in runs/, so this loop has ended.`);
   setResults(repo, AFTER);
-  refusedBeforeRun(project, {}, 'loop_ended');
+  assert.equal(refusedBeforeRun(project, {}, 'change_locked').reason, 'baseline_missing');
   renameSync(away, folder);
   const status = loopStatus(repo, CHANGE);
   assert.equal(status.ended, null);
-  assert.equal(status.next.action, 'iterate', JSON.stringify(status.next));
+  assert.equal(status.phase, 'live');
+  assert.equal(status.situation.code, 'open', JSON.stringify(status.situation));
+  assert.deepEqual(status.suggestion.command, ['run', 'start', CHANGE, '--repo', repo]);
 });
 
-test('in a new project, eval review asks for N while no package declares its dependencies, and eval confirm without --attempts warns', (t) => {
+test('in a new project, eval review warns that N is not known while no package declares its dependencies, and eval confirm without --attempts warns', (t) => {
   const project = readyProject(t, { mode: 'new', unconnected: [FAILURE, SUCCESS], confirm: false, results: {}, check: false });
   const { repo } = project;
-  const ask = 'No package declares its dependencies yet, since the loop connects them. If a scenario may call a model, ask the user for N now and';
+  const later = 'No package declares its dependencies yet, since none is connected, so whether a scenario calls a model is not known. Declaring a live dependency later changes the package: a running loop ends, and the number of attempts is the user\'s decision before a new one.';
   const review = reviewEval(repo, CHANGE);
   assert.equal(review.run_plan.attempts_needed, false);
-  assert.ok(review.next.endsWith(`${ask} pass --attempts N: declaring a live dependency later changes the package, which ends a running loop and needs the user's number before a new one.`), review.next);
-  const confirmed = confirmChecks(project);
-  assert.ok(confirmed.warnings.includes(`This confirmation fixes no number of attempts. ${ask} confirm again with --attempts N and --reason before the baseline: declaring a live dependency later changes the package, which ends a running loop and needs the user's number before a new one.`), JSON.stringify(confirmed.warnings));
-  // Once N is fixed, neither asks.
-  assert.ok(!confirmChecks(project, { attempts: 3, reason: 'The user chose 3 attempts.' }).warnings.some((warning) => warning.includes(ask)));
-  assert.ok(!reviewEval(repo, CHANGE).next.includes(ask));
+  assert.ok(review.warnings.includes(later), JSON.stringify(review.warnings));
+  const confirmed = confirmChecks(project, { tier: 'full' });
+  assert.equal(confirmed.confirmation.run_plan.attempts, null);
+  assert.ok(confirmed.warnings.includes(`This confirmation fixes no number of attempts. ${later}`), JSON.stringify(confirmed.warnings));
+  // Once the user fixes N, neither warns.
+  const fixed = confirmChecks(project, { tier: 'full', attempts: 3, reason: 'The user chose 3 attempts.' });
+  assert.equal(fixed.confirmation.run_plan.attempts, 3);
+  assert.ok(!fixed.warnings.some((warning) => warning.includes(later)), JSON.stringify(fixed.warnings));
+  assert.ok(!reviewEval(repo, CHANGE).warnings.includes(later));
 });
 
-test('a baseline given plan flags before the user confirmed is named with its plan by eval review and workflow check', (t) => {
-  const project = readyProject(t, { live: [FAILURE], confirm: false });
+test('a baseline given plan flags before the user confirmed is a decision eval review puts to the user, with its plan', (t) => {
+  const project = readyProject(t, { confirm: false });
   const { repo } = project;
   const flagAgent = 'flag_agent:FlagAgent';
-  const base = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT), attempts: 3, agent: flagAgent, model: 'synthetic/flag-model' });
+  const base = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT), agent: flagAgent });
+  assert.deepEqual([base.run_plan.agent, base.run_plan.source, base.confirmation_current], [flagAgent, 'baseline', false]);
   const item = reviewEval(repo, CHANGE).must_decide.find((entry) => entry.code === 'baseline_plan_recorded');
-  assert.deepEqual([item?.baseline, item?.keys, item?.flags], [base.run_id, ['attempts', 'agent', 'model'], undefined], JSON.stringify(item));
-  const text = `The baseline ${base.run_id} ran with 3 attempts, agent ${flagAgent}, model synthetic/flag-model, a plan of its own: without plan flags, \`eval confirm\` records no fixed number of attempts, agent ${AGENT}, model none. \`loop start\` takes that baseline only once the user confirms the plan it ran; otherwise record the baseline again after the confirmation, which reads the plan from it.`;
-  assert.equal(item.message, `${text} The user decides which one runs.`);
-  const workflow = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(workflow.next.action, 'confirm_checks');
-  assert.ok(workflow.next.note.includes(text), workflow.next.note);
-  // Confirmed with those flags, the loop starts on that baseline.
-  confirmChecks(project, { attempts: 3, agent: flagAgent, model: 'synthetic/flag-model' });
+  assert.deepEqual([item?.baseline, item?.keys], [base.run_id, ['agent']], JSON.stringify(item));
+  assert.ok(item.message.includes(`The baseline ${base.run_id} ran with`) && item.message.includes(`agent ${flagAgent}`), item.message);
+  assert.ok(item.message.endsWith('The user decides which one runs.'), item.message);
+  const work = workflowStatus(repo, CHANGE);
+  assert.ok(work.layers.confirmation.review.must_decide.includes('baseline_plan_recorded'), JSON.stringify(work.layers.confirmation.review));
+  assert.ok(work.must_show.must_decide.some((entry) => entry.code === 'baseline_plan_recorded'), JSON.stringify(Object.keys(work.must_show)));
+  // Confirmed with that agent, in the full tier where an agent can be given, the loop starts on that baseline.
+  confirmChecks(project, { tier: 'full', agent: flagAgent });
   assert.ok(!reviewEval(repo, CHANGE).must_decide.some((entry) => entry.code === 'baseline_plan_recorded'));
   assert.equal(startLoop(repo, CHANGE).loop.baseline, base.run_id);
+});
+
+test('before any confirmation, a baseline of a model-calling change is refused until the user decides the number of attempts, whatever --attempts says', (t) => {
+  for (const options of [{ live: [FAILURE] }, { model: 'synthetic/m1' }]) {
+    const project = readyProject(t, { ...options, confirm: false });
+    const { repo } = project;
+    const refusal = refusedBeforeRun(project, { baseline: true, expect: writeExpectations(repo, EXPECT), attempts: 3, ...APPROVAL }, 'attempts_undecided');
+    assertGapShape(refusal, { owner: 'user', layer: 'confirmation' });
+    // The user's confirmation of N settles it.
+    confirmChecks(project, { attempts: 3 });
+    const base = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
+    assert.deepEqual([base.is_baseline, base.run_plan.attempts, base.run_plan.source], [true, 3, 'confirmation'], JSON.stringify(options));
+  }
 });

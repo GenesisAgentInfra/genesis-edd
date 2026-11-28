@@ -16,6 +16,10 @@ import {
   readyProject, setResults, writeExpectations,
 } from './edd.js';
 
+// The consent of the user and startLoop with it (see edd.js), so a run test
+// file imports them from here with the rest.
+export { APPROVAL, APPROVAL_FLAGS, CONSENT, CONSENT_FLAGS, LAYERS, REF, USER, actionOf, allowedActions, assertGapShape, assertNoRoutes, assertSuggestion, startLoop } from './edd.js';
+
 export const FAILURE = 'submit-failure-s1';
 export const SUCCESS = 'submit-success-s1';
 

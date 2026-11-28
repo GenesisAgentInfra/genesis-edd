@@ -1,38 +1,30 @@
 // Loop tests: the code before the change across Spec exports, and the run plans
 // a loop holds to.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import os from 'node:os';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { ignoredArtifacts, initProject, projectRoot, readJSON } from '../src/project.js';
-import { exportSpec, newSpec, validateSpec } from '../src/spec.js';
-import { newEval, validateEval } from '../src/eval.js';
+import { readJSON } from '../src/project.js';
 import { checkEval, codeSnapshot, startRun } from '../src/run.js';
-import { acceptLoop, loopStatus, reportGaps, startLoop, writeReport } from '../src/loop.js';
-import { checkWorkflow } from '../src/workflow.js';
-import { reviewEval } from '../src/confirm.js';
+import { acceptLoop, loopStatus, writeReport } from '../src/loop.js';
+import { workflowStatus } from '../src/workflow.js';
+import { AFTER, BEFORE, CHANGE, actionOf, assertGapShape, assertNoRoutes, confirmChecks, git, harborThen, readyProject, setResults, startLoop, writeExpectations } from './helpers/edd.js';
 import {
-  AFTER, AGENT, BEFORE, CHANGE, FIXTURES, LIVE_DEPENDENCY, SPECS, cli, commit, commitConfirmation, confirmChecks, connect, dropCheck, editChecks, git, harborThen, legacyWarning, readRecord,
-  readyProject, reviewFixtures, setResults, toLegacy, useFakeTools, writeExpectations, writeFixtureScripts, writeSpec,
-} from './helpers/edd.js';
-import {
-  EXPECT, BROKEN, TEMPLATE_MARK, codes, blockedWith, refusedWith, withBaseline, inLoop, changeCode, fullRun, completeReport, FAILURE, SUCCESS, REVISED,
-  loopPath, loopRecord, editApp, restoreStart, changePackage, exportRevision, resultsOutsideCode, liveLoop, gapOf, finalsLoop, passingScreen,
-  newProjectLoop,
-  refusedBeforeRun, assertEnded, assertStopBudget,
+  EXPECT, blockedWith, refusedWith, withBaseline, inLoop, changeCode, fullRun, FAILURE, SUCCESS,
+  loopPath, loopRecord, editApp, restoreStart, exportRevision, resultsOutsideCode, liveLoop, gapOf, finalsLoop, passingScreen,
+  refusedBeforeRun, assertEnded, reviewRun,
 } from './helpers/loop.js';
 
 // --- The code before the change across Spec exports, run plans a loop holds
-// to, errored attempts, and the messages that go with them. ---
+// to, errored attempts, and what goes with them. ---
 
 // Expected baseline results that hold on the code before the change and after it.
 const ANY = { [`${FAILURE}/c1`]: 'any', [`${SUCCESS}/c1`]: 'pass', [`${SUCCESS}/c2`]: 'pass' };
 
-test('after the Spec is exported again in a loop the user has not accepted, every base record of the new export goes on the loop\'s starting code, and the loop for it keeps that code', (t) => {
-  // app/results.json stays uncommitted, so the starting code needs loop-start.patch.
-  const project = withBaseline(t, { commit: false });
+test('after the Spec is exported again in a loop the user has not accepted, every base record of the new export goes on the loop\'s start code, and the loop for it keeps that code', (t) => {
+  // app/results.json stays uncommitted, so the start code needs loop-start.patch.
+  // The full tier, so a record that nothing could run is allowed at all.
+  const project = withBaseline(t, { commit: false, tier: 'full' });
   const { repo, root } = project;
   startLoop(repo, CHANGE);
   const first = loopRecord(project);
@@ -40,68 +32,72 @@ test('after the Spec is exported again in a loop the user has not accepted, ever
   const patch = readFileSync(path.join(root, 'loop-start.patch'), 'utf8');
   editApp(repo, AFTER, 'changed in the first loop');
   assert.equal(fullRun(repo).verdict, 'pass');
-  const exported = exportRevision(project);
+  const exported = exportRevision(project, { tier: 'full' });
   const hint = `${first.start_code.commit ? `commit ${first.start_code.commit}` : 'no commit'} plus \`git apply\` .genesis/edd/${CHANGE}/loop-start.patch`;
 
-  // The loop has ended; loop status and workflow check name the starting code.
+  // The loop has ended; loop status names the start code, and the change is
+  // locked until the user agrees to a new loop.
   const status = loopStatus(repo, CHANGE);
   assertEnded(status, 'spec_exported');
-  assert.deepEqual(status.ended.start_code, first.start_code);
-  assert.ok(status.next.message.includes(`a new loop keeps its start code, ${hint}, until a loop of this change is accepted`), status.next.message);
-  const check = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(check.next.action, 'record_baseline', JSON.stringify(check.next));
-  assert.ok(check.next.note.includes(`Until a loop of this change is accepted, a new loop keeps the start code of the change's first unaccepted loop, ${hint}: that is still the code before the change.`), check.next.note);
+  assert.deepEqual(status.ended.start_code, { commit: first.start_code.commit, digest: first.start_code.digest, patch: `.genesis/edd/${CHANGE}/loop-start.patch`, uncommitted_files: ['app/results.json'] });
+  let workflow = workflowStatus(repo, CHANGE);
+  assert.equal(workflow.layers.loop.change_lock.reason, 'spec_exported');
+  assert.equal(workflow.layers.baseline.start_code.restore, hint);
+  // A base record of the working directory is refused; one rebuilt on the start code is allowed.
+  assert.deepEqual(actionOf(workflow, 'run', 'start', '--baseline', '--expect').blocked_by, ['baseline_after_change']);
+  assert.equal(actionOf(workflow, 'run', 'start', '--baseline', '--at-start').allowed, true);
+  assert.deepEqual(workflow.suggestion.command.slice(-2), ['--baseline', '--at-start']);
 
   // A base record on the changed code is refused, one that records that nothing could run too.
   for (const options of [{ expect: writeExpectations(repo, ANY) }, { unavailable: 'execution_blocked' }]) {
     assert.throws(() => startRun(repo, CHANGE, { baseline: true, ...options }), (error) => {
       refusedWith('baseline_after_change')(error);
-      assert.ok(error.gaps[0].message.startsWith(`Until a loop of this change is accepted, every base record goes on the start code of its first unaccepted loop, ${hint}.`), error.gaps[0].message);
+      const entry = assertGapShape(gapOf(error, 'baseline_after_change'), { owner: 'agent', layer: 'baseline', start_code: hint });
+      assert.ok(entry.message.startsWith(`Until a loop of this change is accepted or the user abandons the change, every base record goes on the start code of its first unaccepted loop, ${hint}, and the working directory holds other code.`), entry.message);
       return true;
     });
   }
   assert.equal(readJSON(loopPath(project)).spec, first.spec);
 
-  // On the starting code it goes through, and the new loop keeps that code.
+  // On the start code it goes through, and the new loop keeps that code.
   restoreStart(project);
   const base = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
   assert.equal(base.is_baseline, true, JSON.stringify(base));
-  assert.ok(base.next.startsWith(`The baseline is recorded on the start code of the change's first unaccepted loop (${hint}). Bring back any changes you set aside and, once the user agrees, run \`loop start\``), base.next);
+  assert.deepEqual([base.start_code, base.loop_baseline, base.confirmation_current], [hint, { usable: true, reasons: [] }, true]);
   editApp(repo, AFTER, 'changed in the first loop');
-  // With the changes back, workflow check and eval confirm compare the new
-  // baseline with that starting code: only loop start is left.
-  const startCommand = ['loop', 'start', CHANGE, '--repo', repo];
-  const runEval = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.deepEqual([runEval.status, runEval.next.action], ['ready', 'start_loop'], JSON.stringify(runEval.next));
-  assert.deepEqual(runEval.next.command, startCommand);
-  assert.ok(runEval.next.note.startsWith(`The baseline ${base.run_id} is recorded on the start code of the change's first unaccepted loop. Bring back any changes you set aside and, once the user agrees, run \`loop start\``), runEval.next.note);
-  const implement = checkWorkflow(repo, 'loop-and-implement', CHANGE);
-  assert.equal(implement.status, 'ready', JSON.stringify(implement.gaps));
-  assert.deepEqual(implement.next.command, startCommand);
-  const revised = confirmChecks(project, { reason: 'The user read the checks of the new export again.' });
-  assert.equal(revised.next, `The checks are confirmed. The baseline ${base.run_id} ran these packages with this plan on the start code of the change's first unaccepted loop: bring back any changes you set aside and start the loop next with \`loop start\`, once the user agrees, which keeps that start code and takes the budget the user confirmed.`);
-  startLoop(repo, CHANGE);
+  // With the changes back, only the user's go-ahead is left before loop start.
+  workflow = workflowStatus(repo, CHANGE);
+  const start = actionOf(workflow, 'loop', 'start');
+  assert.deepEqual([start.allowed, start.by, start.start_code], [true, 'user', 'pinned']);
+  assert.deepEqual(workflow.suggestion.command, ['loop', 'start', CHANGE, '--repo', repo, '--by', '<user>', '--ref', '<where they said so>']);
+  // A confirmation after it keeps that baseline.
+  const revised = confirmChecks(project, { tier: 'full', reason: 'The user read the checks of the new export again.' });
+  assert.deepEqual([revised.baseline.recorded, revised.baseline.kept, revised.baseline.on], [base.run_id, true, 'start_code']);
+  assert.deepEqual(revised.new_loop_needs, { baseline: false, user_consent: true });
+  const started = startLoop(repo, CHANGE);
   const second = loopRecord(project);
-  assert.deepEqual([second.spec, second.baseline], [exported.id, base.run_id]);
+  assert.deepEqual([second.spec, second.baseline, second.start_from], [exported.id, base.run_id, 'pinned']);
   assert.deepEqual(second.start_code, first.start_code);
   assert.equal(second.base_commit, first.base_commit);
+  assert.equal(started.worktree_moved, true);
   assert.equal(readFileSync(path.join(root, 'loop-start.patch'), 'utf8'), patch);
   // The loop goes on from the changed code, compared with the new baseline.
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'iterate');
+  assert.equal(loopStatus(repo, CHANGE).situation.code, 'open');
   assert.equal(fullRun(repo).verdict, 'pass');
 });
 
-test('a loop for a new export keeps the starting code of the unaccepted loop before it, and goes on from the code as it is', (t) => {
+test('a loop for a new export keeps the start code of the unaccepted loop before it, and goes on from the code as it is', (t) => {
   const project = inLoop(t);
   const { repo } = project;
   const first = loopRecord(project);
   exportRevision(project);
-  // Recorded on the starting code, then the code changes before loop start.
+  // Recorded on the start code, then the code changes before loop start.
   const base = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
   assert.equal(base.is_baseline, true);
   editApp(repo, AFTER, 'a change before the loop of the new export');
-  const again = startLoop(repo, CHANGE).loop;
-  assert.deepEqual(again.start_code, first.start_code, 'the loop keeps the starting code and goes on from the current code');
+  const again = startLoop(repo, CHANGE);
+  assert.deepEqual(again.loop.start_code, first.start_code, 'the loop keeps the start code and goes on from the current code');
+  assert.deepEqual([again.loop.start_from, again.worktree_moved], ['pinned', true]);
 });
 
 test('once the user accepted the loop, a new export may record its baseline on the accepted code, and its loop starts there', (t) => {
@@ -110,14 +106,15 @@ test('once the user accepted the loop, a new export may record its baseline on t
   const first = loopRecord(project);
   changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
   const run = fullRun(repo);
-  completeReport(repo, run.run_id);
+  reviewRun(project, run.run_id);
   acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'thread 1' });
   exportRevision(project);
   const status = loopStatus(repo, CHANGE);
   assertEnded(status, 'spec_exported');
-  assert.equal(status.ended.accepted, true);
-  assert.equal(status.ended.start_code, null);
-  assert.ok(!status.next.message.includes('keeps its start code'), status.next.message);
+  assert.deepEqual([status.ended.accepted, status.accepted, status.ended.start_code], [true, true, null]);
+  // The user accepted that loop: nothing is locked and no start code is pinned.
+  const workflow = workflowStatus(repo, CHANGE);
+  assert.deepEqual([workflow.layers.loop.change_lock, workflow.layers.baseline.start_code], [null, null]);
   const base = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, ANY) });
   assert.equal(base.is_baseline, true, JSON.stringify(base));
   const second = startLoop(repo, CHANGE).loop;
@@ -132,14 +129,16 @@ test('a baseline that records that nothing could run keeps its plan for the loop
   const base = startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
   assert.equal(base.run_plan.attempts, 3);
   const revised = confirmChecks(project, { attempts: 5, reason: 'The user asked for 5 attempts.' });
-  assert.match(revised.next, /^The checks are confirmed\. Record the baseline next/);
-  const check = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(check.next.action, 'record_baseline', JSON.stringify(check.next));
-  assert.deepEqual(check.next.command, ['run', 'start', CHANGE, '--repo', repo, '--baseline', '--unavailable', 'no_implementation']);
+  assert.deepEqual([revised.baseline.recorded, revised.baseline.kept, revised.baseline.unavailable], [base.run_id, false, 'no_implementation']);
+  assert.deepEqual(revised.new_loop_needs, { baseline: true, user_consent: true });
+  const workflow = workflowStatus(repo, CHANGE);
+  assertGapShape(workflow.gaps.find((entry) => entry.code === 'baseline_plan_differs'), { owner: 'agent', layer: 'baseline', run: base.run_id, differs: ['attempts'] });
+  assert.deepEqual(actionOf(workflow, 'loop', 'start').blocked_by, ['baseline_plan_differs']);
   assert.throws(() => startLoop(repo, CHANGE), (error) => {
     blockedWith('baseline_plan_differs')(error);
-    assert.ok(gapOf(error, 'baseline_plan_differs').message.startsWith(`The baseline ${base.run_id} records that nothing could run, and a loop on it runs with 3 attempts but the user confirmed 5 attempts`), error.message);
-    assert.ok(gapOf(error, 'baseline_plan_differs').message.includes('`run start --baseline --unavailable no_implementation` reads the confirmed plan'), error.message);
+    const { message } = gapOf(error, 'baseline_plan_differs');
+    assert.ok(message.startsWith(`The baseline ${base.run_id} records that nothing could run, and a loop on it runs with 3 attempts but the user confirmed 5 attempts`), message);
+    assert.ok(message.endsWith('A baseline reads the confirmed plan from confirmed.json.'), message);
     return true;
   });
   const again = startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
@@ -147,24 +146,24 @@ test('a baseline that records that nothing could run keeps its plan for the loop
   assert.equal(startLoop(repo, CHANGE).run_plan.attempts, 5);
 });
 
-test('a run plan confirmed inside a loop ends it, loop accept and run start refuse it, and a new loop needs a baseline of that plan', (t) => {
+test('a run plan confirmed inside a loop ends it, loop accept and run start refuse it, and a new loop needs a baseline of that plan on the start code', (t) => {
   const project = readyProject(t, { live: [FAILURE], attempts: 3 });
   const { repo } = project;
   startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
   const first = startLoop(repo, CHANGE).loop;
   changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
   const screen = fullRun(repo);
-  completeReport(repo, screen.run_id);
   // The user confirms 5 attempts: the confirmation is recorded and the loop ends.
   const confirmed = confirmChecks(project, { attempts: 5, reason: 'The user wants 5 attempts.' });
   assert.equal(confirmed.confirmation.run_plan.attempts, 5);
   const status = loopStatus(repo, CHANGE);
   assertEnded(status, 'confirmation_changed');
   assert.deepEqual([status.ended.plan, status.ended.packages, status.ended.confirmation], [['attempts'], [], confirmed.confirmation.id]);
+  assertGapShape(status.gates.head_run, { code: 'loop_ended', owner: 'user', layer: 'confirmation' });
   assert.throws(() => acceptLoop(repo, CHANGE, { run: screen.run_id, by: 'Dana', ref: 'thread 1' }), refusedWith('loop_ended'));
-  refusedBeforeRun(project, {}, 'loop_ended');
+  refusedBeforeRun(project, {}, 'change_locked');
   assert.throws(() => startLoop(repo, CHANGE), blockedWith('baseline_plan_differs'));
-  // A baseline on the starting code reads the 5 attempts, and a new loop starts on it.
+  // A baseline on the start code reads the 5 attempts, and a new loop starts on it.
   git(repo, ['checkout', '-q', 'HEAD~1', '--', 'app']);
   rmSync(path.join(repo, 'app/handler.txt'), { force: true });
   assert.equal(codeSnapshot(repo).snapshot.digest, first.start_code.digest);
@@ -175,6 +174,7 @@ test('a run plan confirmed inside a loop ends it, loop accept and run start refu
   const next = startLoop(repo, CHANGE).loop;
   assert.equal(next.baseline, again.run_id);
   assert.equal(next.checks_confirmation.id, confirmed.confirmation.id);
+  assert.deepEqual(next.start_code.digest, first.start_code.digest);
   const restarted = loopStatus(repo, CHANGE);
   assert.equal(restarted.ended, null);
   assert.equal(restarted.loop.run_plan.attempts, 5);
@@ -198,17 +198,16 @@ test('a fail graded after the agent errored neither withdraws an acceptance nor 
   assert.equal(startRun(repo, CHANGE).execution_status, 'error');
   // Other code, a completed run, the same check fails: the first valid result of the loop.
   editApp(repo, BEFORE, 'second try');
-  const second = fullRun(repo);
-  completeReport(repo, second.run_id);
+  fullRun(repo);
   let status = loopStatus(repo, CHANGE);
   assert.equal(status.stuck, false);
-  assert.equal(status.next.action, 'iterate', JSON.stringify(status.next));
+  assert.equal(status.situation.code, 'open', JSON.stringify(status.situation));
 
   // After an acceptance, a rerun of the accepted code that errored with a graded fail keeps it.
   tools.harbor(true);
   editApp(repo, AFTER, 'the fix');
   const passed = fullRun(repo);
-  completeReport(repo, passed.run_id);
+  reviewRun(project, passed.run_id);
   acceptLoop(repo, CHANGE, { run: passed.run_id, by: 'Dana', ref: 'thread 1' });
   harborThen(t, `if (argv[argv.indexOf('-p') + 1].endsWith('${SUCCESS}')) {
     const trial = path.join(logs, 'harbor', 'trial-1');
@@ -220,12 +219,11 @@ test('a fail graded after the agent errored neither withdraws an acceptance nor 
     writeFileSync(path.join(trial, 'verifier', 'check-results.json'), JSON.stringify(checks));
   }`);
   const errored = startRun(repo, CHANGE);
-  // This verdict was pinned as fail until a fail graded after an error stopped
-  // counting: the check is unknown, so the run fails nothing.
+  // A fail graded after an error is no result: the check is unknown, so the run fails nothing.
   assert.deepEqual([errored.execution_status, errored.verdict], ['error', 'unverified']);
   status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'done', JSON.stringify(status.next));
-  assert.equal(status.accepted.outdated, undefined);
+  assert.equal(status.phase, 'done', JSON.stringify(status.situation));
+  assert.deepEqual([status.acceptance.holds, status.acceptance.outdated], [true, undefined]);
   // A run recorded before then, with the graded fail as its result and verdict, keeps the acceptance too.
   const folder = path.join(project.runs, errored.run_id);
   const record = readJSON(path.join(folder, 'run.json'));
@@ -238,37 +236,55 @@ test('a fail graded after the agent errored neither withdraws an acceptance nor 
   attempts.attempts = attempts.attempts.map(({ graded, ...entry }) => ({ ...entry, results: graded ?? entry.results }));
   writeFileSync(attemptsFile, `${JSON.stringify(attempts, null, 2)}\n`);
   status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'done', JSON.stringify(status.next));
-  assert.equal(status.accepted.outdated, undefined);
+  assert.equal(status.phase, 'done', JSON.stringify(status.situation));
+  assert.deepEqual([status.acceptance.holds, status.acceptance.outdated], [true, undefined]);
 });
 
-test('a revision that leaves the recorded baseline as it ran says to start the loop, not to record the baseline again', (t) => {
-  const { repo, ...project } = withBaseline(t);
-  const revised = confirmChecks({ repo, ...project }, { iterations: 8, reason: 'The user raised the budget.' });
-  assert.match(revised.next, /^The checks are confirmed\. The baseline \S+ ran these packages with this plan on this code: start the loop next with `loop start`/);
-  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'start_loop');
-  assert.equal(startLoop(repo, CHANGE).loop.budget.iterations, 8);
+test('a revision that leaves the recorded baseline as it ran keeps it, so only the user\'s go-ahead is left before loop start', (t) => {
+  const project = withBaseline(t);
+  const { repo, base } = project;
+  const revised = confirmChecks(project, { iterations: 8, reason: 'The user raised the budget.' });
+  assertNoRoutes(revised, 'confirmation');
+  assert.deepEqual([revised.baseline.recorded, revised.baseline.kept], [base.run_id, true]);
+  assert.deepEqual(revised.new_loop_needs, { baseline: false, user_consent: true });
+  assert.deepEqual(revised.suggestion.command.slice(0, 2), ['loop', 'start']);
+  const workflow = workflowStatus(repo, CHANGE);
+  assert.deepEqual([actionOf(workflow, 'run', 'start', '--baseline').needed, actionOf(workflow, 'loop', 'start').allowed], [false, true]);
+  const started = startLoop(repo, CHANGE);
+  assert.deepEqual([started.loop.budget.iterations, started.loop.budget_source, started.loop.baseline], [8, 'confirmation', base.run_id]);
 });
 
-test('a package that waits only for eval check comes first: eval confirm and workflow check say so, the baseline warns, and loop start refuses a baseline that skipped it', (t) => {
+test('a package that waits only for eval check comes first: the light tier confirms no line it cannot prove, a baseline skips the package, and loop start refuses a baseline that skipped it', (t) => {
   const project = readyProject(t);
   const { repo, root } = project;
   const file = path.join(root, 'evals', SUCCESS, 'environment/Dockerfile');
   writeFileSync(file, `${readFileSync(file, 'utf8')}RUN true\n`);
-  const confirmed = confirmChecks(project, { reason: 'The Dockerfile of submit-success-s1 gained a build step.' });
-  assert.ok(confirmed.next.startsWith(`The checks are confirmed. Prove ${SUCCESS} with \`eval check\` first`), confirmed.next);
-  const check = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.deepEqual([check.next.action, check.next.command], ['check_evals', ['eval', 'check', CHANGE, '--repo', repo]]);
-  assert.ok(check.next.note.startsWith(`${SUCCESS} changed since its last \`eval check\``), check.next.note);
+  const reason = 'The Dockerfile of submit-success-s1 gained a build step.';
+  // The proofs of its lines were made for the package as it was.
+  assert.throws(() => confirmChecks(project, { reason }), (error) => {
+    refusedWith('line_unproven')(error);
+    assert.match(gapOf(error, 'line_unproven').message, /review-c1 is not proved by the last `eval check` of submit-success-s1 as it is/);
+    return true;
+  });
+  // The full tier confirms it and says it waits for eval check.
+  const confirmed = confirmChecks(project, { tier: 'full', reason });
+  assert.deepEqual([confirmed.unchecked, confirmed.new_loop_needs.baseline], [[SUCCESS], true]);
+  let workflow = workflowStatus(repo, CHANGE);
+  assert.deepEqual([actionOf(workflow, 'eval', 'check').allowed, actionOf(workflow, 'eval', 'check').cases], [true, [SUCCESS]]);
+  assert.deepEqual(workflow.suggestion.command, ['eval', 'check', CHANGE, '--repo', repo]);
   const base = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
-  assert.ok(base.warnings.includes(`${SUCCESS} changed since its last \`eval check\`, so this baseline skips it, and a loop does not start on it. Prove it with \`eval check\`, then record the baseline again.`), JSON.stringify(base.warnings));
+  assert.ok(base.warnings.includes(`${SUCCESS} changed since its last \`eval check\`, so this baseline skips it, and a loop does not start on it.`), JSON.stringify(base.warnings));
+  assert.deepEqual(base.skipped.map((entry) => [entry.case, entry.reason, entry.missing]), [[SUCCESS, 'awaiting_integration', ['check']]]);
+  assert.deepEqual(base.loop_baseline, { usable: false, reasons: ['skipped_unproved'] });
   assert.throws(() => startLoop(repo, CHANGE), (error) => {
     blockedWith('baseline_packages_differ')(error);
-    assert.ok(gapOf(error, 'baseline_packages_differ').message.includes(`${SUCCESS} did not run in it. Every run of a loop is compared with its baseline, so it must have run these packages. Prove ${SUCCESS} with \`eval check\` first`), error.message);
+    const entry = assertGapShape(gapOf(error, 'baseline_packages_differ'), { owner: 'agent', layer: 'baseline', run: base.run_id, unchecked: [SUCCESS] });
+    assert.ok(entry.message.includes(`${SUCCESS} did not run in it. Every run of a loop is compared with its baseline, so it must have run these packages. A run skips ${SUCCESS} until \`eval check\` proves its verifier for it as it is.`), entry.message);
     return true;
   });
   assert.equal(checkEval(repo, CHANGE).passed, true);
-  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'record_baseline');
+  workflow = workflowStatus(repo, CHANGE);
+  assert.deepEqual([actionOf(workflow, 'run', 'start', '--baseline').needed, actionOf(workflow, 'loop', 'start').blocked_by], [true, ['baseline_packages_differ']]);
 });
 
 test('a final run that stops early names the packages it did not run in its report', (t) => {
@@ -286,11 +302,13 @@ test('a final run that stops early names the packages it did not run in its repo
   assert.ok(readFileSync(file, 'utf8').includes(`\nNot run: ${stopped[0]} (the final run stopped after ${ran} failed).\n`), readFileSync(file, 'utf8'));
 });
 
-test('eval check stops asking for the confirmation once the user confirmed the checks as they are', (t) => {
-  const project = readyProject(t);
-  const { repo } = project;
-  const checked = checkEval(repo, CHANGE, { case: FAILURE });
-  assert.equal(checked.next, 'Every checked verifier told its fixtures apart, so those packages are ready. `workflow check run-eval` says what comes next.');
+test('eval check states what it proved and leaves the next step to the agent, before and after the user confirmed the checks', (t) => {
+  for (const confirm of [false, true]) {
+    const project = readyProject(t, { confirm });
+    const checked = checkEval(project.repo, CHANGE, { case: FAILURE });
+    assertNoRoutes(checked, 'eval check');
+    assert.deepEqual([checked.passed, checked.proved, checked.suggestion], [true, [FAILURE], null]);
+  }
 });
 
 test('a full run recorded before runs had a role is a final run only when it passed', (t) => {

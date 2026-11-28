@@ -11,10 +11,23 @@ import { fileURLToPath } from 'node:url';
 import { ROOT, initProject, projectRoot, readJSON } from '../../src/project.js';
 import { exportSpec, newSpec } from '../../src/spec.js';
 import { newEval, reviewFile } from '../../src/eval.js';
-import { checkEval } from '../../src/run.js';
+import { checkEval, startRun } from '../../src/run.js';
 import { confirmEval, reviewEval } from '../../src/confirm.js';
+import { startLoop as startLoopOf } from '../../src/loop.js';
 
 export const CHANGE = 'report-notifications';
+// Who made a user's decision in these tests, and where they said so. Every
+// decision the CLI records as the user's (checks confirmation, loop start,
+// budget, acceptance, decline, abandon, cost approval) takes both.
+export const USER = 'Test User';
+export const REF = 'test setup';
+// The same as options of the functions in src/ and as CLI flags.
+export const CONSENT = Object.freeze({ by: USER, ref: REF });
+export const CONSENT_FLAGS = Object.freeze(['--by', USER, '--ref', REF]);
+// The user's approval of what a model-calling run costs before any checks
+// confirmation (run start --approved-by --ref).
+export const APPROVAL = Object.freeze({ approvedBy: USER, ref: REF });
+export const APPROVAL_FLAGS = Object.freeze(['--approved-by', USER, '--ref', REF]);
 export const AGENT = 'app_agent:AppAgent';
 export const FAKE_HARBOR = fileURLToPath(new URL('./fake-harbor.mjs', import.meta.url));
 export const FAKE_HARBOR_VERSION = 'harbor 0.0.0 (fake)';
@@ -59,62 +72,122 @@ export const BEFORE = { 'submit-failure-s1': { c1: 'fail' }, 'submit-success-s1'
 // The code after the change: every check passes.
 export const AFTER = everyCheck('pass');
 
-const DOCKER = `#!/bin/sh
-# Fake Docker for tests: \`docker info\` reports a running daemon unless
-# FAKE_DOCKER_DOWN is set. Nothing else is supported.
+// Fake Docker for tests. `docker info` reports a running daemon unless
+// FAKE_DOCKER_DOWN is set. Every other command goes to DOCKER_OBJECTS (below),
+// which lists and removes compose containers, networks and volumes.
+const dockerScript = (objects) => `#!/bin/sh
+if [ -n "\${FAKE_DOCKER_DOWN:-}" ]; then
+  echo "Cannot connect to the Docker daemon (fake)" >&2
+  exit 1
+fi
 if [ "$1" = "info" ]; then
-  if [ -n "\${FAKE_DOCKER_DOWN:-}" ]; then
-    echo "Cannot connect to the Docker daemon (fake)" >&2
-    exit 1
-  fi
   echo "27.0.0-fake"
   exit 0
 fi
-echo "fake docker: unsupported command: $*" >&2
-exit 1
+exec ${JSON.stringify(process.execPath)} ${JSON.stringify(objects)} "$@"
+`;
+// The objects of the fake Docker are FAKE_DOCKER_OBJECTS, a JSON file of
+// { containers: [{ id, project }], networks: [...], volumes: [...] } (none
+// when it does not exist). It answers what `run cleanup` asks: `ps -a`,
+// `network ls` and `volume ls` with --filter label=com.docker.compose.project
+// (every object with a project) or label=com.docker.compose.project=NAME, and
+// either --format (prints the project) or -q (prints the ids); `rm -f IDS`,
+// `network rm IDS` and `volume rm IDS` remove objects, and exit 1 for an id
+// that does not exist. Each such call is appended to FAKE_DOCKER_LOG.
+const DOCKER_OBJECTS = `import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+const argv = process.argv.slice(2);
+if (process.env.FAKE_DOCKER_LOG) appendFileSync(process.env.FAKE_DOCKER_LOG, JSON.stringify({ argv }) + '\\n');
+const file = process.env.FAKE_DOCKER_OBJECTS;
+const state = file && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+const kinds = { ps: 'containers', network: 'networks', volume: 'volumes', rm: 'containers' };
+const kind = kinds[argv[0]];
+if (!kind) { process.stderr.write('fake docker: unsupported command: ' + argv.join(' ') + '\\n'); process.exit(1); }
+const objects = Array.isArray(state[kind]) ? state[kind] : [];
+const removing = argv[0] === 'rm' || argv[1] === 'rm';
+if (removing) {
+  const ids = argv.slice(argv[0] === 'rm' ? 1 : 2).filter((word) => !word.startsWith('-'));
+  const unknown = ids.filter((id) => !objects.some((entry) => entry.id === id));
+  state[kind] = objects.filter((entry) => !ids.includes(entry.id));
+  if (file) writeFileSync(file, JSON.stringify(state, null, 2) + '\\n');
+  if (unknown.length) { process.stderr.write('fake docker: no such object: ' + unknown.join(', ') + '\\n'); process.exit(1); }
+  process.stdout.write(ids.join('\\n') + (ids.length ? '\\n' : ''));
+  process.exit(0);
+}
+const filter = argv[argv.indexOf('--filter') + 1] ?? '';
+const label = 'label=com.docker.compose.project';
+const project = filter.startsWith(label + '=') ? filter.slice(label.length + 1) : null;
+const listed = objects.filter((entry) => entry.project && (project === null || entry.project === project));
+const lines = argv.includes('-q') ? listed.map((entry) => entry.id) : listed.map((entry) => entry.project);
+process.stdout.write(lines.join('\\n') + (lines.length ? '\\n' : ''));
 `;
 // Git reads the user's own configuration and location variables; the tests
 // run Git with none of them, so they behave the same on every machine.
 const GIT_KEYS = ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CEILING_DIRECTORIES'];
-const ENV_KEYS = ['GENESIS_EDD_HARBOR', 'PATH', 'FAKE_HARBOR_LOG', 'FAKE_DOCKER_DOWN', ...GIT_KEYS];
+const ENV_KEYS = ['GENESIS_EDD_HARBOR', 'GENESIS_EDD_PROGRESS', 'PATH', 'FAKE_HARBOR_LOG', 'FAKE_DOCKER_DOWN', 'FAKE_DOCKER_OBJECTS', 'FAKE_DOCKER_LOG', ...GIT_KEYS];
 let active = null;
+
+const readLines = (file) => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : []);
 
 // Points process.env at the fake Harbor and a fake `docker` on PATH until the
 // test ends. src/ and every child process (cli()) read them from there, so the
 // tests of one file must run one at a time (the node:test default). Calling it
-// again in the same test returns the same handle.
+// again in the same test returns the same handle. Run progress on stderr is
+// off (GENESIS_EDD_PROGRESS=0) unless the test turns it on.
+//   tools.directory        a folder of this test, removed when it ends
 //   tools.calls()          every Harbor call so far: [{ argv, env }]
 //   tools.runs()           only the `run` calls
-//   tools.docker(false)    `docker info` exits 1 until docker(true)
+//   tools.docker(false)    every Docker command exits 1 until docker(true)
+//   tools.dockerObjects(o) the compose objects Docker holds: { containers:
+//                          [{ id, project }], networks, volumes }; with no
+//                          argument, what it holds now
+//   tools.dockerCalls()    every Docker call but `docker info`: [{ argv }]
 //   tools.harbor(false)    the Harbor command cannot be started until harbor(true)
+//   tools.progress(true)   runs report their progress on stderr until progress(false)
 export function useFakeTools(t) {
   if (active) return active;
   const directory = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-tools-'));
   const bin = path.join(directory, 'bin');
   mkdirSync(bin);
-  writeFileSync(path.join(bin, 'docker'), DOCKER, { mode: 0o755 });
+  const objectsScript = path.join(directory, 'docker-objects.mjs');
+  writeFileSync(objectsScript, DOCKER_OBJECTS);
+  writeFileSync(path.join(bin, 'docker'), dockerScript(objectsScript), { mode: 0o755 });
   const log = path.join(directory, 'harbor-calls.jsonl');
+  const objects = path.join(directory, 'docker-objects.json');
+  const dockerLog = path.join(directory, 'docker-calls.jsonl');
   const saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   const harbor = JSON.stringify([process.execPath, FAKE_HARBOR]);
   process.env.GENESIS_EDD_HARBOR = harbor;
+  process.env.GENESIS_EDD_PROGRESS = '0';
   process.env.PATH = [bin, saved.PATH].filter(Boolean).join(path.delimiter);
   process.env.FAKE_HARBOR_LOG = log;
+  process.env.FAKE_DOCKER_OBJECTS = objects;
+  process.env.FAKE_DOCKER_LOG = dockerLog;
   delete process.env.FAKE_DOCKER_DOWN;
   for (const key of GIT_KEYS) delete process.env[key];
   const gitConfig = path.join(directory, 'gitconfig');
   writeFileSync(gitConfig, '');
   process.env.GIT_CONFIG_GLOBAL = gitConfig;
   process.env.GIT_CONFIG_NOSYSTEM = '1';
-  const calls = () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : []);
+  const calls = () => readLines(log);
   const tools = {
-    log, calls, gitConfig,
+    directory, log, calls, gitConfig,
     runs: () => calls().filter((call) => call.argv[0] === 'run'),
     docker(running) {
       if (running) delete process.env.FAKE_DOCKER_DOWN;
       else process.env.FAKE_DOCKER_DOWN = '1';
     },
+    dockerObjects(given) {
+      if (given === undefined) return existsSync(objects) ? readJSON(objects) : { containers: [], networks: [], volumes: [] };
+      writeFileSync(objects, `${JSON.stringify({ containers: [], networks: [], volumes: [], ...given }, null, 2)}\n`);
+      return given;
+    },
+    dockerCalls: () => readLines(dockerLog),
     harbor(available) {
       process.env.GENESIS_EDD_HARBOR = available ? harbor : JSON.stringify([path.join(directory, 'no-such-harbor')]);
+    },
+    progress(on) {
+      if (on) delete process.env.GENESIS_EDD_PROGRESS;
+      else process.env.GENESIS_EDD_PROGRESS = '0';
     },
   };
   active = tools;
@@ -244,7 +317,7 @@ export function dropCheck(declared, id) {
 // The warning eval validate gives for packages still in checks.json 1.0.
 export function legacyWarning(ids) {
   const one = ids.length === 1;
-  return `${ids.join(', ')} ${one ? 'uses' : 'use'} checks.json 1.0: ${one ? 'its' : 'their'} checks do not name the THEN lines they verify, so whether every line is checked is not known, and ${one ? 'it has' : 'they have'} no reviewer counterexamples; \`eval confirm\` needs 1.1. This is a warning until the next \`loop start\`, which refuses 1.0 packages. Upgrade ${one ? 'it' : 'them'} to 1.1 before recording the baseline; task-package.md says how. The upgrade changes ${one ? 'the package' : 'each package'}, so a baseline recorded before it compares nothing with ${one ? 'it' : 'them'}.`;
+  return `${ids.join(', ')} ${one ? 'uses' : 'use'} checks.json 1.0: ${one ? 'its' : 'their'} checks do not name the THEN lines they verify, so whether every line is checked is not known, and ${one ? 'it has' : 'they have'} no reviewer counterexamples. \`eval confirm\` needs 1.1, and \`loop start\` refuses 1.0 packages. Upgrading changes ${one ? 'the package' : 'each package'}, so a baseline recorded before it compares nothing with ${one ? 'it' : 'them'}.`;
 }
 
 // The dependency a package declares in these tests when it is live.
@@ -252,10 +325,11 @@ export const LIVE_DEPENDENCY = { name: 'model', mode: 'live', note: 'Synthetic m
 
 // The reviewer's counterexamples of a package's checks.json: for each THEN line
 // its gating checks verify, review-<first check> fails that line's checks and
-// passes every other gating check. Returns the fixtures, without scripts.
-export function reviewFixtures(declared) {
+// passes every other gating check. Lines in except get none. Returns the
+// fixtures, without scripts.
+export function reviewFixtures(declared, { except = [] } = {}) {
   const gating = declared.checks.filter((check) => check.role === 'gating' && typeof check.then === 'string');
-  const lines = [...new Set(gating.map((check) => check.then))];
+  const lines = [...new Set(gating.map((check) => check.then))].filter((then) => !except.includes(then));
   return lines.map((then) => {
     const own = gating.filter((check) => check.then === then).map((check) => check.id);
     return { name: `review-${own[0].toLowerCase()}`, origin: 'review', note: `Synthetic counterexample for ${then}.`,
@@ -272,15 +346,37 @@ export function writeFixtureScripts(repo, id, names) {
   }
 }
 
+// The THEN lines of a package whose gating checks all fail in results (the
+// app/results.json entry of the package): the lines a change to that code fixes.
+export function failingLines(declared, results) {
+  const gating = declared.checks.filter((check) => check.role === 'gating' && typeof check.then === 'string');
+  const value = (check) => (results !== null && typeof results === 'object' && !Array.isArray(results) ? results[check.id] : undefined);
+  return [...new Set(gating.map((check) => check.then))]
+    .filter((then) => gating.filter((check) => check.then === then).every((check) => value(check) === 'fail'));
+}
+
+// The expected baseline result of every check of the packages, read from
+// results as the code before the change gives them: fail or pass, and any for
+// a check results gives no such value for. Keyed '<case>/<check>', as
+// writeExpectations takes it.
+export function expectationsOf(packages, results) {
+  return Object.fromEntries(Object.entries(packages).flatMap(([id, checks]) => checks.map((check) => {
+    const value = results?.[id]?.[check];
+    return [`${id}/${check}`, value === 'fail' || value === 'pass' ? value : 'any'];
+  })));
+}
+
 // Fills every file eval validate needs, except instruction.md when connected is
-// false. A live package declares LIVE_DEPENDENCY. Every gating line gets a
-// reviewer's counterexample (reviewFixtures).
-function fillPackage(repo, id, connected, live) {
+// false. A live package declares LIVE_DEPENDENCY. The author's fixtures pass,
+// fail and unknown are written unless authorFixtures is false, and every gating
+// line gets a reviewer's counterexample (reviewFixtures) but those in except.
+function fillPackage(repo, id, { connected, live, authorFixtures = true, except = [] }) {
   const directory = packageDirectory(repo, id);
   const file = path.join(directory, 'tests/checks.json');
   const declared = readJSON(file);
   const ids = declared.checks.map((check) => check.id);
-  declared.fixtures = [...FIXTURES.map((name) => ({ name, expect: Object.fromEntries(ids.map((check) => [check, name])) })), ...reviewFixtures(declared)];
+  declared.fixtures = [...(authorFixtures ? FIXTURES.map((name) => ({ name, expect: Object.fromEntries(ids.map((check) => [check, name])) })) : []),
+    ...reviewFixtures(declared, { except })];
   if (live) declared.dependencies = [LIVE_DEPENDENCY];
   writeFileSync(file, `${JSON.stringify(declared, null, 2)}\n`);
   writeFixtureScripts(repo, id, declared.fixtures.map((fixture) => fixture.name));
@@ -308,14 +404,38 @@ finish
 //   map: null                       a business-map.json object for spec new --map
 //   parent: os.tmpdir()             the folder the project is created in
 //   live: []                        package ids that declare a live dependency
-//                                   (LIVE_DEPENDENCY), so a baseline needs --attempts
+//                                   (LIVE_DEPENDENCY): the change is of the full tier,
+//                                   and the confirmation fixes the number of attempts
 //   model: null                     the model harness.json names beside the agent
+//                                   (the full tier as well)
+//   authorFixtures: true            write the author's fixtures pass, fail and unknown
+//                                   beside the reviewer's counterexamples; false
+//                                   writes only the counterexamples
+//   proof: 'counterexample'         every gating line gets a reviewer's counterexample.
+//          | 'baseline'             the lines whose gating checks all fail in results
+//                                   get none: their proof that the checks can fail is
+//                                   a baseline on that code, which is recorded after
+//                                   eval check and before the confirmation, with the
+//                                   expectations results gives (expectationsOf),
+//                                   committed first; project.base is that baseline
 //   confirm: check                  confirm the checks after eval check (confirmChecks),
 //                                   committing review.json and confirmed.json with commit
+//   tier: 'full' when unconnected   the tier the user confirms (eval confirm --tier).
+//         is not empty, else none   With none the confirmation takes the CLI's
+//                                   proposal: light when the change qualifies (no
+//                                   live package, no model, every package sealed).
+//                                   The light tier cannot confirm a line of a package
+//                                   that is not connected, so those projects default
+//                                   to the full tier
 //   attempts: 3 when live or model  the number of attempts the confirmation fixes
+//   budget: {}                      the budget the confirmation fixes: { iterations,
+//                                   minutes, maxCost }, as confirmEval takes them
+//   startLoop: false                the confirmation also records the user's consent
+//                                   to start a loop (eval confirm --start-loop)
+// Every confirmation is the user's, recorded with by USER and ref REF.
 // Returns { repo, name, tools, packages: { id: [check ids] }, check (checkEval result
-// or null), confirmation (confirmEval result or null), root (.genesis/edd/<change>),
-// runs (its runs/ folder) }.
+// or null), confirmation (confirmEval result or null), base (the baseline of
+// proof 'baseline', or null), root (.genesis/edd/<change>), runs (its runs/ folder) }.
 //
 // Building a project takes about two seconds, so each test process builds every
 // distinct set of options once, as a template, and gives each test its own copy
@@ -326,11 +446,14 @@ finish
 // as before.
 export function readyProject(t, options = {}) {
   const { mode = 'existing', spec = 'two', results = BEFORE, unconnected = [], commit: committed = true, check = true, map = null,
-    parent = os.tmpdir(), live = [], model = null } = options;
-  const { confirm = check, attempts = live.length || model ? 3 : undefined } = options;
+    parent = os.tmpdir(), live = [], model = null, authorFixtures = true, proof = 'counterexample', budget = {}, startLoop = false } = options;
+  const { confirm = check, attempts = live.length || model ? 3 : undefined, tier = unconnected.length ? 'full' : undefined } = options;
   if (!SPECS[spec]) throw new Error(`spec must be one of ${Object.keys(SPECS).join(', ')}.`);
+  if (!['counterexample', 'baseline'].includes(proof)) throw new Error('proof must be counterexample or baseline.');
+  if (proof === 'baseline' && !check) throw new Error('proof baseline records a baseline, which needs check: true.');
+  if (tier !== undefined && !['light', 'full'].includes(tier)) throw new Error('tier must be light or full.');
   const tools = useFakeTools(t);
-  const settings = { mode, spec, results, unconnected, committed, check, map, live, model, confirm, attempts };
+  const settings = { mode, spec, results, unconnected, committed, check, map, live, model, confirm, attempts, authorFixtures, proof, tier, budget, startLoop };
   const key = options.parent === undefined ? templateKey(settings, tools) : null;
   const template = key === null ? null : templates.get(key) ?? makeTemplate(key, settings, tools);
   if (template?.copyable) return copyTemplate(t, template, tools);
@@ -340,7 +463,7 @@ export function readyProject(t, options = {}) {
 }
 
 function buildProject(repo, tools, settings) {
-  const { mode, spec, results, unconnected, committed, check, map, live, model, confirm, attempts } = settings;
+  const { mode, spec, results, unconnected, committed, check, map, live, model, confirm, attempts, authorFixtures, proof, tier, budget, startLoop } = settings;
   git(repo, ['init', '-q', '-b', 'main']);
   git(repo, ['config', 'user.name', 'Genesis Test']);
   git(repo, ['config', 'user.email', 'test@example.invalid']);
@@ -364,8 +487,10 @@ function buildProject(repo, tools, settings) {
   for (const id of [...unconnected, ...live]) if (!ids.includes(id)) throw new Error(`No package named ${id}; packages are ${ids.join(', ')}.`);
   const packages = {};
   for (const id of ids) {
-    fillPackage(repo, id, !unconnected.includes(id), live.includes(id));
-    packages[id] = readJSON(path.join(root, 'evals', id, 'tests/checks.json')).checks.map((entry) => entry.id);
+    const file = path.join(root, 'evals', id, 'tests/checks.json');
+    const except = proof === 'baseline' ? failingLines(readJSON(file), results?.[id]) : [];
+    fillPackage(repo, id, { connected: !unconnected.includes(id), live: live.includes(id), authorFixtures, except });
+    packages[id] = readJSON(file).checks.map((entry) => entry.id);
   }
   setResults(repo, results);
   if (committed) commit(repo, 'Add the application and its evals');
@@ -374,9 +499,20 @@ function buildProject(repo, tools, settings) {
     checked = checkEval(repo, CHANGE);
     if (checked.cases.length) assert.equal(checked.passed, true, `eval check failed: ${JSON.stringify(checked, null, 2)}`);
   }
-  const project = { repo, name: CHANGE, tools, packages, check: checked, confirmation: null, root, runs: path.join(root, 'runs') };
+  let base = null;
+  if (proof === 'baseline') {
+    const expect = writeExpectations(repo, expectationsOf(packages, results));
+    if (committed) {
+      const file = path.relative(repo, expect);
+      git(repo, ['add', '--', file]);
+      git(repo, ['commit', '-q', '-m', 'Expect the baseline results', '--', file]);
+    }
+    base = startRun(repo, CHANGE, { baseline: true, expect });
+    assert.equal(base.is_baseline, true, `the baseline did not record: ${JSON.stringify(base, null, 2)}`);
+  }
+  const project = { repo, name: CHANGE, tools, packages, check: checked, confirmation: null, base, root, runs: path.join(root, 'runs') };
   if (confirm) {
-    project.confirmation = confirmChecks(project, { attempts });
+    project.confirmation = confirmChecks(project, { attempts, tier, ...budget, ...(startLoop ? { startLoop: true } : {}) });
     if (committed) commitConfirmation(repo);
   }
   return project;
@@ -388,7 +524,7 @@ const templates = new Map();
 let templateFolder = null;
 const FAKE_HARBOR_COMMAND = JSON.stringify([process.execPath, FAKE_HARBOR]);
 // Variables useFakeTools sets for every test, or that hold a path of the test.
-const PER_TEST = new Set(['GENESIS_EDD_HARBOR', 'FAKE_HARBOR_LOG', 'FAKE_DOCKER_DOWN', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'PATH']);
+const PER_TEST = new Set(['GENESIS_EDD_HARBOR', 'GENESIS_EDD_PROGRESS', 'FAKE_HARBOR_LOG', 'FAKE_DOCKER_DOWN', 'FAKE_DOCKER_OBJECTS', 'FAKE_DOCKER_LOG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'PATH']);
 
 // Numbers, strings, booleans, null, and arrays and plain objects of them.
 function plainData(value) {
@@ -478,8 +614,8 @@ function copyTemplate(t, template, tools) {
   const left = template.marks.filter((mark) => calls.includes(mark) || JSON.stringify(data).includes(mark));
   if (left.length) throw new Error(`readyProject: the copy of a template still names ${left.join(', ')}; build this project without the template.`);
   if (calls) appendFileSync(tools.log, calls);
-  const { name, packages, check, confirmation, root, runs } = data;
-  return { repo, name, tools, packages, check, confirmation, root, runs };
+  const { name, packages, check, confirmation, base, root, runs } = data;
+  return { repo, name, tools, packages, check, confirmation, base, root, runs };
 }
 
 // Commits review.json and confirmed.json, and nothing else.
@@ -492,13 +628,24 @@ export function commitConfirmation(repo, message = 'Confirm the checks') {
 // Records the user's confirmation of the checks as the skills do: review.json
 // written from eval review's review_template, with every line faithful (a
 // scenario.manual line not_observable) unless verdict(line) says otherwise,
-// and every changed package answered as not loosening a line. Options: reason
-// (for a revision), verdict, origin ('review'), attempts, agent, model,
-// iterations, minutes, by ('Test User'), ref ('test setup'). Returns the
-// confirmEval result; it throws a refusal as confirmEval does.
+// and every changed package answered as not loosening a line. Then eval
+// confirm, as the user's decision with by and ref. Options:
+//   by (USER), ref (REF)       who confirmed and where they said so
+//   verdict(line)              the verdict of a line of the template, or undefined
+//   origin ('review')          review.origin of the answers
+//   any other option goes to confirmEval as given (undefined ones are left
+//   out): reason, tier ('light' | 'full'), attempts, agent, model, iterations,
+//   minutes, maxCost, startLoop, stopOnStuck, judgeGating, acceptVerdict,
+//   acceptReason.
+// With no tier the confirmation takes the tier eval review proposes. In the
+// light tier every gating line needs a proof that its checks can fail: a
+// reviewer's counterexample eval check proved (readyProject writes one for
+// every line), or, for a line the change fixes, its failure at a baseline that
+// expected it (readyProject's proof 'baseline'). Returns the confirmEval
+// result; it throws a refusal as confirmEval does.
 export function confirmChecks(project, options = {}) {
   const { repo } = project;
-  const { verdict = () => undefined, origin = 'review', by = 'Test User', ref = 'test setup', ...plan } = options;
+  const { verdict = () => undefined, origin = 'review', by = USER, ref = REF, ...plan } = options;
   const review = reviewEval(repo, CHANGE);
   const manual = new Set(review.lines.filter((line) => line.status === 'manual').map((line) => `${line.package}\n${line.then}`));
   const answers = { ...review.review_template, review: { origin, note: 'Synthetic review.' },
@@ -509,6 +656,76 @@ export function confirmChecks(project, options = {}) {
   writeFileSync(file, `${JSON.stringify(answers, null, 2)}\n`);
   const defined = Object.fromEntries(Object.entries(plan).filter(([, value]) => value !== undefined));
   return confirmEval(repo, CHANGE, { verdicts: file, by, ref, ...defined });
+}
+
+// The layers a gap names: where the cause is.
+export const LAYERS = ['spec', 'package', 'kit', 'confirmation', 'baseline', 'loop', 'ledger', 'machine', 'code'];
+
+// Asserts the shape every gap has: a code, a kind, an owner (agent or user),
+// a layer and a message, and no route or resume (a gap states facts, never
+// the skill or command to go to). expected holds fields it must have too,
+// such as { code: 'loop_consent_missing', owner: 'user', layer: 'loop' }.
+// Returns the gap.
+export function assertGapShape(entry, expected = {}) {
+  const shown = JSON.stringify(entry);
+  assert.ok(entry !== null && typeof entry === 'object', `not a gap: ${shown}`);
+  assert.equal(typeof entry.code, 'string', shown);
+  assert.equal(typeof entry.kind, 'string', shown);
+  assert.ok(['agent', 'user'].includes(entry.owner), `owner: ${shown}`);
+  assert.ok(LAYERS.includes(entry.layer), `layer: ${shown}`);
+  assert.equal(typeof entry.message, 'string', shown);
+  assert.ok(!('route' in entry) && !('resume' in entry), `a gap names no route or resume: ${shown}`);
+  for (const [key, value] of Object.entries(expected)) assert.deepEqual(entry[key], value, `${key}: ${shown}`);
+  return entry;
+}
+
+// Asserts that no object anywhere in value carries route, resume or next:
+// results and gaps state facts and at most one suggestion.
+export function assertNoRoutes(value, where = 'result') {
+  const seen = [];
+  const walk = (item, at) => {
+    if (item === null || typeof item !== 'object') return;
+    if (Array.isArray(item)) { item.forEach((entry, index) => walk(entry, `${at}[${index}]`)); return; }
+    for (const key of ['route', 'resume', 'next']) if (key in item) seen.push(`${at}.${key}`);
+    for (const [key, entry] of Object.entries(item)) walk(entry, `${at}.${key}`);
+  };
+  walk(value, where);
+  assert.deepEqual(seen, [], `found ${seen.join(', ')}`);
+}
+
+// Asserts a result's suggestion: null when command is null, else { command,
+// why } whose command starts with the given words.
+export function assertSuggestion(result, command) {
+  if (command === null) {
+    assert.equal(result.suggestion, null, JSON.stringify(result.suggestion));
+    return null;
+  }
+  const { suggestion } = result;
+  assert.ok(suggestion && Array.isArray(suggestion.command) && typeof suggestion.why === 'string', JSON.stringify(suggestion));
+  assert.deepEqual(suggestion.command.slice(0, command.length), command, JSON.stringify(suggestion));
+  return suggestion;
+}
+
+// The action of a workflow status (workflowStatus, or checkWorkflow, its old
+// name) whose command is words[0] words[1] and holds every further word, such
+// as '--baseline': actionOf(status, 'run', 'start', '--baseline'). Undefined
+// when it lists none.
+export const actionOf = (status, ...words) => status.actions.find((entry) => entry.command[0] === words[0] && entry.command[1] === words[1]
+  && words.slice(2).every((word) => entry.command.includes(word)));
+// The actions a workflow status allows now (allowed: nothing refuses them), as
+// 'group command --flag ...' with the flags that tell them apart, never --repo
+// or placeholder values: ['eval check', 'run start --baseline', ...].
+export const allowedActions = (status) => status.actions.filter((entry) => entry.allowed)
+  .map((entry) => [...entry.command.slice(0, 2), ...entry.command.slice(2).filter((word) => word.startsWith('--') && word !== '--repo')].join(' '));
+
+// Starts a loop as the user's decision: startLoop of src/loop.js with by USER
+// and ref REF, as `loop start --by --ref` records the user's consent. Options
+// go to it as given and win over those: budget flags (iterations, minutes,
+// maxCost), or another by and ref. To start one without --by and --ref, as
+// after `eval confirm --start-loop`, pass { by: undefined, ref: undefined },
+// or call startLoop of src/loop.js. Returns what it returns; throws its refusals.
+export function startLoop(repo, name = CHANGE, options = {}) {
+  return startLoopOf(repo, name, { ...CONSENT, ...options });
 }
 
 // An --expect file for a baseline. expected is { '<case>/<check>': 'pass' | 'fail' | 'any' },

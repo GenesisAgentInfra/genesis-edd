@@ -8,20 +8,25 @@ import test from 'node:test';
 import { readJSON } from '../src/project.js';
 import { validateEval } from '../src/eval.js';
 import { checkEval, codeSnapshot, readCounts, runTools, sameCode, savePatch, startRun } from '../src/run.js';
-import { loopStatus, startLoop } from '../src/loop.js';
-import { checkWorkflow } from '../src/workflow.js';
+import { loopStatus } from '../src/loop.js';
+import { workflowStatus } from '../src/workflow.js';
 import {
   AFTER, AGENT, BEFORE, CHANGE, FAKE_HARBOR_VERSION, LIVE_DEPENDENCY, cli, commit, confirmChecks, connect, dropCheck, editChecks, git, harborThen, readRecord,
   readyProject, setResults, writeExpectations,
 } from './helpers/edd.js';
 import {
-  FAILURE, SUCCESS, runIds, rows, find, tally, sha256, valueOf, refused, scratch, tree,
+  FAILURE, SUCCESS, runIds, rows, find, tally, sha256, valueOf, refused, scratch, tree, actionOf, assertGapShape, assertNoRoutes, assertSuggestion,
 } from './helpers/run.js';
 
-test('a head run is refused until a baseline is recorded, and workflow check suggests recording one', (t) => {
+test('a head run is refused until a baseline is recorded, and workflow status allows and suggests recording one', (t) => {
   const { repo, tools, runs } = readyProject(t);
   const calls = tools.runs().length;
-  assert.throws(() => startRun(repo, CHANGE), refused('baseline_missing'));
+  assert.throws(() => startRun(repo, CHANGE), (error) => {
+    refused('baseline_missing')(error);
+    assertGapShape(error.gaps[0], { code: 'baseline_missing', owner: 'agent', layer: 'baseline' });
+    assert.equal(error.gaps[0].last_attempt, undefined, 'no base attempt was made');
+    return true;
+  });
   assert.deepEqual(runIds(runs), []);
   assert.equal(tools.runs().length, calls);
 
@@ -29,23 +34,27 @@ test('a head run is refused until a baseline is recorded, and workflow check sug
   assert.equal(refusal.status, 1);
   assert.equal(refusal.json.code, 'RUN_INPUT_BLOCKED');
   assert.deepEqual(refusal.json.gaps.map((gap) => gap.code), ['baseline_missing']);
-  assert.equal(refusal.json.gaps[0].route, 'run-eval');
-  assert.deepEqual(refusal.json.resume.command, ['workflow', 'check', 'run-eval', CHANGE, '--repo', repo]);
+  assertGapShape(refusal.json.gaps[0], { owner: 'agent', layer: 'baseline' });
+  // A refusal states the facts: no skill or command to go to.
+  assertNoRoutes(refusal.json, 'refusal');
   assert.deepEqual(runIds(runs), []);
 
-  const workflow = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(workflow.status, 'ready');
-  assert.equal(workflow.next.action, 'record_baseline');
-  assert.deepEqual(workflow.next.command, ['run', 'start', CHANGE, '--repo', repo, '--baseline']);
+  const status = workflowStatus(repo, CHANGE);
+  const baseline = actionOf(status, 'run', 'start', '--baseline');
+  assert.deepEqual([baseline.allowed, baseline.needed, baseline.blocked_by], [true, true, []], JSON.stringify(baseline));
+  const head = status.actions.find((entry) => entry.command.join(' ') === ['run', 'start', CHANGE, '--repo', repo].join(' '));
+  assert.ok(head.blocked_by.includes('baseline_missing'), JSON.stringify(head));
+  assertSuggestion(status, ['run', 'start', CHANGE, '--repo', repo, '--baseline']);
 });
 
-test('a baseline attempt that errored does not count: head runs are still refused and the baseline is still suggested', (t) => {
+test('a baseline attempt that errored does not count: head runs are still refused, the gap says why, and a baseline is still wanted', (t) => {
   const { repo, runs } = readyProject(t, { results: { ...BEFORE, [SUCCESS]: 'error' } });
   const attempt = cli(['run', 'start', CHANGE, '--repo', repo, '--baseline']);
   assert.equal(attempt.status, 1, attempt.stderr);
   assert.equal(attempt.json.execution_status, 'error');
   assert.equal(attempt.json.is_baseline, false);
   assert.equal(attempt.json.baseline_unavailable_reason, 'execution_blocked');
+  assert.deepEqual(attempt.json.loop_baseline, { usable: false, reasons: ['execution_incomplete'] });
   const byCase = Object.fromEntries(attempt.json.cases.map((item) => [item.id, item.execution]));
   assert.deepEqual(byCase[FAILURE], { status: 'completed' });
   assert.equal(byCase[SUCCESS].status, 'error');
@@ -54,7 +63,9 @@ test('a baseline attempt that errored does not count: head runs are still refuse
 
   assert.throws(() => startRun(repo, CHANGE), (error) => {
     refused('baseline_missing')(error);
-    assert.ok(error.gaps[0].message.startsWith(`The last baseline attempt, ${attempt.json.run_id}, did not run; fix the cause and record it again.`), error.gaps[0].message);
+    const gap = assertGapShape(error.gaps[0], { owner: 'agent', layer: 'baseline' });
+    assert.deepEqual(gap.last_attempt, { run_id: attempt.json.run_id, why: 'it did not complete (error)' });
+    assert.ok(gap.message.includes(`the last base attempt, ${attempt.json.run_id}, gives none because it did not complete (error)`), gap.message);
     return true;
   });
   const head = cli(['run', 'start', CHANGE, '--repo', repo]);
@@ -62,9 +73,11 @@ test('a baseline attempt that errored does not count: head runs are still refuse
   assert.deepEqual(head.json.gaps.map((gap) => gap.code), ['baseline_missing']);
   assert.deepEqual(runIds(runs), [attempt.json.run_id]);
 
-  const workflow = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(workflow.next.action, 'record_baseline');
-  assert.deepEqual(workflow.next.command, ['run', 'start', CHANGE, '--repo', repo, '--baseline']);
+  const status = workflowStatus(repo, CHANGE);
+  assert.ok(status.layers.baseline.gaps.some((gap) => gap.code === 'baseline_missing'), JSON.stringify(status.layers.baseline));
+  const baseline = actionOf(status, 'run', 'start', '--baseline');
+  assert.deepEqual([baseline.allowed, baseline.needed], [true, true], JSON.stringify(baseline));
+  assertSuggestion(status, ['run', 'start', CHANGE, '--repo', repo, '--baseline']);
 });
 
 test('a baseline with no runnable package is blocked, executes nothing and does not count', (t) => {
@@ -80,9 +93,11 @@ test('a baseline with no runnable package is blocked, executes nothing and does 
   assert.deepEqual(tools.calls(), []);
   assert.throws(() => startRun(repo, CHANGE), refused('baseline_missing'));
 
-  const workflow = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(workflow.status, 'blocked');
-  assert.ok(workflow.gaps.some((gap) => gap.code === 'no_runnable_case'), JSON.stringify(workflow.gaps));
+  // Nothing can run: a baseline that runs and a head run are both refused for it.
+  const status = workflowStatus(repo, CHANGE);
+  assert.ok(actionOf(status, 'run', 'start', '--baseline').blocked_by.includes('no_runnable_case'), JSON.stringify(status.actions));
+  const head = status.actions.find((entry) => entry.command.join(' ') === ['run', 'start', CHANGE, '--repo', repo].join(' '));
+  assert.ok(head.blocked_by.includes('no_runnable_case'), JSON.stringify(head));
 });
 
 test('an unavailable baseline records not_run without running anything, and head runs compare with no baseline result', (t) => {
@@ -113,8 +128,9 @@ test('an unavailable baseline records not_run without running anything, and head
 
   tools.docker(true);
   tools.harbor(true);
-  // Nothing ran, so any code is the code before the change: the loop starts next.
-  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'start_loop');
+  // Nothing ran, so any code is the code before the change: a loop can start on it.
+  const loopStart = actionOf(workflowStatus(repo, CHANGE), 'loop', 'start');
+  assert.deepEqual([loopStart.allowed, loopStart.by], [true, 'user'], JSON.stringify(loopStart));
 
   // A failure the head run proves is a violation even with no baseline result.
   setResults(repo, BEFORE);
@@ -141,7 +157,11 @@ test('an unavailable baseline records not_run without running anything, and head
   assert.equal(second.verdict, 'pass');
   assert.deepEqual(second.compare, tally({ head_only: 3 }));
   assert.ok(readRecord(second).compare.results.every((entry) => entry.before === null && entry.before_unavailable_reason === 'no_implementation'));
-  assert.match(second.next, /head_only/);
+  // A pass outside a loop is a comparison, never an acceptance.
+  assert.equal(second.acceptable, false);
+  assert.match(second.not_acceptance, /not an acceptance/);
+  assert.equal(readRecord(second).run.not_acceptance, true);
+  assert.equal(second.suggestion, null);
 });
 
 test('a baseline records its declared expectations, and a result that differs is a baseline_mismatch that makes the passing head check base_mismatch', (t) => {
@@ -153,13 +173,14 @@ test('a baseline records its declared expectations, and a result that differs is
   assert.equal(base.is_baseline, true);
   const mismatch = [{ case: SUCCESS, check: 'c1', expected: 'fail', got: 'pass' }];
   assert.deepEqual(base.baseline_mismatch, mismatch);
-  assert.match(base.next, /baseline_mismatch/);
+  // A loop cannot start on it.
+  assert.deepEqual(base.loop_baseline, { usable: false, reasons: ['baseline_mismatch'] });
   const { run } = readRecord(base);
   assert.deepEqual(run.baseline_mismatch, mismatch);
   assert.deepEqual(run.baseline_expectations, [
-    { case: FAILURE, check: 'c1', expected: 'fail', reason: `Synthetic expectation for ${FAILURE}/c1.` },
-    { case: SUCCESS, check: 'c1', expected: 'fail', reason: `Synthetic expectation for ${SUCCESS}/c1.` },
-    { case: SUCCESS, check: 'c2', expected: 'pass', reason: `Synthetic expectation for ${SUCCESS}/c2.` },
+    { case: FAILURE, check: 'c1', expected: 'fail', reason: `Synthetic expectation for ${FAILURE}/c1.`, declared: true },
+    { case: SUCCESS, check: 'c1', expected: 'fail', reason: `Synthetic expectation for ${SUCCESS}/c1.`, declared: true },
+    { case: SUCCESS, check: 'c2', expected: 'pass', reason: `Synthetic expectation for ${SUCCESS}/c2.`, declared: true },
   ]);
 
   setResults(repo, AFTER);
@@ -172,7 +193,7 @@ test('a baseline records its declared expectations, and a result that differs is
     [SUCCESS, 'c2', 'pass', 'pass', 'holds'],
   ]);
   assert.deepEqual(head.compare, tally({ holds: 2, base_mismatch: 1 }));
-  assert.match(head.next, /base_mismatch/);
+  assert.deepEqual(head.compare_gating, tally({ holds: 2, base_mismatch: 1 }));
 });
 
 test('--expect is refused unless it names declared checks with pass, fail or any and a reason, and then nothing runs', (t) => {
@@ -202,23 +223,43 @@ test('--expect is refused unless it names declared checks with pass, fail or any
   assert.equal(tools.runs().length, calls);
 });
 
-test('--expect, --case and --unavailable are refused on the wrong side of a run', (t) => {
+test('--expect, --unavailable, --trial and --all-packages are refused on the wrong side of a run, and --unavailable takes no --case', (t) => {
   const { repo, tools, runs } = readyProject(t);
   const calls = tools.runs().length;
   const expect = writeExpectations(repo, { [`${FAILURE}/c1`]: 'fail' });
   assert.throws(() => startRun(repo, CHANGE, { expect }), /--expect belongs to a baseline that actually runs/);
   assert.throws(() => startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation', expect }), /--expect belongs to a baseline that actually runs/);
-  assert.throws(() => startRun(repo, CHANGE, { baseline: true, case: [FAILURE] }), /--case belongs to a head run/);
+  assert.throws(() => startRun(repo, CHANGE, { trial: true, expect }), /--expect belongs to a baseline that actually runs/);
   assert.throws(() => startRun(repo, CHANGE, { unavailable: 'no_implementation' }), /--unavailable belongs to --baseline/);
   assert.throws(() => startRun(repo, CHANGE, { baseline: true, unavailable: 'not_today' }), /must be one of no_implementation, execution_blocked, incompatible_tasks/);
+  assert.throws(() => startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation', case: [FAILURE] }), /takes no --case/);
+  // A trial is never a baseline.
+  assert.throws(() => startRun(repo, CHANGE, { baseline: true, trial: true }), /a trial is never a baseline/);
+  assert.throws(() => startRun(repo, CHANGE, { baseline: true, allPackages: true }), /--all-packages belongs to a head run/);
 
-  for (const args of [['--expect', expect], ['--baseline', '--case', FAILURE], ['--unavailable', 'no_implementation']]) {
+  for (const args of [['--expect', expect], ['--unavailable', 'no_implementation'], ['--baseline', '--all-packages']]) {
     const result = cli(['run', 'start', CHANGE, '--repo', repo, ...args]);
     assert.equal(result.status, 1, args.join(' '));
     assert.match(result.json.error, /belongs to/);
   }
   assert.deepEqual(runIds(runs), []);
   assert.equal(tools.runs().length, calls);
+});
+
+test('a base record limited with --case is partial: it is never a baseline, and a head run still has none to compare with', (t) => {
+  const { repo, tools, runs } = readyProject(t);
+  const calls = tools.runs().length;
+  const partial = startRun(repo, CHANGE, { baseline: true, case: [FAILURE] });
+  assert.equal(partial.execution_status, 'completed', JSON.stringify(partial));
+  assert.deepEqual([partial.scope, partial.is_baseline], ['partial', false]);
+  assert.deepEqual(partial.skipped, [{ case: SUCCESS, reason: 'not_selected' }]);
+  assert.equal(tools.runs().length, calls + 1);
+  assert.ok(valueOf(tools.runs().at(-1).argv, '-p').endsWith(FAILURE));
+  // No loop can start on it.
+  assert.deepEqual(partial.loop_baseline, { usable: false, reasons: ['partial'] });
+  assert.equal(readRecord(partial).run.scope, 'partial');
+  assert.throws(() => startRun(repo, CHANGE), refused('baseline_missing'));
+  assert.deepEqual(runIds(runs), [partial.run_id]);
 });
 
 test('a passing head check holds against the baseline, and each run is written once in its own folder that Git ignores', (t) => {
@@ -267,9 +308,9 @@ test('a passing head check holds against the baseline, and each run is written o
 
   assert.deepEqual(runIds(runs), [base.run_id, run.run_id].sort());
   assert.equal(readFileSync(path.join(base.directory, 'run.json'), 'utf8'), baseText);
-  assert.equal(readFileSync(path.join(root, '..', '.gitignore'), 'utf8'), '/*/runs/\n/*/checks/\n/*/loop.json\n/*/loop-start.patch\n__pycache__/\n');
+  assert.equal(readFileSync(path.join(root, '..', '.gitignore'), 'utf8'), '/*/runs/\n/*/checks/\n/*/loop.json\n/*/loop-start.patch\n/*/decisions.jsonl\n__pycache__/\n');
   const status = git(repo, ['status', '--porcelain', '--untracked-files=all']).split('\n');
-  assert.ok(status.every((line) => !line.includes('/runs/') && !line.includes('/checks/')), status.join('\n'));
+  assert.ok(status.every((line) => !line.includes('/runs/') && !line.includes('/checks/') && !line.includes('decisions.jsonl')), status.join('\n'));
 });
 
 test('a failing head check is violated and fails the run whatever reward the verifier wrote, and the CLI exits 0', (t) => {
@@ -346,7 +387,7 @@ test('a package changed after the baseline is skipped until checked again, then 
   assert.equal(find(compare, SUCCESS, 'c2').before_unavailable_reason, 'incompatible_tasks');
   assert.equal(find(compare, FAILURE, 'c1').before_unavailable_reason, undefined);
   assert.deepEqual(head.compare, tally({ holds: 1, head_only: 2 }));
-  assert.match(head.next, /head_only/);
+  assert.deepEqual(head.unverified_by, []);
 });
 
 test('a package that is not connected yet is skipped, so the run is unverified and never passes', (t) => {
@@ -418,7 +459,7 @@ test('--case runs only the named packages, lists the others as not_selected and 
   assert.equal(partial.verdict, 'unverified');
   assert.deepEqual(partial.cases.map((item) => item.id), [FAILURE]);
   assert.deepEqual(partial.skipped, [{ case: SUCCESS, reason: 'not_selected' }]);
-  assert.match(partial.next, /partial run/);
+  assert.deepEqual(partial.unverified_by, ['partial']);
   const record = readRecord(partial);
   assert.equal(record.run.scope, 'partial');
   assert.deepEqual(rows(record.compare), [[FAILURE, 'c1', 'fail', 'pass', 'holds']]);
@@ -446,7 +487,7 @@ test('--case naming every package is still a partial run and never gives verdict
   assert.equal(every.scope, 'partial');
   assert.deepEqual(every.skipped, []);
   assert.equal(every.verdict, 'unverified');
-  assert.match(every.next, /partial run/);
+  assert.deepEqual(every.unverified_by, ['partial']);
   assert.equal(startRun(repo, CHANGE).verdict, 'pass');
 });
 
@@ -518,7 +559,7 @@ test('an attempt without a trial result is an execution error and the CLI exits 
   assert.equal(run.json.execution_status, 'error');
   assert.equal(run.json.verdict, 'unverified');
   assert.match(run.json.cases[0].execution.reason, /1 of 2 trial results \(exit 1\)/);
-  assert.match(run.json.next, /Execution did not complete/);
+  assert.deepEqual(run.json.unverified_by, ['execution_incomplete']);
   assert.equal(readRecord(run.json.directory).run.environment_ref.attempts, 2);
 
   const before = runIds(runs);
@@ -575,8 +616,11 @@ test('an exception in a trial is an execution error, not a business failure', (t
 });
 
 test('a run hands Harbor the package, agent, model and attempts, and the application root in its environment', (t) => {
-  const { repo, root, tools } = readyProject(t, { live: [FAILURE], confirm: false });
+  const project = readyProject(t, { live: [FAILURE], confirm: false });
+  const { repo, root, tools } = project;
   const kit = path.join(repo, '.genesis/edd/harness');
+  // The plan is the user's: only their confirmation settles the attempts.
+  const { confirmation } = confirmChecks(project, { agent: 'other_agent:OtherAgent', model: 'synthetic/model-1', attempts: 2 });
   const base = startRun(repo, CHANGE, { baseline: true, agent: 'other_agent:OtherAgent', model: 'synthetic/model-1', attempts: 2, yes: true });
   assert.equal(base.execution_status, 'completed', JSON.stringify(base));
   const calls = tools.runs().slice(-2).sort((a, b) => valueOf(a.argv, '-p').localeCompare(valueOf(b.argv, '-p')));
@@ -591,8 +635,10 @@ test('a run hands Harbor the package, agent, model and attempts, and the applica
   }
   assert.deepEqual(readRecord(base).run.environment_ref, { harbor: FAKE_HARBOR_VERSION, agent: 'other_agent:OtherAgent',
     model: 'synthetic/model-1', attempts: 2, attempts_by_case: { [FAILURE]: 2, [SUCCESS]: 1 },
-    run_plan: { attempts: 2, pass_rule: 'all', agent: 'other_agent:OtherAgent', model: 'synthetic/model-1', source: 'baseline' },
+    run_plan: { attempts: 2, pass_rule: 'all', agent: 'other_agent:OtherAgent', model: 'synthetic/model-1', source: 'confirmation', confirmation: confirmation.id, tier: 'full' },
     dependencies: { [FAILURE]: [LIVE_DEPENDENCY], [SUCCESS]: [] } });
+  // --yes passed every host variable the packages declare.
+  assert.equal(readRecord(base).run.host_env.mode, 'all');
 
   // Without options the agent comes from the kit's harness.json, with no model and no --yes.
   const head = startRun(repo, CHANGE);
@@ -688,15 +734,19 @@ test('Docker not running or Harbor missing blocks a run with the matching gaps a
   const docker = runTools();
   assert.deepEqual([docker.harbor, docker.docker], [FAKE_HARBOR_VERSION, false]);
   assert.deepEqual(docker.gaps.map((gap) => gap.code), ['docker_unavailable']);
+  assertGapShape(docker.gaps[0], { owner: 'agent', layer: 'machine' });
   assert.throws(() => startRun(repo, CHANGE, { baseline: true }), (error) => {
     refused('docker_unavailable')(error);
-    assert.deepEqual(error.resume.command, ['workflow', 'check', 'run-eval', CHANGE, '--repo', repo]);
+    assertGapShape(error.gaps[0], { owner: 'agent', layer: 'machine' });
+    assert.equal(error.resume, undefined);
     return true;
   });
-  const workflow = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(workflow.status, 'blocked');
-  assert.deepEqual(workflow.gaps.map((gap) => gap.code), ['docker_unavailable']);
-  assert.equal(workflow.next.action, 'repair_inputs');
+  // The machine layer holds the gap, and every run waits for it.
+  const status = workflowStatus(repo, CHANGE);
+  assert.deepEqual(status.layers.machine.gaps.map((gap) => gap.code), ['docker_unavailable']);
+  assert.ok(actionOf(status, 'run', 'start', '--baseline').blocked_by.includes('docker_unavailable'), JSON.stringify(status.actions));
+  assert.ok(actionOf(status, 'run', 'start', '--trial').blocked_by.includes('docker_unavailable'), JSON.stringify(status.actions));
+  assert.notDeepEqual(status.suggestion?.command?.slice(0, 2), ['run', 'start'], JSON.stringify(status.suggestion));
 
   tools.harbor(false);
   const both = cli(['run', 'start', CHANGE, '--repo', repo, '--baseline']);

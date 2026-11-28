@@ -10,15 +10,15 @@ import path from 'node:path';
 import test from 'node:test';
 import { readJSON } from '../src/project.js';
 import { validateEval } from '../src/eval.js';
-import { checkEval, codeSnapshot, readCounts, runTools, sameCode, savePatch, startRun } from '../src/run.js';
-import { loopStatus, startLoop } from '../src/loop.js';
-import { checkWorkflow } from '../src/workflow.js';
+import { checkEval, codeSnapshot, readCounts, readRuns, runTools, sameCode, savePatch, startRun } from '../src/run.js';
+import { loopStatus } from '../src/loop.js';
+import { workflowStatus } from '../src/workflow.js';
 import {
-  AFTER, AGENT, BEFORE, CHANGE, FAKE_HARBOR_VERSION, LIVE_DEPENDENCY, cli, commit, confirmChecks, connect, dropCheck, editChecks, git, harborThen, readRecord,
+  AFTER, AGENT, BEFORE, CHANGE, FAKE_HARBOR, FAKE_HARBOR_VERSION, LIVE_DEPENDENCY, cli, commit, confirmChecks, connect, dropCheck, editChecks, git, harborThen, readRecord,
   readyProject, setResults, writeExpectations,
 } from './helpers/edd.js';
 import {
-  FAILURE, SUCCESS, runIds, rows, find, tally, sha256, valueOf, refused, scratch, tree, loopFile,
+  FAILURE, SUCCESS, runIds, rows, find, tally, sha256, valueOf, refused, scratch, tree, loopFile, actionOf, assertGapShape, assertNoRoutes, assertSuggestion, startLoop,
 } from './helpers/run.js';
 
 // Which base record a head run compares with, and how a running loop pins it.
@@ -39,10 +39,11 @@ const baseRuns = (run) => {
 const expectationRows = (record) => record.baseline_expectations.map(({ case: id, check, expected }) => [id, check, expected])
   .sort((a, b) => `${a[0]}/${a[1]}`.localeCompare(`${b[0]}/${b[1]}`));
 // The warning of a base record made while a loop for its Spec runs.
-const keepsBaselineWarning = (warnings) => warnings.some((warning) => /keeps comparing with its own baseline .* a new loop/.test(warning));
+const keepsBaselineWarning = (warnings) => warnings.some((warning) => /^The loop for this Spec keeps comparing with its own baseline \S+ while it runs\.$/.test(warning));
 
 test('a head run records as base_run, in run.json and compare.json, the base record it compared with, real or unavailable', (t) => {
-  const { repo } = readyProject(t);
+  // The full tier allows an unavailable baseline in an existing project.
+  const { repo } = readyProject(t, { tier: 'full' });
   const base = startRun(repo, CHANGE, { baseline: true });
   assert.equal(base.is_baseline, true);
   setResults(repo, AFTER);
@@ -70,7 +71,7 @@ test('a head run in a new project with only an unavailable baseline records that
 });
 
 test('without a loop, a head run compares with the latest base run that executed or was declared unavailable', (t) => {
-  const { repo } = readyProject(t);
+  const { repo } = readyProject(t, { tier: 'full' });
   const first = startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
   const second = startRun(repo, CHANGE, { baseline: true });
   assert.equal(second.is_baseline, true);
@@ -118,13 +119,17 @@ test('while a loop runs for the current Spec, every head run compares with the l
   const second = startRun(repo, CHANGE);
   assert.deepEqual(baseRuns(second), { run: first.run_id, compare: first.run_id, baseline: first.run_id, compareBaseline: first.run_id });
 
-  // Once there is no loop, the latest base run is the reference again.
+  // Deleting loop.json does not free the head runs from the loop: the loop,
+  // known from its runs, counts as ended without acceptance, which locks the
+  // change until the user decides.
   rmSync(loopFile(root));
   setResults(repo, AFTER);
   commit(repo);
-  const free = startRun(repo, CHANGE);
-  assert.deepEqual(baseRuns(free), { run: later.run_id, compare: later.run_id, baseline: later.run_id, compareBaseline: later.run_id });
-  assert.equal(find(readRecord(free).compare, SUCCESS, 'c1').verdict, 'base_mismatch');
+  assert.throws(() => startRun(repo, CHANGE), (error) => {
+    refused('change_locked')(error);
+    assertGapShape(error.gaps[0], { owner: 'user', layer: 'loop' });
+    return true;
+  });
 });
 
 test('a loop pins an unavailable baseline too: later base runs on the starting code do not replace it', (t) => {
@@ -134,7 +139,8 @@ test('a loop pins an unavailable baseline too: later base runs on the starting c
   assert.equal(loop.baseline, first.run_id);
   const blockedBase = startRun(repo, CHANGE, { baseline: true, unavailable: 'execution_blocked' });
   assert.equal(blockedBase.execution_status, 'not_run');
-  const executed = startRun(repo, CHANGE, { baseline: true });
+  // A new project's baseline expects every check to fail on its skeleton.
+  const executed = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, { [`${FAILURE}/c1`]: 'fail', [`${SUCCESS}/c1`]: 'fail', [`${SUCCESS}/c2`]: 'fail' }) });
   assert.equal(executed.is_baseline, true, JSON.stringify(executed));
 
   setResults(repo, BEFORE);
@@ -152,8 +158,8 @@ test('a loop pins an unavailable baseline too: later base runs on the starting c
   assert.ok(compare.results.every((entry) => entry.before_unavailable_reason === 'no_implementation'), JSON.stringify(compare.results));
 });
 
-test('a loop.json for a different Spec is not a running loop: head runs compare with the latest base, and until the user accepts that loop a baseline goes on its starting code', (t) => {
-  const { repo, root } = readyProject(t);
+test('a loop.json for a different Spec is no running loop of this one, yet it locks the change, and until a loop is accepted a baseline goes on its starting code', (t) => {
+  const { repo, root, runs } = readyProject(t);
   const first = startRun(repo, CHANGE, { baseline: true });
   startLoop(repo, CHANGE);
   const stale = readJSON(loopFile(root));
@@ -161,6 +167,17 @@ test('a loop.json for a different Spec is not a running loop: head runs compare 
 
   setResults(repo, AFTER);
   commit(repo);
+  // That loop ended without the user's acceptance: a new Spec export does not
+  // lift the lock on the head runs of this change.
+  assert.throws(() => startRun(repo, CHANGE), (error) => {
+    refused('change_locked')(error);
+    const gap = assertGapShape(error.gaps[0], { owner: 'user', layer: 'loop', reason: 'spec_exported' });
+    assert.deepEqual(gap.loop, { started_at: stale.started_at, spec: sha256('a Spec exported before this one') });
+    assert.equal(gap.unlocks.length, 2, JSON.stringify(gap.unlocks));
+    return true;
+  });
+  // Nor is a trial of the application code allowed.
+  assert.throws(() => startRun(repo, CHANGE, { trial: true }), refused('change_locked'));
   // That loop's starting code is still the code before the change.
   assert.throws(() => startRun(repo, CHANGE, { baseline: true }), refusedWith('baseline_after_change'));
   setResults(repo, BEFORE);
@@ -168,16 +185,21 @@ test('a loop.json for a different Spec is not a running loop: head runs compare 
   const later = startRun(repo, CHANGE, { baseline: true });
   assert.equal(later.is_baseline, true, JSON.stringify(later));
   assert.ok(!keepsBaselineWarning(later.warnings), JSON.stringify(later.warnings));
+  // A new loop the user agrees to lifts the lock; it starts on that baseline.
+  const { loop } = startLoop(repo, CHANGE);
+  assert.equal(loop.baseline, later.run_id);
   setResults(repo, AFTER);
   const head = startRun(repo, CHANGE);
   assert.notEqual(later.run_id, first.run_id);
   assert.deepEqual(baseRuns(head), { run: later.run_id, compare: later.run_id, baseline: later.run_id, compareBaseline: later.run_id });
 
-  // Nor does a missing baseline folder of that other loop matter.
+  // Nor does a missing baseline folder of that other loop matter to this
+  // one, though the run index still counts the run as lost.
   rmSync(first.directory, { recursive: true, force: true });
   const again = startRun(repo, CHANGE);
   assert.equal(again.execution_status, 'completed', JSON.stringify(again));
   assert.equal(readRecord(again).run.base_run, later.run_id);
+  assert.ok(readRuns(runs).some((run) => run.run_id === first.run_id && run.lost === true));
 });
 
 test('while a loop runs, a baseline that executes on changed code is refused with baseline_after_change, writes nothing, and the CLI exits 1', (t) => {
@@ -210,7 +232,8 @@ test('while a loop runs, a baseline that executes on changed code is refused wit
 });
 
 test('while a loop runs, --baseline --unavailable is refused on changed code too, so it cannot replace the loop baseline', (t) => {
-  const { repo, runs } = readyProject(t);
+  // The full tier allows an unavailable baseline in an existing project.
+  const { repo, runs } = readyProject(t, { tier: 'full' });
   const first = startRun(repo, CHANGE, { baseline: true });
   startLoop(repo, CHANGE);
   setResults(repo, AFTER);
@@ -267,7 +290,7 @@ test('while a loop runs, a baseline on the starting code is allowed and warns th
   assert.equal(readRecord(head).run.base_run, first.run_id);
 });
 
-test('a head run is refused with loop_ended (baseline_missing) when the loop baseline folder is gone, even though another baseline exists', (t) => {
+test('once the loop baseline folder is gone the loop has ended, and head runs are refused even though another baseline exists', (t) => {
   const { repo, tools, runs } = readyProject(t);
   const first = startRun(repo, CHANGE, { baseline: true });
   startLoop(repo, CHANGE);
@@ -278,17 +301,22 @@ test('a head run is refused with loop_ended (baseline_missing) when the loop bas
   commit(repo);
   const before = runIds(runs);
   const calls = tools.runs().length;
+  const status = loopStatus(repo, CHANGE);
+  assert.deepEqual([status.phase, status.ended?.reason], ['ended', 'baseline_missing'], JSON.stringify(status.ended));
+  // The loop ended without acceptance, so the change is locked: the gap names why.
   assert.throws(() => startRun(repo, CHANGE), (error) => {
-    refusedWith('loop_ended')(error);
-    assert.equal(error.gaps[0].reason, 'baseline_missing');
+    refused('change_locked', 'loop_ended')(error);
+    assertGapShape(error.gaps[0], { owner: 'user', layer: 'loop', reason: 'baseline_missing' });
     return true;
   });
   const refusal = cli(['run', 'start', CHANGE, '--repo', repo]);
   assert.equal(refusal.status, 1, refusal.stdout);
   assert.equal(refusal.json.code, 'RUN_INPUT_BLOCKED');
-  assert.ok(refusal.json.gaps.some((gap) => gap.code === 'loop_ended' && gap.reason === 'baseline_missing'), JSON.stringify(refusal.json));
+  assert.ok(refusal.json.gaps.some((gap) => gap.code === 'change_locked' && gap.reason === 'baseline_missing'), JSON.stringify(refusal.json));
   assert.deepEqual(runIds(runs), before);
   assert.equal(tools.runs().length, calls);
+  // The deleted baseline is still in the run index, as a lost run.
+  assert.ok(readRuns(runs).some((run) => run.run_id === first.run_id && run.lost === true));
 });
 
 test('a baseline that runs records an expectation for every declared check, including packages awaiting integration, and an unavailable one records none', (t) => {
@@ -355,7 +383,7 @@ test('a check with no baseline result says why: not_run_at_baseline for a packag
 });
 
 test('with no baseline run, every check without a result carries the reason the baseline was declared unavailable', (t) => {
-  const { repo } = readyProject(t);
+  const { repo } = readyProject(t, { tier: 'full' });
   setResults(repo, AFTER);
   commit(repo);
   for (const reason of ['execution_blocked', 'incompatible_tasks', 'no_implementation']) {
@@ -459,7 +487,8 @@ test('eval check skips packages whose record still matches, proves the changed o
   assert.equal(again.passed, true);
   assert.deepEqual(again.cases, []);
   assert.deepEqual(again.already_proved, [FAILURE, SUCCESS]);
-  assert.match(again.next, /proved already/);
+  assert.deepEqual(again.proved, []);
+  assert.equal(again.suggestion, null);
   assert.equal(tools.runs().length, calls);
   const shown = cli(['eval', 'check', CHANGE, '--repo', repo]);
   assert.equal(shown.status, 0, shown.stderr);
@@ -497,7 +526,9 @@ test('eval check proves again a package whose last proof failed, and a failed pr
   assert.equal(failed.passed, false);
   assert.deepEqual(failed.cases.map((item) => [item.case, item.passed]), [[SUCCESS, false]]);
   assert.deepEqual(failed.already_proved, [FAILURE]);
-  assert.match(failed.next, /did not get the result it expects/);
+  assert.deepEqual(failed.proved, []);
+  // Every fixture of the changed package failed to execute, and so did its probe.
+  assert.deepEqual(failed.failed, { probe_judged: [], probe_errored: [SUCCESS], fixture_failed: [SUCCESS], package_changed_during_check: [] });
 
   // The failed record matches the package, but it proves nothing: it runs again.
   const missing = validateEval(repo, CHANGE).cases.find((item) => item.id === SUCCESS).integration.missing;
@@ -514,21 +545,26 @@ test('eval check proves again a package whose last proof failed, and a failed pr
 // agent or the user editing while a run executes would.
 const EDIT_DURING_RUN = "appendFileSync(path.join(repo, 'app/edited.txt'), 'edited during the run\\n');";
 
-test('code edited while a run executes makes it neither a baseline nor a pass, and the run says to run again on stable code', (t) => {
+// The warning of a run during which the code changed.
+const CODE_MOVED = 'The code changed while this run executed, so its results do not belong to one version of the code: it neither passes nor counts as a baseline.';
+
+test('code edited while a run executes makes it neither a baseline nor a pass, and the run says why', (t) => {
   const { repo, tools } = readyProject(t);
   harborThen(t, EDIT_DURING_RUN);
   const base = startRun(repo, CHANGE, { baseline: true });
   assert.equal(base.execution_status, 'completed', JSON.stringify(base));
   assert.equal(base.is_baseline, false);
   assert.equal(base.baseline_unavailable_reason, 'execution_blocked');
-  assert.match(base.next, /The code changed while this run executed/);
+  assert.deepEqual(base.unverified_by, ['code_changed_during_run']);
+  assert.deepEqual(base.loop_baseline, { usable: false, reasons: ['code_changed_during_run'] });
+  assert.ok(base.warnings.includes(CODE_MOVED), JSON.stringify(base.warnings));
   assert.equal(readRecord(base).run.code_changed_during_run, true);
   // The attempt ran; it is no baseline because the code changed meanwhile.
   assert.throws(() => startRun(repo, CHANGE), (error) => {
     refused('baseline_missing')(error);
-    const { message } = error.gaps[0];
-    assert.ok(message.startsWith(`The last baseline attempt, ${base.run_id}, ran while the code changed, so it is not a baseline; record it again without editing the code during the run.`), message);
-    assert.doesNotMatch(message, /did not run/);
+    const gap = error.gaps[0];
+    assert.deepEqual(gap.last_attempt, { run_id: base.run_id, why: 'the code changed while it ran' });
+    assert.ok(gap.message.includes(`the last base attempt, ${base.run_id}, gives none because the code changed while it ran`), gap.message);
     return true;
   });
 
@@ -546,9 +582,8 @@ test('code edited while a run executes makes it neither a baseline nor a pass, a
   assert.equal(head.json.execution_status, 'completed');
   assert.deepEqual(head.json.compare, tally({ holds: 3 }));
   assert.equal(head.json.verdict, 'unverified');
-  assert.ok(head.json.warnings.includes('The code changed while this run executed, so its results do not belong to one version of the code. Do not edit the code during a run; run again once it is stable.'),
-    JSON.stringify(head.json.warnings));
-  assert.match(head.json.next, /run the same command again/);
+  assert.ok(head.json.warnings.includes(CODE_MOVED), JSON.stringify(head.json.warnings));
+  assert.deepEqual(head.json.unverified_by, ['code_changed_during_run']);
   const { run } = readRecord(head.json.directory);
   assert.equal(run.code_changed_during_run, true);
   assert.equal(run.verdict, 'unverified');
@@ -559,7 +594,7 @@ test('code edited while a run executes makes it neither a baseline nor a pass, a
 // Appends to a package's Dockerfile after each Harbor call, as an edit during a run would.
 const EDIT_PACKAGE = (id) => `appendFileSync(path.join(repo, '.genesis/edd/${CHANGE}/evals/${id}/environment/Dockerfile'), 'RUN true\\n');`;
 
-test('a package or kit edited while a run executes makes it neither a pass nor a baseline, and the run names what changed and says to prove it again', (t) => {
+test('a package or kit edited while a run executes makes it neither a pass nor a baseline, and the run names what changed', (t) => {
   const { repo, tools } = readyProject(t);
   harborThen(t, EDIT_PACKAGE(SUCCESS));
   const base = startRun(repo, CHANGE, { baseline: true });
@@ -567,12 +602,13 @@ test('a package or kit edited while a run executes makes it neither a pass nor a
   assert.equal(base.is_baseline, false);
   assert.equal(base.baseline_unavailable_reason, 'execution_blocked');
   assert.equal(readRecord(base).run.packages_changed_during_run, true);
-  assert.match(base.next, /^The eval packages changed while this run executed/);
+  assert.deepEqual(base.unverified_by, ['packages_changed_during_run']);
+  assert.deepEqual(base.loop_baseline, { usable: false, reasons: ['packages_changed_during_run'] });
   // The attempt ran; it is no baseline because a package changed meanwhile.
   tools.harbor(true);
   assert.throws(() => startRun(repo, CHANGE), (error) => {
     refused('baseline_missing')(error);
-    assert.ok(error.gaps[0].message.startsWith(`The last baseline attempt, ${base.run_id}, ran while the eval packages changed, so it is not a baseline; record it again without editing them during the run.`), error.gaps[0].message);
+    assert.deepEqual(error.gaps[0].last_attempt, { run_id: base.run_id, why: 'the eval packages changed while it ran' });
     return true;
   });
   assert.equal(checkEval(repo, CHANGE).passed, true);
@@ -592,8 +628,8 @@ test('a package or kit edited while a run executes makes it neither a pass nor a
   // The record keeps the packages as the run started with them.
   assert.deepEqual(run.task_digest, digests);
   const warning = head.warnings.find((entry) => entry.startsWith('The eval packages changed while this run executed'));
-  assert.equal(warning, `The eval packages changed while this run executed: ${SUCCESS} (${SUCCESS}/environment/Dockerfile). Its results do not belong to one version of them. Do not edit packages or the project kit during a run; prove them again with \`eval check\` and run again.`);
-  assert.match(head.next, /prove them again with `eval check`, then run the same command again\.$/);
+  assert.equal(warning, `The eval packages changed while this run executed: ${SUCCESS} (${SUCCESS}/environment/Dockerfile). Its results do not belong to one version of them: it neither passes nor counts as a baseline.`);
+  assert.deepEqual(head.unverified_by, ['packages_changed_during_run']);
 
   // A change to the kit changes every package that ran.
   tools.harbor(true);
@@ -725,32 +761,37 @@ test('the records .gitignore keeps the lines a user added and gains only the bui
   const file = path.join(root, '..', '.gitignore');
   writeFileSync(file, '# Large logs stay local\n*.log\n!keep-me/\n/*/runs/');
   startRun(repo, CHANGE, { baseline: true });
-  const merged = '# Large logs stay local\n*.log\n!keep-me/\n/*/runs/\n/*/checks/\n/*/loop.json\n/*/loop-start.patch\n__pycache__/\n';
+  const merged = '# Large logs stay local\n*.log\n!keep-me/\n/*/runs/\n/*/checks/\n/*/loop.json\n/*/loop-start.patch\n/*/decisions.jsonl\n__pycache__/\n';
   assert.equal(readFileSync(file, 'utf8'), merged);
   setResults(repo, AFTER);
   startRun(repo, CHANGE);
   assert.equal(readFileSync(file, 'utf8'), merged);
 });
 
-test('a head run with no ready package is refused with no_runnable_case, as workflow check is, and writes no run', (t) => {
+test('a head run with no ready package is refused with no_runnable_case, which workflow status names for it too, and writes no run', (t) => {
   const { repo, root, runs, tools } = readyProject(t);
   const base = startRun(repo, CHANGE, { baseline: true });
   // An edited package waits for `eval check` again.
   for (const id of [FAILURE, SUCCESS]) writeFileSync(path.join(root, 'evals', id, 'instruction.md'), `Submit the weekly report for scenario ${id} twice.\n`);
-  const workflow = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(workflow.status, 'blocked');
+  const status = workflowStatus(repo, CHANGE);
+  const headAction = status.actions.find((entry) => entry.command.join(' ') === ['run', 'start', CHANGE, '--repo', repo].join(' '));
+  assert.ok(headAction.blocked_by.includes('no_runnable_case'), JSON.stringify(headAction));
+  // What would prove them again is allowed.
+  assert.equal(actionOf(status, 'eval', 'check').allowed, true, JSON.stringify(status.actions));
+  assert.deepEqual(actionOf(status, 'eval', 'check').cases, [FAILURE, SUCCESS]);
   const calls = tools.runs().length;
   assert.throws(() => startRun(repo, CHANGE), (error) => {
     refused('no_runnable_case')(error);
-    assert.deepEqual(error.gaps, workflow.gaps);
-    assert.deepEqual(error.resume, workflow.resume);
-    assert.match(error.message, /^No package is ready to run\. Waiting: submit-failure-s1 \(check: run `eval check`/);
+    const gap = assertGapShape(error.gaps[0], { owner: 'agent', layer: 'package' });
+    // Both wait only for their `eval check` record.
+    assert.deepEqual(gap.unchecked, [FAILURE, SUCCESS]);
+    assert.match(error.message, /^No package is ready to run\. Waiting: submit-failure-s1 \(/);
     return true;
   });
   const refusal = cli(['run', 'start', CHANGE, '--repo', repo]);
   assert.equal(refusal.status, 1);
-  assert.deepEqual(refusal.json.gaps.map((gap) => [gap.code, gap.route]), [['no_runnable_case', 'write-eval']]);
-  assert.deepEqual(refusal.json.resume.command, ['workflow', 'check', 'run-eval', CHANGE, '--repo', repo]);
+  assert.deepEqual(refusal.json.gaps.map((gap) => gap.code), ['no_runnable_case']);
+  assertNoRoutes(refusal.json, 'refusal');
   assert.deepEqual(runIds(runs), [base.run_id]);
   assert.equal(tools.runs().length, calls);
 });
@@ -818,7 +859,7 @@ test('what a verifier graded in an attempt whose agent raised, a fail or a pass,
   }`);
   const run = startRun(repo, CHANGE);
   assert.deepEqual([run.execution_status, run.verdict], ['error', 'unverified']);
-  assert.equal(run.next, 'Execution did not complete. Read cases[].execution.reason and each case\'s logs/harbor.log, fix the cause, then run the same command again.');
+  assert.deepEqual(run.unverified_by, ['execution_incomplete']);
   assert.deepEqual(run.compare_gating, tally({ unverified: 3 }));
   const { compare } = readRecord(run);
   assert.deepEqual(rows(compare), [
@@ -845,7 +886,7 @@ test('what a verifier graded in an attempt whose agent raised, a fail or a pass,
   assert.deepEqual(readCounts(path.join(run.directory, FAILURE), [{ id: 'c1' }]), { c1: { pass: 2, fail: 0, unknown: 1 } });
 });
 
-test('a run folder without run.json, left by an interrupted run, is named in a warning that says it can be deleted', (t) => {
+test('a run folder without run.json that the run index does not list is named in a warning, which never says to delete it', (t) => {
   const { repo, runs } = readyProject(t);
   const base = startRun(repo, CHANGE, { baseline: true });
   const interrupted = '20260101-000000-dead';
@@ -855,12 +896,18 @@ test('a run folder without run.json, left by an interrupted run, is named in a w
   const head = startRun(repo, CHANGE);
   assert.equal(head.verdict, 'pass');
   assert.equal(head.baseline, base.run_id);
-  assert.deepEqual(head.warnings.filter((warning) => warning.startsWith('Run folders')), [`Run folders without a readable run.json, left by a run that was interrupted or is still running: ${interrupted}. They are not counted or compared. Delete them once their logs are no longer needed.`]);
+  const named = head.warnings.filter((warning) => warning.startsWith('Run folders'));
+  assert.deepEqual(named, [`Run folders without a readable run.json, left by a run that was interrupted or is still running: ${interrupted}. A run the run index lists counts as interrupted: the attempts it completed count for its code. The folders hold that evidence and their logs.`]);
+  // The folders are evidence: nothing tells anyone to remove them.
+  assert.doesNotMatch(named[0], /delete|remove/i);
   assert.deepEqual(readRecord(head).run.warnings, head.warnings);
 });
 
 test('a head run whose agent, model or attempts differ from the baseline warns which ones, and its verdicts stay as they are', (t) => {
-  const { repo } = readyProject(t, { live: [FAILURE], confirm: false });
+  const project = readyProject(t, { live: [FAILURE], confirm: false });
+  const { repo } = project;
+  // The user confirmed the plan the baseline runs.
+  confirmChecks(project, { model: 'synthetic/model-a', attempts: 1 });
   const base = startRun(repo, CHANGE, { baseline: true, model: 'synthetic/model-a', attempts: 1 });
   setResults(repo, AFTER);
   const differs = (run) => run.warnings.filter((warning) => warning.startsWith('The settings of this run differ'));
@@ -870,67 +917,148 @@ test('a head run whose agent, model or attempts differ from the baseline warns w
   const other = startRun(repo, CHANGE, { agent: 'other_agent:OtherAgent', model: 'synthetic/model-b', attempts: 2 });
   assert.equal(other.verdict, 'pass');
   assert.deepEqual(other.compare, tally({ holds: 3 }));
-  assert.deepEqual(differs(other), [`The settings of this run differ from those of the baseline ${base.run_id}: agent other_agent:OtherAgent here, ${AGENT} in the baseline; model synthetic/model-b here, synthetic/model-a in the baseline; attempts 2 here, 1 in the baseline. A different result may come from that, not from the change. Run with the baseline's settings to compare like with like.`]);
+  assert.deepEqual(differs(other), [`The settings of this run differ from those of the baseline ${base.run_id}: agent other_agent:OtherAgent here, ${AGENT} in the baseline; model synthetic/model-b here, synthetic/model-a in the baseline; attempts 2 here, 1 in the baseline. A different result may come from that, not from the change.`]);
   assert.deepEqual(readRecord(other).run.warnings, other.warnings);
 
   const unnamed = startRun(repo, CHANGE);
-  assert.deepEqual(differs(unnamed), [`The settings of this run differ from those of the baseline ${base.run_id}: model none here, synthetic/model-a in the baseline. A different result may come from that, not from the change. Run with the baseline's settings to compare like with like.`]);
+  assert.deepEqual(differs(unnamed), [`The settings of this run differ from those of the baseline ${base.run_id}: model none here, synthetic/model-a in the baseline. A different result may come from that, not from the change.`]);
 });
 
-test('a multi-step package stays awaiting_integration, missing steps: eval check does not prove it and runs skip it', (t) => {
-  const { repo, root } = readyProject(t);
-  const directory = path.join(root, 'evals', FAILURE);
-  for (const step of ['first', 'second']) {
-    mkdirSync(path.join(directory, 'steps', step), { recursive: true });
-    writeFileSync(path.join(directory, 'steps', step, 'instruction.md'), `Turn ${step} of the conversation.\n`);
-  }
+// Turns a package of the project into one of two steps, first and second:
+// task.toml declares them, each step has its instruction and test.sh, every
+// check is read after the second step, and each fixture gives a script for
+// the second step only.
+function twoSteps(repo, root, id) {
+  const directory = path.join(root, 'evals', id);
+  appendFileSync(path.join(directory, 'task.toml'), '\n[[steps]]\nname = "first"\n\n[[steps]]\nname = "second"\n');
   const file = path.join(directory, 'tests/checks.json');
   const declared = readJSON(file);
   declared.checks = declared.checks.map((check) => ({ ...check, at: 'second' }));
   writeFileSync(file, `${JSON.stringify(declared, null, 2)}\n`);
+  for (const step of ['first', 'second']) {
+    mkdirSync(path.join(directory, 'steps', step, 'tests'), { recursive: true });
+    writeFileSync(path.join(directory, 'steps', step, 'instruction.md'), `Turn ${step} of the weekly report conversation for scenario ${id}.\n`);
+    const gates = step === 'second' ? declared.checks.map((check) => `gate ${check.id} unknown "synthetic"`) : ['# Synthetic: nothing is checked after the first turn.'];
+    writeFileSync(path.join(directory, 'steps', step, 'tests/test.sh'), `#!/bin/sh\n. "$(dirname "$0")/genesis.sh"\n${gates.join('\n')}\nfinish\n`, { mode: 0o755 });
+  }
+  rmSync(path.join(directory, 'instruction.md'), { force: true });
+  rmSync(path.join(directory, 'tests/test.sh'), { force: true });
+  for (const fixture of declared.fixtures) {
+    rmSync(path.join(directory, 'tests/fixtures', `${fixture.name}.sh`), { force: true });
+    mkdirSync(path.join(directory, 'tests/fixtures', fixture.name), { recursive: true });
+    writeFileSync(path.join(directory, 'tests/fixtures', fixture.name, 'second.sh'), `#!/bin/sh\n# Synthetic fixture: leaves a state the verifier judges as ${fixture.name}.\nexit 0\n`, { mode: 0o755 });
+  }
+}
 
+// Points GENESIS_EDD_HARBOR at a Harbor that runs the fake one and then lays
+// out each trial of a package with steps as Harbor does: every step's
+// verifier output under steps/STEP/verifier/. The checks go to the step their
+// at names; every other step's verifier records the opposite pass or fail
+// for them, which must never count.
+function stepsHarbor(t) {
+  const directory = scratch(t, 'genesis-edd-steps-harbor-');
+  const file = path.join(directory, 'harbor.mjs');
+  writeFileSync(file, `import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+const argv = process.argv.slice(2);
+// eval check hands a package with steps one fixture script per step; the
+// fake Harbor reads the fixture's name from the script it is given.
+const env = { ...process.env };
+const name = process.env.GENESIS_EDD_FIXTURE_NAME;
+const scripts = name && process.env.GENESIS_EDD_FIXTURE_DIR ? path.join(process.env.GENESIS_EDD_FIXTURE_DIR, name) : null;
+if (process.env.GENESIS_EDD_STEPS && scripts && existsSync(scripts) && !existsSync(process.env.GENESIS_EDD_FIXTURE ?? '')) {
+  env.GENESIS_EDD_FIXTURE = path.join(${JSON.stringify(directory)}, name + '.sh');
+  writeFileSync(env.GENESIS_EDD_FIXTURE, '#!/bin/sh\\nexit 0\\n');
+}
+const done = spawnSync(process.execPath, [${JSON.stringify(FAKE_HARBOR)}, ...argv], { stdio: 'inherit', env });
+if (argv[0] === 'run') {
+  const packageDirectory = argv[argv.indexOf('-p') + 1];
+  const job = path.join(argv[argv.indexOf('-o') + 1], argv[argv.indexOf('--job-name') + 1] ?? 'harbor');
+  const steps = [...readFileSync(path.join(packageDirectory, 'task.toml'), 'utf8').matchAll(/^\\[\\[steps\\]\\]\\s*\\nname = "([^"]+)"$/gm)].map((match) => match[1]);
+  const checks = JSON.parse(readFileSync(path.join(packageDirectory, 'tests/checks.json'), 'utf8')).checks;
+  const flip = { pass: 'fail', fail: 'pass' };
+  for (const trial of existsSync(job) ? readdirSync(job) : []) {
+    const own = path.join(job, trial, 'verifier', 'check-results.json');
+    if (!steps.length || !existsSync(own)) continue;
+    const results = JSON.parse(readFileSync(own, 'utf8')).results;
+    for (const step of steps) {
+      const folder = path.join(job, trial, 'steps', step, 'verifier');
+      mkdirSync(folder, { recursive: true });
+      const written = results.map((entry) => (checks.find((check) => check.id === entry.id)?.at === step ? entry
+        : { ...entry, result: flip[entry.result] ?? entry.result, evidence: 'another step recorded this' }));
+      const passed = checks.filter((check) => check.role === 'gating' && check.at === step).every((check) => results.find((entry) => entry.id === check.id)?.result === 'pass');
+      writeFileSync(path.join(folder, 'check-results.json'), JSON.stringify({ results: written }));
+      writeFileSync(path.join(folder, 'reward.json'), JSON.stringify({ reward: checks.some((check) => check.role === 'gating' && check.at === step) && passed ? 1 : 0 }));
+    }
+  }
+}
+process.exit(done.status ?? 1);
+`);
+  process.env.GENESIS_EDD_HARBOR = JSON.stringify([process.execPath, file]);
+}
+
+test('a multi-step package is proved and run, and each check is read only from the verifier of its own step', (t) => {
+  const project = readyProject(t, { check: false });
+  const { repo, root } = project;
+  twoSteps(repo, root, FAILURE);
   const evals = validateEval(repo, CHANGE);
-  assert.ok(evals.warnings.includes(`${FAILURE} is a multi-step package, which this release cannot run, so a full run of this change cannot pass. Tell the user before a loop starts.`), JSON.stringify(evals.warnings));
   const item = evals.cases.find((entry) => entry.id === FAILURE);
   assert.deepEqual(item.errors, []);
-  assert.equal(item.integration.state, 'awaiting_integration');
-  assert.ok(item.integration.missing.includes('steps'), JSON.stringify(item.integration));
-  assert.ok(item.integration.detail.some((entry) => entry.startsWith('steps: multi-step packages are not supported yet')), JSON.stringify(item.integration));
-
+  assert.deepEqual([item.steps, item.check_at], [['first', 'second'], { c1: 'second' }]);
+  stepsHarbor(t);
+  // The fixtures and the probe run through the steps too.
   const checked = checkEval(repo, CHANGE);
-  assert.ok(checked.skipped.some((entry) => entry.case === FAILURE && entry.missing.includes('steps')), JSON.stringify(checked));
-  assert.ok(!checked.cases.some((entry) => entry.case === FAILURE));
-  const base = startRun(repo, CHANGE, { baseline: true });
-  assert.ok(base.skipped.some((entry) => entry.case === FAILURE && entry.reason === 'awaiting_integration'), JSON.stringify(base.skipped));
+  assert.equal(checked.passed, true, JSON.stringify(checked.cases.map((entry) => [entry.case, entry.fixtures.map((fixture) => [fixture.name, fixture.got, fixture.execution])])));
+  assert.ok(checked.proved.includes(FAILURE), JSON.stringify(checked));
+  assert.equal(validateEval(repo, CHANGE).cases.find((entry) => entry.id === FAILURE).integration.state, 'ready');
+  commit(repo, 'Turn the failure scenario into two steps');
+  confirmChecks(project);
+
+  const base = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, { [`${FAILURE}/c1`]: 'fail', [`${SUCCESS}/c1`]: 'pass', [`${SUCCESS}/c2`]: 'pass' }) });
+  assert.equal(base.is_baseline, true, JSON.stringify(base));
+  assert.deepEqual(base.baseline_mismatch, []);
+  // The first step's verifier recorded pass for c1; only the second step's fail counts.
+  assert.deepEqual(readJSON(path.join(base.directory, FAILURE, 'attempts.json')).attempts.map((entry) => entry.results), [{ c1: 'fail' }]);
   setResults(repo, AFTER);
   const head = startRun(repo, CHANGE);
-  assert.notEqual(head.verdict, 'pass');
-  assert.ok(head.skipped.some((entry) => entry.case === FAILURE));
+  assert.equal(head.verdict, 'pass', JSON.stringify(head));
+  assert.deepEqual(rows(readRecord(head).compare), [
+    [FAILURE, 'c1', 'fail', 'pass', 'holds'],
+    [SUCCESS, 'c1', 'pass', 'pass', 'holds'],
+    [SUCCESS, 'c2', 'pass', 'pass', 'holds'],
+  ]);
+  assert.equal(find(readRecord(head).compare, FAILURE, 'c1').evidence, 'fake verifier: submit-failure-s1/c1 attempt 1 is pass');
+  // The run index keeps where each check of the package is read.
+  const start = readFileSync(path.join(project.runs, 'index.jsonl'), 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    .find((entry) => entry.event === 'start' && entry.run_id === head.run_id);
+  assert.deepEqual(start.check_steps, { [FAILURE]: { steps: ['first', 'second'], at: { c1: 'second' } } });
 });
 
-test('in a new project with an unavailable baseline and no package connected yet, workflow check run-eval points at loop start', (t) => {
+test('in a new project with an unavailable baseline and no package connected yet, a loop can start, and one started after the code moved keeps the baseline\'s code as its start', (t) => {
   const { repo } = readyProject(t, { mode: 'new', results: {}, unconnected: [FAILURE, SUCCESS] });
   const base = startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
-  assert.match(base.next, /^That no baseline could run is recorded\. To implement the change/);
-  assert.doesNotMatch(base.next, /does not start on code other than/);
-  const check = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
-  assert.equal(check.next.action, 'start_loop');
-  assert.equal(check.next.route, 'loop-and-implement');
-  assert.match(check.next.note, /^That no baseline could run is recorded/);
-  // A record that nothing could run says so of the code it was recorded on:
-  // once the code changed, it is recorded again before a loop starts.
+  assert.equal(base.execution_status, 'not_run');
+  // A loop can start on it as far as the record goes.
+  assert.deepEqual(base.loop_baseline, { usable: true, reasons: [] });
+  assert.equal(base.suggestion, null);
+  const status = workflowStatus(repo, CHANGE);
+  const loopStart = actionOf(status, 'loop', 'start');
+  assert.deepEqual([loopStart.allowed, loopStart.by], [true, 'user'], JSON.stringify(loopStart));
+  // The user's consent is recorded with --by and --ref.
+  assert.deepEqual(loopStart.command.slice(-4), ['--by', '<user>', '--ref', '<where they said so>']);
+  assert.equal(status.layers.baseline.recorded.on_code_now, true);
+  // The code moves before the loop starts: the record that nothing could run
+  // describes the code it was recorded on, which stays the loop's start code,
+  // and the loop records what moved.
   setResults(repo, AFTER);
   commit(repo, 'Write a first implementation');
-  const moved = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(moved.next.action, 'record_baseline');
-  assert.match(moved.next.note, new RegExp(`^The baseline ${base.run_id} records that nothing could run on other code than the code now: record it again on the code the loop starts from\\.`));
-  assert.throws(() => startLoop(repo, CHANGE), (error) => {
-    assert.ok(error.gaps.some((entry) => entry.code === 'baseline_not_at_start'), JSON.stringify(error.gaps));
-    assert.equal(error.gaps.find((entry) => entry.code === 'baseline_not_at_start').message, `The baseline ${base.run_id} records that nothing could run on other code than the code now. A loop starts on the code its baseline was recorded on: record the baseline again on the code the loop starts from, with \`run start --baseline --unavailable no_implementation\`.`);
-    return true;
-  });
-  const again = startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
-  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'start_loop');
-  assert.equal(startLoop(repo, CHANGE).loop.baseline, again.run_id);
+  const moved = workflowStatus(repo, CHANGE);
+  assert.equal(moved.layers.baseline.recorded.on_code_now, false);
+  const { loop } = startLoop(repo, CHANGE);
+  assert.equal(loop.baseline, base.run_id);
+  assert.equal(loop.start_code.digest, readRecord(base).run.code_snapshot.digest);
+  assert.deepEqual([loop.worktree_moved, loop.moved_files], [true, ['app/results.json']]);
+  // Every later base record goes on that start code.
+  assert.throws(() => startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' }), refusedWith('baseline_after_change'));
 });
