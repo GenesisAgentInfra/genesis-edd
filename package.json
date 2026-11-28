@@ -1,6 +1,6 @@
 {
   "name": "@genesis-agent-infra/edd",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Lightweight requirements and evaluation-driven development for coding agents",
   "type": "module",
@@ -10,7 +10,7 @@
   "scripts": {
     "test": "node --test",
     "test:quick": "node --test tests/helpers/harness.smoke.test.js tests/spec.test.js tests/eval.test.js tests/run.test.js tests/loop.test.js",
-    "check": "node --check bin/genesis-edd.js && node --check src/cli.js && node --check src/spec.js && node --check src/project.js && node --check src/workflow.js && node --check src/eval.js && node --check src/run.js && node --check src/loop.js && node --check src/confirm.js"
+    "check": "node --check bin/genesis-edd.js && node --check src/cli.js && node --check src/spec.js && node --check src/project.js && node --check src/workflow.js && node --check src/eval.js && node --check src/run.js && node --check src/loop.js && node --check src/confirm.js && node --check src/records.js"
   },
   "dependencies": {
     "@fission-ai/openspec": "2.1.0",

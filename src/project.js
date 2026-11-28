@@ -1,12 +1,33 @@
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'yaml';
 
 export const ROOT = fileURLToPath(new URL('../', import.meta.url));
 export const SCHEMA = 'genesis-spec';
+
+// The project is what Genesis EDD judges, and the agent being judged can edit
+// every file in it. A CLI installed inside the project could be swapped for
+// one that judges differently, so Genesis EDD refuses to work on a project
+// that holds its own installation. Throws the refusal; returns nothing.
+export function assertOutsideRepo(repo) {
+  let root;
+  let project;
+  try {
+    root = realpathSync(ROOT);
+    project = realpathSync(path.resolve(repo));
+  } catch { return; }
+  const relative = path.relative(project, root);
+  if (relative !== '' && (relative.startsWith('..') || path.isAbsolute(relative))) return;
+  const message = `Genesis EDD runs from ${root}, which is inside the project it would judge (${project}). The CLI that judges a project has to be installed outside it.`;
+  throw Object.assign(new Error(message), {
+    code: 'RUNTIME_INSIDE_PROJECT',
+    gaps: [{ code: 'runtime_inside_project', kind: 'technical', owner: 'user', layer: 'machine', message, path: root }],
+  });
+}
 // Exact files shipped before the public skill was renamed to agent-spec.
 const LEGACY_SCHEMA_HASH = 'sha256:a9390e43cec50f174f66d045c5c9c4e5515287e5e55d4ed1efdf26ef21d2b016';
 const LEGACY_SKILL_HASHES = {
@@ -17,11 +38,19 @@ const LEGACY_SKILL_HASHES = {
   'scripts/.gitignore': 'sha256:141fc8419b0378e8ff6d3161f01cb89a1165dc7b7230df4448f63bb3797d2735',
 };
 export const SKILLS = ['agent-spec', 'write-eval', 'run-eval', 'loop-and-implement'];
+// A file of the project's own in an installed skill: init never creates,
+// changes or deletes it, so a team keeps its additions to a skill there.
+export const LOCAL_SKILL_FILE = 'LOCAL.md';
+// Each skill's launcher, and the runtime.json beside it that names the CLI by
+// its absolute path. Only init writes them, so it writes them again on every
+// run, whatever they hold.
+const LAUNCHER = 'scripts/run.mjs';
+const RUNTIME = 'scripts/runtime.json';
 // Earlier shipped versions of skill and schema files. init updates an untouched
-// copy and still refuses to replace an edited one. Add the outgoing hash here
-// whenever a shipped file changes.
+// copy and leaves an edited skill file as it is, listed under conflicts. Add
+// the outgoing hash here whenever a shipped file changes.
 const PREVIOUS_SCHEMA_HASHES = [LEGACY_SCHEMA_HASH, 'sha256:196585c6747f342958a2ebf70b2e29b312664302c0d79e6b15f658b549a2371b',
-  'sha256:2ca194edb19cc4fc87b9d6ef6c58b31f9b75ce49bdde17b970697182d70f89fc'];
+  'sha256:2ca194edb19cc4fc87b9d6ef6c58b31f9b75ce49bdde17b970697182d70f89fc', 'sha256:49dafa3760a7df72b9ea34ae9f5eb2479b1f04d7b807146799f2cf35da07743d'];
 const PREVIOUS_SKILL_HASHES = {
   'agent-spec/SKILL.md': [
     'sha256:125c0caf12be5e2e0dac8bb9758105173260d842e9cfe144f3b4d38a1ebc7871',
@@ -33,6 +62,7 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:8778cd7d6dc3c144e96c758f1f149b1ae35c530a3a52df42a5305a832c113142',
     'sha256:5bb03c4d492792be8498845b79b50593f3cac3d191bc0717620b0f913733f872',
     'sha256:fd565bd5caf5b245490ad42877f15b860b5fa19784b00e4d94325503aa270338',
+    'sha256:623136ec69bba22784e4bc82ec94cfff9fda331874a39c326aef0604922df191',
   ],
   'agent-spec/scripts/run.mjs': ['sha256:881a4b48652d858fa99c6cccacd9549910b64631152884beef6bb88a70fc1e9a'],
   'write-eval/SKILL.md': [
@@ -41,10 +71,12 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:fb44a892188d2e01bcbc295d5119edd97bde2c63ce22f8bedb52e2d5f76d339a',
     'sha256:bec188e1bf562a8129071249582ebf02b9caee890a2ba7658ab9dcbdfc165182',
     'sha256:87be146556882da7a407d04acb24421ebe392c9d7aae689c97d73584c197e07d',
+    'sha256:675229d3b4bdf676d0b8fd25ef6cfb85c709a25cbe78306774f478a7b1e9bfd5',
   ],
   'write-eval/references/task-package.md': [
     'sha256:45ea9802b29191f985ea5b88227ebdd8ba6099355d80e3e90a68d2cdf97791df',
     'sha256:d3b6a64a7a87de2785377f2f08374515ca822798c5e6244155aeb5fd4f1c41de',
+    'sha256:a23eb196a3015ee88b5ee05294ab5680edf51ad10f24683bb6bd65e106382aa7',
   ],
   'run-eval/SKILL.md': [
     'sha256:ffb9e10f3f25bffc007ed9381df23cb3d1e31b64dc8088352302158215f75ba7',
@@ -54,6 +86,7 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:6d91c065e882409f53dbc19356d718dd8bcb3fbd54f44e439c67d4f17d953b39',
     'sha256:92517345f833a0de9a74347cf857391b6b9910aa87dedd70e7ab2a04c36762dc',
     'sha256:9e3f1fc5a30250626efd6aa149966e98a7c6155599eb381cf7f38ecd98f65f80',
+    'sha256:c4a1f6b745ec72123905e48863519698d5b423bb0620708a4b5ddff0ad496662',
   ],
   'run-eval/references/run-records.md': [
     'sha256:0f2bafd0cf20299e5ab7d0f28ffbdbc657450d986d56cd708352ec1e761c5c61',
@@ -62,17 +95,27 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:c907c59be9416c241534a85affd4475e4848f5ada7213ec5e596365d779c047d',
     'sha256:21a0764116d0cf70248da814001ee1ad252d4f70a620beb37224aef2fcbcdb66',
     'sha256:7f402c9906fe836e36cc56dc5af0b6585a976dff37e895a7ca0e3ca1ee202a9d',
+    'sha256:8989ddf78fdf04961097093226aff8c008d6f5edbfca1428e5581c2409e21e16',
   ],
   'write-eval/references/harbor.md': [
     'sha256:560385a1e4ac0c91e0a1699c52b15ef5038181ec6cc9cf3e47bedaedebbabbfa',
     'sha256:bd52fadcf7d57fd7312862e0c401172e09ccfdc13fd12fe85331c9d915dd0887',
     'sha256:ba2a636a5a9b63c032e89d61a831c30ae2d4dcb66dcb0daaaad9aec4b7cb0e99',
+    'sha256:3ef7c497b7c9fe45e3e72b9062f163e243b25b46d83ef59c2266720f9d6378bb',
   ],
-  'write-eval/examples/reportbot/README.md': ['sha256:bf5dd52a3ba5841323e7eac5907e852d8855fe6d3f277b9fd91ee112d8ee01f2'],
-  'write-eval/references/verifier.md': ['sha256:e39ea228b886880a82e39b1289db236ac8f454ed489219a0efe4739a2792d95a'],
+  'write-eval/examples/reportbot/README.md': [
+    'sha256:bf5dd52a3ba5841323e7eac5907e852d8855fe6d3f277b9fd91ee112d8ee01f2',
+    'sha256:769c96e74910964b847d3ac0abc8fb1368b1a7c65b12e02902a31e3ca1e226c1',
+  ],
+  'write-eval/assets/genesis.sh': ['sha256:c990c8dd5f3c582fc48b6012ad0b5a54ea5e4ff1e2af1fb511ccb826bfd1e366'],
+  'write-eval/references/verifier.md': [
+    'sha256:e39ea228b886880a82e39b1289db236ac8f454ed489219a0efe4739a2792d95a',
+    'sha256:7b3e5904b3cf5deb3e99d89f64353fb0604fb14bd6b6d790acd1a81f707b3f48',
+  ],
   'write-eval/references/environment.md': [
     'sha256:50b827232d9df5f55ed603fc8d670440f5cd877b33f581b82aa7ee0768aaa964',
     'sha256:2fdf829960bd1d0f9fe3f381f6991aa460ff828cbd6df72eb7ee513060c7eb77',
+    'sha256:b685f82053c46456c153e5919313fa6a0b411b0b9a661bfc9430e81240697281',
   ],
   'loop-and-implement/SKILL.md': [
     'sha256:02d47d51ad3bcb6f8899622e70526fbf750a5047ce98661fd4df55e034356921',
@@ -81,8 +124,12 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:ea1eb703dbfd3abb9298d0f340a6d417a8c3c726ba2b1f9dbe638d58d100753b',
     'sha256:e79cd72a62901799677e08255b33d091e99468ec43ea41bf11f4fb32211ced66',
     'sha256:1e9e8d9d5d2b3b444fb229160fc26c9734dd5ebb4b4a4cb55d17c73b776eb9a4',
+    'sha256:22ad58395c3ebcb7e3fd7f80e1cc133ced5465f29c6fd2c9afe8bd4ef2a64968',
   ],
-  'loop-and-implement/references/causes.md': ['sha256:3f5b896818485b047912cbf99ee6f37e8595d9b8c9fa3a18d987c9c4eae5e6f1'],
+  'loop-and-implement/references/causes.md': [
+    'sha256:3f5b896818485b047912cbf99ee6f37e8595d9b8c9fa3a18d987c9c4eae5e6f1',
+    'sha256:fed6186d87e5e8b7682cb726639ae9337248b3284834f4a5ba4f5c3df64005a3',
+  ],
   'agent-spec/references/spec-format.md': [
     'sha256:b0945ecd8c3ed0d0f7ddcfd13a0ce69433ed2a6f741981e7c3a1c46e8ff063a1',
     'sha256:99a3389ea7a87d2c61077a5f81252d39f594d6e86d5ad21f939c779020b56619',
@@ -90,6 +137,7 @@ const PREVIOUS_SKILL_HASHES = {
     'sha256:72dcc8e43234509dac8eec197e670fd4dd43a5111deba5a0a8eb4bdd88cb88e4',
     'sha256:6fb88d1b37864df50c624b2b4715edbc22a4f1135ec6c3a17f0fba34be3f2636',
     'sha256:9405b14ef77b98654219f003e4a3d455efc77e70be2faa0546d562e3b1c18f8c',
+    'sha256:a2366d84cd06e3d95a93bce96fdeba8b37c90a3aa06c7eb86df5c82f70636e4f',
   ],
   'write-eval/examples/reportbot/.genesis/edd/report-submission-notifications/evals/submit-failure-s1/tests/checks.json': [
     'sha256:45dc740258bd10610c08cf72d899d076bc69a8563652eb1fd0ef641de375f7b2',
@@ -97,6 +145,7 @@ const PREVIOUS_SKILL_HASHES = {
   'write-eval/examples/reportbot/.genesis/edd/report-submission-notifications/evals/submit-success-s1/tests/checks.json': [
     'sha256:1d8f1d55c8505c1ee7df003995e12d4131d7e6622eea9d5caeb4ddb19329d472',
   ],
+  'write-eval/references/review.md': ['sha256:996f83cb259c77319269b7fba151de6b5c6c2d79205a9dedee3c5f969c6ccdad'],
 };
 // Files Genesis itself writes are not changes to the application.
 const GENERATED = ['openspec/', '.genesis/', ...SKILLS.flatMap((skill) => [`.agents/skills/${skill}/`, `.claude/skills/${skill}/`])];
@@ -158,8 +207,9 @@ export function openspec(repo, args, { allowFailure = false } = {}) {
 }
 
 export function requireProject(repo) {
+  assertOutsideRepo(repo);
   const configFile = localPath(repo, 'openspec/config.yaml');
-  if (!existsSync(configFile)) throw new Error('Run genesis-edd init first.');
+  if (!existsSync(configFile)) throw new Error('This project has no openspec/config.yaml: Genesis EDD is not initialized here (genesis-edd init).');
   const config = parse(readFileSync(configFile, 'utf8'));
   if (config?.store) throw new Error('Genesis EDD v0.1 requires project-local OpenSpec artifacts; external stores are not supported.');
   const file = localPath(repo, 'openspec/genesis.json');
@@ -172,17 +222,29 @@ export function requireProject(repo) {
   const missing = listFiles(schemaRoot).map((file) => `openspec/schemas/${SCHEMA}/${path.relative(schemaRoot, file)}`)
     .filter((file) => !existsSync(localPath(repo, file)));
   if (missing.length) {
-    throw new Error(`${missing.length === listFiles(schemaRoot).length ? `openspec/schemas/${SCHEMA}/ is missing` : `${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} missing`}, so OpenSpec cannot read this project's Specs. Run \`init --repo <app> --mode ${project.mode} --agent none\`: it restores the schema, keeps existing work and installs no skills. Then commit openspec/schemas/, so every clone has it.`);
+    throw new Error(`${missing.length === listFiles(schemaRoot).length ? `openspec/schemas/${SCHEMA}/ is missing` : `${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} missing`}, so OpenSpec cannot read this project's Specs. \`init --mode ${project.mode} --agent none\` writes the schema again without changing other files or installing skills; a clone has it once openspec/schemas/ is committed.`);
   }
   return project;
 }
 
+// Installs the OpenSpec project files, the Spec schema and the skills. A
+// shipped skill file the project edited is left as it is and listed under
+// conflicts, with the digest of what is installed and of what this release
+// ships; everything else is written. A skill's LOCAL.md is never touched.
+// Each skill gets its own launcher and runtime.json, written again on every
+// run. A non-skill file that differs, such as openspec/genesis.json of
+// another mode, still stops init before it writes anything.
 export function initProject(repo, mode, agent) {
   if (!['new', 'existing'].includes(mode)) throw new Error('--mode must be new or existing.');
   if (!['codex', 'claude', 'both', 'none'].includes(agent)) throw new Error('--agent must be codex, claude, both or none.');
+  assertOutsideRepo(repo);
   const writes = [];
   const legacySkills = [];
-  const add = (relative, content, previousHash, keep = false) => writes.push({ file: localPath(repo, relative), content, previousHash, keep });
+  const conflicts = [];
+  // keep: a file the project may own, written only while it is missing.
+  // force: a file only init writes, written whatever it holds now. skill: a
+  // shipped skill file, left alone and reported when it was edited.
+  const add = (relative, content, previousHash, flags = {}) => writes.push({ file: localPath(repo, relative), relative, content, previousHash, ...flags });
   const configFile = localPath(repo, 'openspec/config.yaml');
   if (existsSync(configFile)) {
     const config = parse(readFileSync(configFile, 'utf8'));
@@ -197,45 +259,59 @@ export function initProject(repo, mode, agent) {
     add(`openspec/schemas/${SCHEMA}/${relative}`, readFileSync(file, 'utf8'), relative === 'schema.yaml' ? PREVIOUS_SCHEMA_HASHES : undefined);
   }
   const agentDirs = agent === 'both' ? ['.agents', '.claude'] : agent === 'none' ? [] : [agent === 'codex' ? '.agents' : '.claude'];
+  // The launchers name the CLI by its absolute path, never through PATH.
   const runtime = `${JSON.stringify({ cli: path.join(ROOT, 'bin/genesis-edd.js') }, null, 2)}\n`;
   for (const directory of agentDirs) {
+    // The skill as shipped before it was renamed is replaced only when every
+    // file of it is as shipped; otherwise it stays, and its files are listed.
     const legacy = localPath(repo, `${directory}/skills/genesis-spec`);
     if (existsSync(legacy)) {
       const expected = { ...LEGACY_SKILL_HASHES, 'scripts/runtime.json': digest(runtime) };
-      const files = listFiles(legacy);
-      if (files.length !== Object.keys(expected).length || files.some((file) =>
-        digest(readFileSync(file, 'utf8')) !== expected[path.relative(legacy, file).split(path.sep).join('/')])) {
-        throw new Error(`Legacy skill differs; left unchanged. Review it before installing agent-spec: ${legacy}`);
-      }
-      legacySkills.push(legacy);
+      const found = new Map(listFiles(legacy).map((file) => [path.relative(legacy, file).split(path.sep).join('/'), digest(readFileSync(file, 'utf8'))]));
+      const differ = [...new Set([...found.keys(), ...Object.keys(expected)])].sort().filter((file) => found.get(file) !== expected[file]);
+      if (differ.length) {
+        conflicts.push(...differ.map((file) => ({ file: `${directory}/skills/genesis-spec/${file}`, installed: found.get(file) ?? null, shipped: expected[file] ?? null, skill: 'genesis-spec' })));
+      } else legacySkills.push(legacy);
     }
     for (const skill of SKILLS) {
       const skillRoot = path.join(ROOT, 'skills', skill);
       for (const file of listFiles(skillRoot)) {
         const target = path.relative(skillRoot, file).split(path.sep).join('/');
-        add(`${directory}/skills/${skill}/${target}`, readFileSync(file, 'utf8'), PREVIOUS_SKILL_HASHES[`${skill}/${target}`]);
+        if (target === LOCAL_SKILL_FILE || target === RUNTIME) continue;
+        const relative = `${directory}/skills/${skill}/${target}`;
+        if (target === LAUNCHER) add(relative, readFileSync(file, 'utf8'), undefined, { force: true });
+        else add(relative, readFileSync(file, 'utf8'), PREVIOUS_SKILL_HASHES[`${skill}/${target}`], { skill });
       }
+      // Each skill starts the CLI through its own launcher, so none depends
+      // on another skill being installed.
+      add(`${directory}/skills/${skill}/${RUNTIME}`, runtime, undefined, { force: true });
     }
-    // Every skill starts the CLI through the one launcher in agent-spec.
-    add(`${directory}/skills/agent-spec/scripts/runtime.json`, runtime);
     // The installed skills run this machine's checkout, so another clone
     // cannot use them: each one stays out of Git and every clone runs init.
     // A .gitignore of the user's own there is theirs to keep.
-    for (const skill of SKILLS) add(`${directory}/skills/${skill}/.gitignore`, '*\n', undefined, true);
+    for (const skill of SKILLS) add(`${directory}/skills/${skill}/.gitignore`, '*\n', undefined, { keep: true });
   }
-  // Check the entire install before writing anything; never replace custom files.
+  // Check the entire install before writing anything. A file other than a
+  // skill file that differs stops init; an edited skill file is a conflict.
   for (const write of writes) {
-    if (existsSync(write.file)) {
-      const current = readFileSync(write.file, 'utf8');
-      if (current !== write.content && !write.keep) {
-        if (![write.previousHash].flat().includes(digest(current))) throw new Error(`Existing file differs; left unchanged: ${write.file}`);
-        write.update = true;
-      }
+    if (!existsSync(write.file)) continue;
+    const current = readFileSync(write.file, 'utf8');
+    if (current === write.content || write.keep) continue;
+    if (write.force || [write.previousHash].flat().includes(digest(current))) {
+      write.update = true;
+      continue;
     }
+    if (write.skill) {
+      write.conflict = true;
+      conflicts.push({ file: write.relative, installed: digest(current), shipped: digest(write.content), skill: write.skill });
+      continue;
+    }
+    throw new Error(`Existing file differs; left unchanged: ${write.file}`);
   }
   const created = [];
   const updated = [];
-  for (const { file, content, update } of writes) {
+  for (const { file, content, update, conflict } of writes) {
+    if (conflict) continue;
     if (update) {
       writeFileSync(file, content);
       updated.push(path.relative(repo, file));
@@ -257,9 +333,12 @@ export function initProject(repo, mode, agent) {
   const tracked = folders.length ? spawnSync('git', ['-C', repo, 'ls-files', '-z', '--', ...folders], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }) : null;
   const committed = tracked?.status === 0 ? folders.filter((folder) => tracked.stdout.split('\0').some((file) => file.startsWith(`${folder}/`))) : [];
   if (committed.length) {
-    warnings.push(`Git still tracks skill folders an earlier install committed: ${committed.join(', ')}. They point at this machine's checkout, and their .gitignore does not untrack them. To keep them out of Git, run \`git rm -r --cached ${committed.join(' ')}\` and commit; the files stay on disk.`);
+    warnings.push(`Git still tracks skill folders an earlier install committed: ${committed.join(', ')}. They point at this machine's checkout, and their .gitignore does not untrack them; \`git rm -r --cached\` of those folders takes them out of Git and leaves the files on disk.`);
   }
-  return { repo, mode, agent, created, updated, migrated: legacySkills.map((file) => path.relative(repo, file)), warnings, schema: openspec(repo, ['schema', 'validate', SCHEMA, '--json']).data };
+  if (conflicts.length) {
+    warnings.push(`${conflicts.length === 1 ? 'An installed skill file differs' : `${conflicts.length} installed skill files differ`} from what this release ships and ${conflicts.length === 1 ? 'was' : 'were'} left as ${conflicts.length === 1 ? 'it is' : 'they are'}: ${conflicts.map((entry) => entry.file).join(', ')}. Every other file is installed. A skill's ${LOCAL_SKILL_FILE} is the project's own place for additions; init never writes it.`);
+  }
+  return { repo, mode, agent, created, updated, conflicts, migrated: legacySkills.map((file) => path.relative(repo, file)), warnings, schema: openspec(repo, ['schema', 'validate', SCHEMA, '--json']).data };
 }
 
 export function changeDirectory(repo, name) {
@@ -308,6 +387,41 @@ export function codeState(repo) {
   return { head: git(['rev-parse', '--verify', 'HEAD']), changed, git };
 }
 
+// The content digest of the application code: the commit's files with the
+// changed paths as they are on disk, listed from a scratch index. --info-only
+// hashes each file through the project's Git filters, as a commit of it would,
+// without writing objects. Files Genesis writes, such as the evals and the
+// Spec, are not code. This is the identity a run records for its code, so
+// two records with the same digest ran the same code. null where Git cannot
+// say.
+export function applicationDigest(repo, commit, changed) {
+  const scratch = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-index-'));
+  const env = { ...process.env, GIT_INDEX_FILE: path.join(scratch, 'index') };
+  const git = (args, input) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', env, input, maxBuffer: 256 * 1024 * 1024 });
+  try {
+    if (git(['read-tree', ...(commit ? [commit] : ['--empty'])]).status !== 0) return null;
+    // Git lists a repository inside the project with a trailing slash; the
+    // index records it as a link to its commit.
+    const paths = changed.map((file) => file.replace(/\/$/, ''));
+    if (paths.length && git(['update-index', '--add', '--remove', '--info-only', '-z', '--stdin'], paths.join('\0')).status !== 0) return null;
+    const listed = git(['ls-files', '--stage', '-z']);
+    if (listed.status !== 0) return null;
+    const entries = listed.stdout.split('\0').filter((entry) => entry && !isGenerated(entry.slice(entry.indexOf('\t') + 1)));
+    return digest(entries.join('\0'));
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+// The application code as it is now, in the form a run records it: the
+// commit, the application files changed since it, and the content digest.
+export function applicationSnapshot(repo, state = codeState(repo)) {
+  const { head, changed } = state;
+  if (changed === null) return { commit: null, changed_files: null, digest: null, note: 'Not a Git repository; the code is not pinned.' };
+  const content = applicationDigest(repo, head, changed);
+  return { commit: head, changed_files: changed, digest: content, ...(content ? { digest_of: 'content' } : {}) };
+}
+
 // Files the operating system or an editor leaves beside the real ones: Finder
 // and Explorer metadata, swap files and backups. They never take part in a run
 // and are not files of a change.
@@ -326,6 +440,7 @@ const committedArtifacts = (name) => ({
   '.genesis/edd/.gitignore': null,
   '.genesis/edd/harness/': 'project kit',
   [`.genesis/edd/${name}/evals/`]: 'eval packages',
+  [`.genesis/edd/${name}/spec-drafts/`]: 'kept Spec drafts',
   [`.genesis/edd/${name}/baseline-expectations.json`]: 'expected baseline results',
   [`.genesis/edd/${name}/review.json`]: 'reviewer verdicts',
   [`.genesis/edd/${name}/confirmed.json`]: 'checks confirmation',
@@ -421,8 +536,45 @@ export function uncommittedArtifacts(repo, name) {
 // committed and reviewed with the Spec. Genesis keeps its own output out of Git.
 export const mapCopy = (name) => `openspec/changes/${name}/business-map.json`;
 
-// Reads the Map chosen for a new change. Its bytes are copied as they are, so
-// the copy keeps the digest of the file Genesis wrote.
+// The fields of a Map's record that the CLI works out from the Map itself,
+// and never takes from genesis.json: at spec new, at spec remap, and again at
+// every spec validate and spec export.
+export const MAP_COMPUTED = ['snapshot_id', 'analysis_status', 'mode', 'freshness', 'coverage', 'coverage_scope'];
+
+// What a Map says about itself, read from the file. `mode` says what a Map
+// covers: map for the whole project, change for the Map of a Genesis change
+// review, which covers what that review analyzed and is recorded with
+// coverage_scope partial. Genesis writes change-report.json beside the Map
+// of a change review; a Genesis before MAP_FIELDS wrote no mode, so such a
+// Map is unknown, unless a record of it already said change, which is kept:
+// it only narrows what the Map is taken to cover. freshness compares the Map
+// with the commit checked out now. Returns { fields, freshness, warnings }.
+export function mapFacts(repo, document, { changeReport = false, recorded = null } = {}) {
+  const declared = document?.mode ?? null;
+  const mode = changeReport || declared === 'change' || (declared === null && recorded?.mode === 'change') ? 'change'
+    : declared === 'map' ? 'map' : declared === null ? 'unknown' : String(declared);
+  const warnings = [];
+  if (mode === 'change') {
+    warnings.push(`This Map comes from a Genesis change review (${declared === 'change' ? 'its mode is change' : changeReport ? 'change-report.json is beside it' : 'its record says so'}): it covers only what that review analyzed, not the whole project. It is recorded with coverage_scope partial, and a Genesis review that starts from it covers only those flows.`);
+  } else if (mode === 'unknown') {
+    warnings.push(`This Map does not say whether it maps the whole project or a change review: Genesis before ${MAP_FIELDS} wrote no mode, and nothing beside it marks a review, so it is recorded with mode unknown.`);
+  }
+  const freshness = mapFreshness(repo, document?.source);
+  if (freshness.warning) warnings.push(freshness.warning);
+  const coverage = mapCoverage(document?.coverage);
+  if (coverage && coverage.entries_planned < coverage.entries_total) warnings.push(outsideFlows(coverage, skipReasons(document.coverage)));
+  return {
+    fields: {
+      snapshot_id: document?.snapshot_id ?? null, analysis_status: document?.analysis_status ?? null,
+      mode, freshness: freshness.status, ...(coverage ? { coverage } : {}), ...(mode === 'change' ? { coverage_scope: 'partial' } : {}),
+    },
+    freshness, warnings,
+  };
+}
+
+// Reads the Map chosen for a change, at spec new, spec new --adopt or spec
+// remap. Its bytes are copied as they are, so the copy keeps the digest of
+// the file Genesis wrote.
 export function readMap(repo, mapFile, name) {
   const file = path.resolve(repo, mapFile);
   const bytes = readFileSync(file);
@@ -430,42 +582,22 @@ export function readMap(repo, mapFile, name) {
   if (typeof document?.snapshot_id !== 'string' || !document.snapshot_id || !['complete', 'partial'].includes(document.analysis_status)) {
     throw new Error('Map must be a Genesis business-map.json with snapshot_id and analysis_status.');
   }
-  // `mode` says what a Map covers. The Map of a change review covers what
-  // that review analyzed, not the project. Genesis before MAP_FIELDS wrote no
-  // mode, so such a Map may be either kind.
   const mode = document.mode ?? null;
-  if (mode === 'change') {
-    throw new Error('This Map comes from a Genesis change review (its mode is change) and covers only what that review analyzed, not the whole project. Pass the business-map.json of a full map: run `/genesis map` first.');
+  if (mode !== null && mode !== 'map' && mode !== 'change') {
+    throw new Error(`Map has a mode Genesis EDD does not know: ${JSON.stringify(mode)}. Genesis writes map for a full map and change for the Map of a change review.`);
   }
-  if (mode !== null && mode !== 'map') {
-    throw new Error(`Map has a mode Genesis EDD does not know: ${JSON.stringify(mode)}. Pass the business-map.json of a full Genesis map, whose mode is map.`);
-  }
-  // Genesis writes change-report.json beside the Map of a change review,
-  // which describes only the flows the change touched.
-  if (existsSync(path.join(path.dirname(file), 'change-report.json'))) {
-    throw new Error('This Map comes from a Genesis change review (change-report.json is beside it) and covers only the flows that change touched. Pass the business-map.json of a full map: run `/genesis map` first.');
-  }
-  const warnings = [];
-  if (mode === null) {
-    warnings.push(`This Map does not say whether it maps the whole project or a change review: Genesis before ${MAP_FIELDS} wrote no mode. Nothing beside it marks a review, so it is used and recorded with mode unknown. If it came from \`/genesis review\`, pass the business-map.json of a full map instead. A Map from Genesis ${MAP_FIELDS} or later says which it is.`);
-  }
-  const freshness = mapFreshness(repo, document.source);
-  if (freshness.warning) warnings.push(freshness.warning);
+  const facts = mapFacts(repo, document, { changeReport: existsSync(path.join(path.dirname(file), 'change-report.json')) });
+  const warnings = [...facts.warnings];
   const edited = editedMapFiles(repo, document.source);
   if (edited) warnings.push(edited);
-  const coverage = mapCoverage(document.coverage);
-  if (coverage && coverage.entries_planned < coverage.entries_total) warnings.push(outsideFlows(coverage, skipReasons(document.coverage)));
   const { coded, total } = codeNamedSteps(document.flows);
   if (coded) {
-    warnings.push(`${coded} of the ${total} steps in this Map belong to flows Genesis has not described yet and are named from the source code: by a line of code, or by the entry point for a flow's trigger. The copy at ${mapCopy(name)} is committed with the Spec, so that code goes into Git too. If it should not, tell the user before anything is committed: describing those flows with \`/genesis map\` replaces those names.`);
+    warnings.push(`${coded} of the ${total} steps in this Map belong to flows Genesis has not described yet and are named from the source code: by a line of code, or by the entry point for a flow's trigger. The copy at ${mapCopy(name)} is committed with the Spec, so that code goes into Git too.`);
   }
   return {
     bytes,
-    record: {
-      status: 'available', path: mapCopy(name), sha256: digest(bytes),
-      snapshot_id: document.snapshot_id, analysis_status: document.analysis_status,
-      mode: mode ?? 'unknown', freshness: freshness.status, ...(coverage ? { coverage } : {}),
-    },
+    record: { status: 'available', path: mapCopy(name), sha256: digest(bytes), ...facts.fields },
+    code_named_steps: coded,
     warnings,
   };
 }
@@ -499,7 +631,7 @@ function skipReasons(coverage) {
 export function outsideFlows(coverage, reasons = null) {
   const { entries_total: total, entries_planned: planned, entries_skipped: skipped, entries_unhandled: unhandled } = coverage;
   const parts = [...(skipped ? [`${skipped} skipped${reasons ? ` (${reasons})` : ''}`] : []), ...(unhandled ? [`${unhandled} not handled`] : [])];
-  return `This Map's planned flows cover ${planned} of the ${total} entries Genesis found${parts.length ? `: ${parts.join(' and ')}` : ''}. Its analysis_status says whether those flows are finished, not whether the whole project is mapped. If the request touches an entry outside them, read its code, or map it with \`/genesis map\`.`;
+  return `This Map's planned flows cover ${planned} of the ${total} entries Genesis found${parts.length ? `: ${parts.join(' and ')}` : ''}. Its analysis_status says whether those flows are finished, not whether the whole project is mapped, so an entry outside them is not described by the Map.`;
 }
 
 // Files the Map was read from that have edits not committed yet. Freshness
@@ -512,7 +644,7 @@ function editedMapFiles(repo, source) {
   const edited = changed.filter((file) => Object.hasOwn(files, file));
   if (!edited.length) return null;
   const named = `${edited.slice(0, 5).join(', ')}${edited.length > 5 ? ', …' : ''}`;
-  return `${edited.length} of the files this Map was read from ${edited.length === 1 ? 'has' : 'have'} uncommitted edits (${named}). Its freshness compares commit ${short(head)}, not those edits, while impact.md evidence is read from the working tree. If the edits are not part of this request, the Map and that evidence may describe different code: tell the user.`;
+  return `${edited.length} of the files this Map was read from ${edited.length === 1 ? 'has' : 'have'} uncommitted edits (${named}). Its freshness compares commit ${short(head)}, not those edits, while impact.md evidence is read from the working tree, so the Map and that evidence may describe different code.`;
 }
 
 const short = (commit) => commit.slice(0, 7);
@@ -532,9 +664,10 @@ const repoPath = (file) => file.length > 0 && !/[\u0000-\u001f\\]/.test(file) &&
 // file read with the SHA-256 of its bytes as the commit stores them, which is
 // what `git show <revision>:<path>` prints. The same bytes are read here from
 // the commit checked out now. A file added since is not listed, so `verified`
-// says nothing about new files.
+// says nothing about new files. Returns { status, warning, commit }: commit
+// is the one compared with, or null when none was.
 export function mapFreshness(repo, source) {
-  const unverified = (reason) => ({ status: 'unverified', warning: `Whether this Map still matches the code was not checked: ${reason}` });
+  const unverified = (reason, commit = null) => ({ status: 'unverified', warning: `Whether this Map still matches the code was not checked: ${reason}`, commit });
   if (source === undefined || source === null) {
     return unverified(`it does not record the code it was read from, which Genesis before ${MAP_FIELDS} did not do. A Map from Genesis ${MAP_FIELDS} or later can be checked.`);
   }
@@ -553,16 +686,16 @@ export function mapFreshness(repo, source) {
   if (!commit) return unverified('the project has no commit to compare it with.');
   const paths = Object.keys(files).sort();
   const committed = committedDigests(repo, commit, paths);
-  if (!committed) return unverified(`Git could not read the files of commit ${short(commit)}.`);
+  if (!committed) return unverified(`Git could not read the files of commit ${short(commit)}.`, commit);
   const changed = paths.filter((file) => committed.get(file) !== files[file]);
   if (changed.length) {
     const named = changed.slice(0, 5).join(', ');
-    return { status: 'stale', warning: `This Map no longer matches the code of commit ${short(commit)}: ${changed.length} of the ${paths.length} files it was read from changed or are gone since Genesis read them (${named}${changed.length > 5 ? ', …' : ''}). Its flows may describe code that is not there anymore. Tell the user. To write the Spec against the code as it is, map the project again with \`/genesis map\`, remove the change folder \`spec new\` just created, and run \`spec new\` again with the new Map.` };
+    return { status: 'stale', commit, warning: `This Map no longer matches the code of commit ${short(commit)}: ${changed.length} of the ${paths.length} files it was read from changed or are gone since Genesis read them (${named}${changed.length > 5 ? ', …' : ''}). Its flows may describe code that is not there anymore. Until the change is first exported, \`spec remap\` can replace it with a Map of this code.` };
   }
   if (source.integrity_status === 'partial') {
-    return unverified(`Genesis left out files it would have read, such as one over its size limit (its integrity_status is partial). ${paths.length === 1 ? 'The one file' : `The ${paths.length} files`} it read ${paths.length === 1 ? 'is' : 'are'} unchanged at ${short(commit)}.`);
+    return unverified(`Genesis left out files it would have read, such as one over its size limit (its integrity_status is partial). ${paths.length === 1 ? 'The one file' : `The ${paths.length} files`} it read ${paths.length === 1 ? 'is' : 'are'} unchanged at ${short(commit)}.`, commit);
   }
-  return { status: 'verified', warning: null };
+  return { status: 'verified', warning: null, commit };
 }
 
 // The SHA-256 of each path as `commit` stores it, or undefined where the commit
@@ -602,23 +735,39 @@ function committedDigests(repo, commit, paths) {
 // modules the evals ran are reviewed only with --include-untracked. Genesis
 // compares the base commit with the working tree, so files that were already
 // uncommitted when the loop started are listed: their edits from before the
-// loop are not part of the change.
+// loop are not part of the change. scope says what the Map covers: project
+// for a full map, change_review for the Map of a Genesis change review, whose
+// entries hold only the flows that review analyzed (scope_limited), unknown
+// for a Map that does not say.
 export function genesisReview(repo, name, map, base, { untracked = false, uncommittedAtStart = [] } = {}) {
   if (!map || map.status !== 'available' || !base) return null;
   const copy = mapCopy(name);
   const from = existsSync(path.join(repo, copy)) ? copy : String(map.path).replaceAll('\\', '/');
+  const scope = map.mode === 'change' || map.coverage_scope === 'partial' ? 'change_review' : map.mode === 'map' ? 'project' : 'unknown';
   return {
     base, entries_from: from, prepare: ['map', 'prepare', '--base', base, '--entries-from', from, ...(untracked ? ['--include-untracked'] : [])],
+    scope, scope_limited: scope === 'change_review',
+    ...(scope === 'change_review' ? { scope_note: 'The Spec was written against the Map of a Genesis change review, so a review started from its entries covers only the flows that review analyzed, not the whole project.' }
+      : scope === 'unknown' ? { scope_note: 'The Spec\'s Map does not say whether it covers the whole project or a change review.' } : {}),
     ...(uncommittedAtStart.length ? { uncommitted_at_start: uncommittedAtStart } : {}),
   };
 }
 
+// What a change records when its Spec is started: the project mode, the code
+// as it is at that moment (its commit and, under snapshot, the content digest
+// a run would record for it), the Map or why there is none, and a baseline
+// not run yet. A baseline recorded on other code than code.snapshot ran on
+// code that changed after the requirements were first written down.
 export function captureContext(repo, mode, map = null) {
-  const { head, changed } = codeState(repo);
+  const state = codeState(repo);
+  const { head, changed } = state;
   const workingTree = changed === null ? null : changed.join('\n');
   return {
     version: 1, project_mode: mode,
-    code: { base_commit: head, working_tree_dirty: workingTree === null ? null : workingTree !== '', captured_at: new Date().toISOString() },
+    code: {
+      base_commit: head, working_tree_dirty: workingTree === null ? null : workingTree !== '', captured_at: new Date().toISOString(),
+      snapshot: applicationSnapshot(repo, state),
+    },
     map: map ?? { status: mode === 'new' ? 'not_applicable' : 'missing', reason: mode === 'new' ? 'new_project' : 'not_provided' },
     baseline: { status: 'not_run', availability: mode === 'new' ? 'no_implementation' : 'unknown' },
   };

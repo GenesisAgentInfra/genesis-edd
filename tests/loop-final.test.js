@@ -1,26 +1,21 @@
 // Loop tests: screen runs and the final run, including final runs with an
-// errored attempt.
+// errored attempt. A loop states where it stands as facts (situation, final,
+// gates) with at most one suggestion; only a passing final run of reviewed
+// code can be accepted, and only by the user.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import os from 'node:os';
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { ignoredArtifacts, initProject, projectRoot, readJSON } from '../src/project.js';
-import { exportSpec, newSpec, validateSpec } from '../src/spec.js';
-import { newEval, validateEval } from '../src/eval.js';
-import { checkEval, codeSnapshot, startRun } from '../src/run.js';
-import { acceptLoop, loopStatus, reportGaps, startLoop, writeReport } from '../src/loop.js';
+import { readJSON } from '../src/project.js';
+import { checkEval, startRun } from '../src/run.js';
+import { REVIEWERS, acceptLoop, budgetLoop, loopStatus, writeReport } from '../src/loop.js';
 import { checkWorkflow } from '../src/workflow.js';
-import { reviewEval } from '../src/confirm.js';
 import {
-  AFTER, AGENT, BEFORE, CHANGE, FIXTURES, LIVE_DEPENDENCY, SPECS, cli, commit, commitConfirmation, confirmChecks, connect, dropCheck, editChecks, git, harborThen, legacyWarning, readRecord,
-  readyProject, reviewFixtures, setResults, toLegacy, useFakeTools, writeExpectations, writeFixtureScripts, writeSpec,
+  AFTER, CHANGE, CONSENT, allowedActions, assertGapShape, confirmChecks, editChecks, readRecord, readyProject, setResults, writeExpectations,
 } from './helpers/edd.js';
 import {
-  EXPECT, BROKEN, TEMPLATE_MARK, codes, blockedWith, refusedWith, withBaseline, inLoop, changeCode, fullRun, completeReport, runRecord, FAILURE, SUCCESS,
-  loopPath, loopRecord, changePackage, resultsOutsideCode, liveLoop, gapOf, STRENGTH_3, FINAL_COST, FINAL_RUN, finalsLoop, passingScreen, newProjectLoop,
-  refusedBeforeRun, assertEnded, assertStopBudget,
+  EXPECT, BROKEN, codes, refusedWith, inLoop, changeCode, fullRun, runRecord, FAILURE, SUCCESS, resultsOutsideCode, liveLoop, STRENGTH_3, finalsLoop,
+  passingScreen, refusedBeforeRun, assertEnded, assertFinalDue, assertStopBudget, reviewRun, startLoop,
 } from './helpers/loop.js';
 
 // --- Screen runs and the final run ---
@@ -30,17 +25,46 @@ const attemptsAsked = (tools, count) => Object.fromEntries(tools.runs().slice(-c
   .map((call) => [path.basename(call.argv[call.argv.indexOf('-p') + 1]), call.argv[call.argv.indexOf('-k') + 1]]));
 // The packages of the last count Harbor runs, in the order they ran.
 const ranInOrder = (tools, count) => tools.runs().slice(-count).map((call) => path.basename(call.argv[call.argv.indexOf('-p') + 1]));
-// The sentence ask_acceptance gives for what the loop's runs took, where the
-// adapter reported no usage.
-const usedText = (status) => ` The loop used ${status.loop.usage.minutes} minutes over ${status.loop.usage.runs} run${status.loop.usage.runs === 1 ? '' : 's'}.`;
+// The gap codes loop accept refuses a run with.
+const acceptRefusal = (repo, run) => {
+  let gaps = null;
+  assert.throws(() => acceptLoop(repo, CHANGE, { run, ...CONSENT }), (error) => {
+    assert.equal(error.code, 'LOOP_INPUT_BLOCKED', error.message);
+    ({ gaps } = error);
+    return true;
+  });
+  return gaps;
+};
+// A situation without its message, which states the same facts in words.
+const factsOf = (situation) => Object.fromEntries(Object.entries(situation).filter(([key]) => key !== 'message'));
+// A head run refused before anything runs because the change's latest loop
+// ended (for reason) without the user's acceptance.
+function lockedBeforeRun(project, options, reason) {
+  const refusal = refusedBeforeRun(project, options, 'change_locked');
+  assertGapShape(refusal, { code: 'change_locked', owner: 'user', layer: 'loop', reason });
+  return refusal;
+}
+// The run records as an earlier release left them: no run index, and no
+// run.json that says it was listed in one.
+function withoutLedger(project) {
+  rmSync(path.join(project.runs, 'index.jsonl'), { force: true });
+  for (const id of readdirSync(project.runs)) {
+    const file = path.join(project.runs, id, 'run.json');
+    if (!existsSync(file)) continue;
+    const { indexed, ...record } = readJSON(file);
+    writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
+  }
+}
 
 const LINE_ZERO = '本次提交发送的成功通知数量为零';
+// The strength sentence of the first final run of a change, which passed.
+const STRENGTH_FIRST_FINAL = `${STRENGTH_3} This change made 1 final run over its loops, and 0 of them failed.`;
 
 test('an acceptance an older CLI recorded for a screen run stays done, with a warning that loop accept would refuse it today', (t) => {
   const project = finalsLoop(t);
   const { repo } = project;
   const screen = passingScreen(project);
-  assert.throws(() => acceptLoop(repo, CHANGE, { run: screen.run_id, by: 'Dana', ref: 'thread 1' }), refusedWith('not_final'));
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: screen.run_id, ...CONSENT }), refusedWith('not_final'));
   // accepted.json 1.0, as an older CLI wrote it for that screen run.
   const { run, compare } = readRecord(path.join(project.runs, screen.run_id));
   writeFileSync(path.join(project.root, 'accepted.json'), `${JSON.stringify({
@@ -52,59 +76,57 @@ test('an acceptance an older CLI recorded for a screen run stays done, with a wa
     accepted: { by: 'Dana', ref: 'thread 1', at: new Date().toISOString() },
   }, null, 2)}\n`);
   const status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'done', JSON.stringify(status.next));
+  assert.deepEqual([status.phase, status.situation.code, status.situation.run_id, status.situation.by], ['done', 'accepted', screen.run_id, 'Dana'], JSON.stringify(status.situation));
   assert.equal(status.runs.find((entry) => entry.run_id === screen.run_id).role, 'screen');
-  assert.ok(status.warnings.includes(`The accepted run ${screen.run_id} is a screen run: its pass rests on one attempt of each package, and this loop needs a passing final run, which \`loop accept\` asks for now (not_final). So this acceptance would be refused today. It stays recorded; tell the user.`), JSON.stringify(status.warnings));
+  assert.ok(status.warnings.some((warning) => warning.startsWith(`The accepted run ${screen.run_id} is a screen run: its pass rests on one attempt of each package`)
+    && warning.includes('(not_final)') && warning.endsWith('It stays recorded.')), JSON.stringify(status.warnings));
   // An acceptance of a final run says nothing of the kind.
-  const accepted = path.join(project.root, 'accepted.json');
-  rmSync(accepted);
+  rmSync(path.join(project.root, 'accepted.json'));
   const final = startRun(repo, CHANGE);
   assert.deepEqual([final.role, final.verdict], ['final', 'pass']);
-  completeReport(repo, final.run_id);
   acceptLoop(repo, CHANGE, { run: final.run_id, by: 'Dana', ref: 'thread 2' });
   const done = loopStatus(repo, CHANGE);
-  assert.equal(done.next.action, 'done', JSON.stringify(done.next));
+  assert.deepEqual([done.phase, done.situation.run_id, done.situation.ref], ['done', final.run_id, 'thread 2']);
   assert.deepEqual(done.warnings.filter((warning) => warning.includes('is a screen run')), []);
 });
 
-test('in a loop whose plan runs a live package more than once, a full run is a screen run of one attempt each, and its final review asks two questions before the final run', (t) => {
+test('in a loop whose plan runs a live package more than once, a full run is a screen run of one attempt each, and its final run is due without waiting for a review', (t) => {
   const project = liveLoop(t, 3);
   const { repo, tools } = project;
   changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
   const screen = fullRun(repo);
-  assert.deepEqual([screen.role, screen.verdict], ['screen', 'pass']);
+  assert.deepEqual([screen.role, screen.verdict, screen.acceptable], ['screen', 'pass', false]);
   assert.deepEqual(attemptsAsked(tools, 2), { [FAILURE]: '1', [SUCCESS]: '1' });
   assert.deepEqual(screen.attempts, { [FAILURE]: 1, [SUCCESS]: 1 });
   const record = runRecord(project, screen);
   assert.deepEqual([record.role, record.final_of, record.run_order, record.environment_ref.attempts], ['screen', undefined, undefined, 1]);
   assert.deepEqual(screen.warnings.filter((warning) => warning.startsWith('The settings of this run differ')), []);
-  assert.equal(screen.next, 'The screen run passed: one attempt of each package is a lead, not a result. Run `loop status` next: the report and the final review come before the final run.');
+  // The run writes its report, and points at loop status for the rest.
+  assert.equal(screen.report.created, true);
+  assert.deepEqual(screen.suggestion.command, ['loop', 'status', CHANGE, '--repo', repo]);
 
   let status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'write_report');
-  assert.deepEqual(status.final, { needed: true, attempts: 3, live: [FAILURE], candidate: null, pending: false, finals: [], failed: [], incomplete: [] });
-  assert.deepEqual(status.runs.map((run) => run.role), ['screen']);
-  completeReport(repo, screen.run_id, { review: false });
-  status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'final_review', JSON.stringify(status.next));
-  assert.deepEqual(status.next.flips, [{ case: FAILURE, check: 'c1', then: LINE_ZERO }]);
-  assert.equal(status.next.message, 'The screen run passed: one attempt of each package. Before the final run, have the whole change reviewed in a fresh context against the Spec. The reviewer answers two things: for each gating check that went from fail to pass (next.flips), which change explains it; and whether each check is still faithful to its THEN line. Then write the Review section of this run\'s report: who reviewed, what they checked and found, and how each finding was handled, in at least 40 characters.');
-  assert.throws(() => acceptLoop(repo, CHANGE, { run: screen.run_id, by: 'Dana', ref: 'thread 1' }), refusedWith('not_final'));
+  assertFinalDue(status, screen.run_id, repo);
+  assert.deepEqual(status.final, { needed: true, attempts: 3, live: [FAILURE], candidate: screen.run_id, pending: true, finals: [], failed: [], incomplete: [], stops_at_failed: 2 });
+  assert.deepEqual(status.situation.final_plan, { packages: [FAILURE], attempts: 3, others_once: [SUCCESS] });
+  assert.deepEqual(status.runs.map((run) => [run.role, run.report]), [['screen', 'written']]);
+  // What a final review of this code answers, and that acceptance needs it.
+  assert.deepEqual([status.review.run_id, status.review.needed_for, status.review.recorded], [screen.run_id, 'acceptance of a final run of this code', []]);
+  assert.deepEqual(status.review.flips, [{ case: FAILURE, check: 'c1', then: LINE_ZERO, before: 'fail' }]);
+  assert.deepEqual(status.review.questions.map((question) => question.split(':')[0]), ['flips', 'special_cases', 'outside_spec', 'side_effects']);
+  assert.deepEqual(status.review.reviewers, REVIEWERS);
+  assert.ok(status.obligations.some((entry) => entry.kind === 'review' && entry.run_id === screen.run_id && entry.recorded === false), JSON.stringify(status.obligations));
+  assert.deepEqual(codes(acceptRefusal(repo, screen.run_id)), ['not_final', 'review_missing']);
 
-  completeReport(repo, screen.run_id);
+  // A final review of the screen run is recorded; the screen run still cannot be accepted.
+  reviewRun(project, screen.run_id);
   status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.next.owner], ['final_run', 'agent']);
-  assert.deepEqual(status.next.command, ['run', 'start', CHANGE, '--repo', repo]);
-  assert.equal(status.next.message, FINAL_RUN(screen.run_id, project.base.run_id));
-  assert.deepEqual(status.final, { needed: true, attempts: 3, live: [FAILURE], candidate: screen.run_id, pending: true, finals: [], failed: [], incomplete: [] });
-  assert.throws(() => acceptLoop(repo, CHANGE, { run: screen.run_id, by: 'Dana', ref: 'thread 1' }), (error) => {
-    blockedWith('not_final')(error);
-    assert.deepEqual(codes(error.gaps), ['not_final']);
-    const entry = gapOf(error, 'not_final');
-    assert.deepEqual([entry.owner, entry.route, entry.message], ['agent', 'loop-and-implement',
-      `${screen.run_id} is a screen run: its pass rests on one attempt of each package. Run the final run, which \`loop status\` names as final_run, and accept that one.`]);
-    return true;
-  });
+  assertFinalDue(status, screen.run_id, repo);
+  assert.ok(status.obligations.some((entry) => entry.kind === 'review' && entry.run_id === screen.run_id && entry.recorded === true), JSON.stringify(status.obligations));
+  const gaps = acceptRefusal(repo, screen.run_id);
+  assert.deepEqual(codes(gaps), ['not_final']);
+  const entry = assertGapShape(gaps[0], { code: 'not_final', owner: 'agent', layer: 'loop', run: screen.run_id, candidate: screen.run_id });
+  assert.ok(entry.message.includes('Only a passing final run can be accepted'), entry.message);
 });
 
 test('the final run follows the plan on the code of the screen run, its report says so, and only it is accepted, with the history of the loop', (t) => {
@@ -112,51 +134,54 @@ test('the final run follows the plan on the code of the screen run, its report s
   const { repo, tools, root } = project;
   const screen = passingScreen(project);
   const final = startRun(repo, CHANGE);
-  assert.deepEqual([final.role, final.verdict], ['final', 'pass']);
+  assert.deepEqual([final.role, final.verdict, final.acceptable], ['final', 'pass', true]);
   assert.deepEqual(attemptsAsked(tools, 2), { [FAILURE]: '3', [SUCCESS]: '1' });
   // FAILURE failed at the baseline, so it runs first.
   assert.deepEqual(ranInOrder(tools, 2), [FAILURE, SUCCESS]);
   const record = runRecord(project, final);
   assert.deepEqual([record.role, record.final_of, record.run_order], ['final', screen.run_id, [FAILURE, SUCCESS]]);
   assert.deepEqual(record.environment_ref.attempts_by_case, { [FAILURE]: 3, [SUCCESS]: 1 });
-  assert.equal(final.next, 'The final run passed. Run `loop status` next: write its report, then ask the user to accept.');
   // A final run repeats the code of its screen run by design.
   assert.ok(!loopStatus(repo, CHANGE).warnings.some((warning) => warning.startsWith('The last two runs used the same code')));
 
-  let status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'write_report');
-  assert.doesNotMatch(status.next.message, /Leave Review/);
-  const written = writeReport(repo, CHANGE);
-  // Same code, every check holding: only Next is left.
-  assert.equal(written.next, 'Fill in Next, then delete the template line. Review is filled in: the final review of the screen run covers this code.');
-  const text = readFileSync(written.file, 'utf8');
-  assert.match(text.split('\n')[0], /keep Result as written; write Next, then delete this line/);
+  // The run wrote its report: Result and Changes from the records, Notes free.
+  const text = readFileSync(final.report.file, 'utf8');
   assert.match(text, new RegExp(`^# ${CHANGE}: run ${final.run_id} \\(final run of ${screen.run_id}\\)$`, 'm'));
-  assert.match(text, /^\| submit-failure-s1 \| c1 \| REQ-submit-failure \| 本次提交发送的成功通知数量为零 \| gating \| fail \(0\/3\) → pass \(3\/3\) \| holds \|$/m);
+  assert.match(text, /^\| submit-failure-s1 \| c1 \| REQ-submit-failure \| 本次提交发送的成功通知数量为零 \| gating \| fail \(0\/3\) → pass \(3\/3\) \| holds \(fixed\) \|$/m);
   assert.ok(text.includes(`Eval package and project kit files changed since screen run ${screen.run_id}:\n- none\n\nSame code as screen run ${screen.run_id}: no file changed.\n`), text);
-  assert.ok(text.includes(`## Review\n\nThe final review of screen run ${screen.run_id} covers this code; see reports/${screen.run_id}.md.\n`), text);
-  assert.match(text, /^- Every check holds\.$/m);
-  assert.deepEqual(writeReport(repo, CHANGE).missing, ['the template line is still there', 'section Next is empty']);
-  completeReport(repo, final.run_id, { review: false });
+  assert.doesNotMatch(text, /^## Review/m);
+  assert.match(text, /^## Notes$/m);
+  assert.deepEqual(writeReport(repo, CHANGE).created, false);
 
-  status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'ask_acceptance', JSON.stringify(status.next));
-  assert.equal(status.next.command[status.next.command.indexOf('--run') + 1], final.run_id);
-  assert.deepEqual(status.next.strength, { attempts: 3, pass_all_chance: { fails_half: 0.125, fails_one_in_ten: 0.729 }, single_sample: false, sentence: STRENGTH_3 });
-  assert.equal(status.next.message, `Show the user the per-check comparison of final run ${final.run_id}, its report and the report of screen run ${screen.run_id} with its Review, and this: ${STRENGTH_3}${usedText(status)} Record acceptance only with their own words; a pass is not acceptance.`);
+  let status = loopStatus(repo, CHANGE);
+  assert.deepEqual(factsOf(status.situation), { code: 'acceptable', run_id: final.run_id, role: 'final', screen_run: screen.run_id });
+  // The review of the screen run covers its final run, which ran the same code.
+  assert.deepEqual(status.gates.accept, []);
+  assert.deepEqual(status.suggestion.command, ['loop', 'accept', CHANGE, '--repo', repo, '--run', final.run_id, '--by', '<user>', '--ref', '<where they said so>']);
+  assert.deepEqual([status.strength.attempts, status.strength.pass_all_chance, status.strength.single_sample, status.strength.sentence],
+    [3, { fails_half: 0.125, fails_one_in_ten: 0.729 }, false, STRENGTH_FIRST_FINAL]);
+  // What the user is shown before deciding.
+  assert.deepEqual(Object.keys(status.must_show), ['checks', 'strength', 'reviews', 'usage', 'final_runs_of_change']);
+  assert.equal(status.must_show.strength[0].sentence, STRENGTH_FIRST_FINAL);
+  assert.deepEqual(status.must_show.reviews.map((review) => review.run_id), [screen.run_id]);
+  assert.deepEqual(status.must_show.checks.map((entry) => [entry.case, entry.check, entry.label]), [[FAILURE, 'c1', 'holds (fixed)'], [SUCCESS, 'c1', 'holds (kept)'], [SUCCESS, 'c2', 'holds (kept)']]);
+  assert.ok(status.obligations.some((entry) => entry.kind === 'consent' && entry.decision === 'acceptance' && entry.by === 'user' && entry.run_id === final.run_id), JSON.stringify(status.obligations));
   assert.deepEqual(status.runs.map((run) => run.role), ['screen', 'final']);
   assert.deepEqual([status.final.pending, status.final.finals], [false, [{ run_id: final.run_id, verdict: 'pass' }]]);
 
-  assert.throws(() => acceptLoop(repo, CHANGE, { run: screen.run_id, by: 'Dana', ref: 'thread 1' }), refusedWith('not_final'));
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: screen.run_id, ...CONSENT }), refusedWith('not_final'));
   const { accepted } = acceptLoop(repo, CHANGE, { run: final.run_id, by: 'Dana', ref: 'thread 1' });
   assert.deepEqual([accepted.final_run, accepted.screen_run], [final.run_id, screen.run_id]);
   assert.deepEqual(accepted.history, [
-    { run_id: screen.run_id, role: 'screen', verdict: 'pass', code_digest: accepted.code_digest },
-    { run_id: final.run_id, role: 'final', verdict: 'pass', code_digest: accepted.code_digest }]);
-  assert.deepEqual(accepted.strength, status.next.strength);
+    { run_id: screen.run_id, role: 'screen', verdict: 'pass', code_digest: accepted.history[0].code_digest },
+    { run_id: final.run_id, role: 'final', verdict: 'pass', code_digest: accepted.history[0].code_digest }]);
+  assert.deepEqual(accepted.strength, status.strength);
   assert.deepEqual(accepted.run_plan.attempts_by_case, { [FAILURE]: 3, [SUCCESS]: 1 });
+  assert.deepEqual([accepted.review.run_id, accepted.self_review], [screen.run_id, false]);
+  assert.deepEqual([accepted.accepted.by, accepted.accepted.ref], ['Dana', 'thread 1']);
   assert.deepEqual(readJSON(path.join(root, 'accepted.json')).history, accepted.history);
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'done');
+  status = loopStatus(repo, CHANGE);
+  assert.deepEqual([status.phase, status.situation.code, status.suggestion], ['done', 'accepted', null]);
 });
 
 test('a final run runs first the packages that failed before, and stops at the first one that fails', (t) => {
@@ -173,6 +198,7 @@ test('a final run runs first the packages that failed before, and stops at the f
   assert.deepEqual([final.role, final.verdict], ['final', 'fail']);
   assert.deepEqual(ranInOrder(tools, 1), [SUCCESS]);
   assert.deepEqual(final.skipped, [{ case: FAILURE, reason: 'final_stopped', after: SUCCESS }]);
+  assert.deepEqual(final.failures_count, { cases: [SUCCESS], final_failed: true });
   const record = runRecord(project, final);
   assert.deepEqual([record.final_of, record.run_order, record.environment_ref.attempts_by_case], [screen.run_id, [SUCCESS], { [SUCCESS]: 1 }]);
   assert.deepEqual(record.skipped, final.skipped);
@@ -183,38 +209,35 @@ test('one failed final run means changing the code: the same code again is a scr
   const { repo, tools } = project;
   const varies = { ...AFTER, [FAILURE]: { c1: ['pass', 'fail', 'pass'] } };
   const screen = passingScreen(project, varies, 'Try a change whose result varies');
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'final_run');
+  assertFinalDue(loopStatus(repo, CHANGE), screen.run_id, repo);
   const final = startRun(repo, CHANGE);
-  assert.deepEqual([final.role, final.verdict], ['final', 'fail']);
+  assert.deepEqual([final.role, final.verdict, final.acceptable], ['final', 'fail', false]);
   assert.deepEqual(ranInOrder(tools, 1), [FAILURE]);
   assert.deepEqual(attemptsAsked(tools, 1), { [FAILURE]: '3' });
   assert.deepEqual(final.skipped, [{ case: SUCCESS, reason: 'final_stopped', after: FAILURE }]);
-  assert.equal(final.next, 'The final run failed, so this code can never be accepted. Run `loop status` next.');
+  // The failure counts for this code: no run of it can be accepted.
+  assert.deepEqual(final.failures_count, { cases: [FAILURE], final_failed: true });
   assert.deepEqual(runRecord(project, final).run_order, [FAILURE]);
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'write_report');
-  completeReport(repo, final.run_id);
   let status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'iterate', JSON.stringify(status.next));
-  assert.equal(status.next.message, `Final run ${final.run_id} of the code of screen run ${screen.run_id} failed: ${FAILURE}/c1 passed 2 of 3 attempts. A failure of the same code always counts, so this code can never be accepted, and one more failed final run of this loop stops it (stop_unstable). Read the failing attempts' logs (<case>/attempts.json names each trial), find what makes the result vary, change the code, and screen it again.`);
+  assert.deepEqual(factsOf(status.situation), { code: 'final_failed', run_id: final.run_id, final_of: screen.run_id,
+    failed: [{ case: FAILURE, check: 'c1', passed: 2, attempts: 3 }], errored: false });
+  assert.match(status.situation.message, /one more failed final run of this loop stops it \(stop_unstable\)/);
   assert.deepEqual([status.final.failed, status.final.candidate, status.final.pending], [[final.run_id], null, false]);
-  assert.throws(() => acceptLoop(repo, CHANGE, { run: final.run_id, by: 'Dana', ref: 'thread 1' }), refusedWith('not_passing'));
+  assert.deepEqual(status.suggestion.command, ['run', 'start', CHANGE, '--repo', repo]);
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: final.run_id, ...CONSENT }), refusedWith('not_passing'));
 
   // The same code again is a screen run; its pass is burned by the failure.
   const again = fullRun(repo);
-  assert.deepEqual([again.role, again.verdict], ['screen', 'pass']);
+  assert.deepEqual([again.role, again.verdict, again.acceptable, again.failed_before], ['screen', 'pass', false, [final.run_id]]);
   assert.deepEqual(attemptsAsked(tools, 2), { [FAILURE]: '1', [SUCCESS]: '1' });
-  assert.equal(again.next, `The screen run passed, but its code already failed a gating check in ${final.run_id}, so no final run of it can be accepted. Run \`loop status\` next: write its report, then change the code.`);
   status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'write_report');
-  assert.match(status.next.message, / Leave Review empty: no final review follows for this code\.$/);
-  completeReport(repo, again.run_id, { review: false });
-  status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'iterate', JSON.stringify(status.next));
-  assert.equal(status.next.message, `Screen run ${again.run_id} passed, but its code failed ${FAILURE}/c1 in ${final.run_id}. A pass never cancels a failure of the same code, so no final run of it can be accepted. Change the code and screen it again.`);
+  assert.deepEqual([status.situation.code, status.situation.run_id], ['screen_burned', again.run_id], JSON.stringify(status.situation));
+  assert.deepEqual([...new Set(status.situation.failures.map((entry) => `${entry.case}/${entry.check} in ${entry.run_id}`))], [`${FAILURE}/c1 in ${final.run_id}`]);
   assert.equal(status.final.candidate, null);
-  assert.throws(() => acceptLoop(repo, CHANGE, { run: again.run_id, by: 'Dana', ref: 'thread 1' }), (error) => {
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: again.run_id, ...CONSENT }), (error) => {
     refusedWith('not_final')(error);
     refusedWith('unstable')(error);
+    assertGapShape(error.gaps.find((entry) => entry.code === 'unstable'), { owner: 'user', layer: 'code' });
     return true;
   });
 });
@@ -224,20 +247,23 @@ test('a second failed final run, on other code, stops the loop for good', (t) =>
   const { repo } = project;
   passingScreen(project, { ...AFTER, [FAILURE]: { c1: ['pass', 'fail', 'pass'] } }, 'Try a change whose result varies');
   const first = startRun(repo, CHANGE);
-  completeReport(repo, first.run_id);
   passingScreen(project, { ...AFTER, [FAILURE]: { c1: ['pass', 'pass', 'fail'] } }, 'Try another change whose result varies');
   const second = startRun(repo, CHANGE);
   assert.deepEqual([second.role, second.verdict], ['final', 'fail']);
-  completeReport(repo, second.run_id);
   let status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.next.owner], ['stop_unstable', 'user'], JSON.stringify(status.next));
-  assert.equal(status.next.message, `Two final runs of this loop failed: ${first.run_id} (${FAILURE}/c1 passed 2 of 3 attempts) and ${second.run_id} (${FAILURE}/c1 passed 2 of 3 attempts). Checks that fail some of the time on code that passed its screen run are not settled by running again. Stop and tell the user what the runs showed. This loop has ended: a code change does not lift this stop, and \`run start\` refuses its head runs. The user decides: find and fix what makes the result vary, or change the requirement through agent-spec. A new loop needs their go-ahead; it keeps the start code, and the failures of the same code still count.`);
+  assertEnded(status, 'stop_unstable');
+  assertGapShape(status.gates.head_run, { code: 'stop_unstable', owner: 'user', layer: 'code' });
+  const failed = [{ case: FAILURE, check: 'c1', passed: 2, attempts: 3 }];
+  assert.deepEqual(status.ended.failed_finals, [{ run_id: first.run_id, failed }, { run_id: second.run_id, failed }]);
   assert.deepEqual(status.final.failed, [first.run_id, second.run_id]);
+  // A new loop is the user's decision; it keeps the start code, and the failures of the same code still count.
+  assert.deepEqual(status.ended.start_code, status.loop.start_code);
+  assert.equal(status.ended.new_loop.gates.find((entry) => entry.gate === 'user_consent').holds, false);
   // Changing the code does not lift the stop: the third run is refused.
   changeCode(repo, AFTER, 'Make the notice handler deterministic');
   status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'stop_unstable', JSON.stringify(status.next));
-  refusedBeforeRun(project, {}, 'stop_unstable');
+  assertEnded(status, 'stop_unstable');
+  lockedBeforeRun(project, {}, 'stop_unstable');
 });
 
 test('a final run that passed and a later failure of its code stop the loop as unstable, and the final run cannot be accepted', (t) => {
@@ -246,139 +272,143 @@ test('a final run that passed and a later failure of its code stop the loop as u
   passingScreen(project);
   const final = startRun(repo, CHANGE);
   assert.equal(final.verdict, 'pass');
-  completeReport(repo, final.run_id, { review: false });
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'ask_acceptance');
+  assert.equal(loopStatus(repo, CHANGE).situation.code, 'acceptable');
   setResults(repo, { ...AFTER, [FAILURE]: { c1: 'fail' } });
   const partial = startRun(repo, CHANGE, { case: [FAILURE] });
   assert.deepEqual([partial.role, partial.verdict], [null, 'fail']);
   setResults(repo, AFTER);
   const status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.next.owner], ['stop_unstable', 'user'], JSON.stringify(status.next));
-  assert.equal(status.next.message, `Final run ${final.run_id} passed, but ${FAILURE}/c1 failed on the same code in ${partial.run_id}. Checks that fail some of the time on code that passed its screen run are not settled by running again. Stop and tell the user what the runs showed. This loop has ended: a code change does not lift this stop, and \`run start\` refuses its head runs. The user decides: find and fix what makes the result vary, or change the requirement through agent-spec. A new loop needs their go-ahead; it keeps the start code, and the failures of the same code still count.`);
-  assert.throws(() => acceptLoop(repo, CHANGE, { run: final.run_id, by: 'Dana', ref: 'thread 1' }), refusedWith('unstable'));
+  assertEnded(status, 'stop_unstable');
+  assert.deepEqual(status.ended.contradicted.map((group) => [group.case, group.check, group.fail]), [[FAILURE, 'c1', [partial.run_id]]]);
+  assert.ok(status.ended.contradicted[0].pass.includes(final.run_id), JSON.stringify(status.ended.contradicted));
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: final.run_id, ...CONSENT }), (error) => {
+    refusedWith('unstable')(error);
+    refusedWith('stop_unstable')(error);
+    return true;
+  });
 });
 
-test('a final run with missing evidence and no failure is run once more on the same code; a second one goes to the user', (t) => {
+test('a final run with missing evidence and no failure is run once more on the same code; a second one stops the loop for the user', (t) => {
   const project = finalsLoop(t);
   const { repo } = project;
   const screen = passingScreen(project);
   setResults(repo, { ...AFTER, [FAILURE]: { c1: 'unknown' } });
   const first = startRun(repo, CHANGE);
-  assert.deepEqual([first.role, first.verdict, first.execution_status], ['final', 'unverified', 'completed']);
+  assert.deepEqual([first.role, first.verdict, first.execution_status, first.acceptable], ['final', 'unverified', 'completed', false]);
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: first.run_id, ...CONSENT }), refusedWith('not_passing'));
   // Without a failure the final run goes on to the next package.
   assert.deepEqual(runRecord(project, first).run_order, [FAILURE, SUCCESS]);
-  completeReport(repo, first.run_id);
   let status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'final_run', JSON.stringify(status.next));
-  assert.equal(status.next.message, `Final run ${first.run_id} found no failure but missing evidence (unknown): ${FAILURE}/c1. Read its logs. If nothing in the packages or the project kit needs changing, such as a fault of the machine or of Docker, fix that and run the final run again on the same code with \`run start\`; a second incomplete final run goes to the user.${FINAL_COST(project.base.run_id)}`);
+  assertFinalDue(status, screen.run_id, repo);
+  assert.deepEqual([status.situation.incomplete, status.situation.unknown], [[first.run_id], [`${FAILURE}/c1`]]);
   assert.deepEqual([status.final.candidate, status.final.pending, status.final.incomplete], [screen.run_id, true, [first.run_id]]);
   const second = startRun(repo, CHANGE);
   assert.deepEqual([second.role, runRecord(project, second).final_of, second.verdict], ['final', screen.run_id, 'unverified']);
-  completeReport(repo, second.run_id);
   status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.next.owner], ['stop_incomplete', 'user'], JSON.stringify(status.next));
-  const STOP_INCOMPLETE = `Two final runs of the code of screen run ${screen.run_id}, ${first.run_id} and ${second.run_id}, found no failure but left ${FAILURE}/c1 unknown, so no further final run of this code and these packages is made. Stop and tell the user what kept the evidence from being read. This loop has ended. The user decides how to go on; a new loop, once they agree, screens and reviews the code again before its final run, and a fix to a package or the kit needs \`eval check\`, \`eval review\` and their \`eval confirm\` first.`;
-  assert.equal(status.next.message, STOP_INCOMPLETE);
+  assertEnded(status, 'stop_incomplete');
+  assertGapShape(status.gates.head_run, { code: 'stop_incomplete', owner: 'user', layer: 'loop' });
+  assert.deepEqual([status.ended.runs, status.ended.screen_runs, status.ended.unknown], [[first.run_id, second.run_id], [screen.run_id], [`${FAILURE}/c1`]]);
   assert.deepEqual([status.final.pending, status.final.incomplete], [false, [first.run_id, second.run_id]]);
   // No further run of this loop: no third final run of that code.
   setResults(repo, AFTER);
-  refusedBeforeRun(project, {}, 'stop_incomplete');
-  // Once the user agrees to a new loop, the same code is screened, reviewed and run once more.
+  lockedBeforeRun(project, {}, 'stop_incomplete');
+  // Once the user agrees to a new loop, the same code is screened and run once more.
   startLoop(repo, CHANGE);
   const next = fullRun(repo);
   assert.deepEqual([next.role, next.verdict], ['screen', 'pass']);
-  completeReport(repo, next.run_id);
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'final_run');
+  assertFinalDue(loopStatus(repo, CHANGE), next.run_id, repo);
   const third = startRun(repo, CHANGE);
   assert.deepEqual([third.role, runRecord(project, third).final_of, third.verdict], ['final', next.run_id, 'pass']);
 });
 
-test('a final run whose execution errored goes to repair_execution and does not count: the next run on the same code is the final run again', (t) => {
+test('a final run whose execution errored does not count: the next run on the same code is the final run again', (t) => {
   const project = finalsLoop(t);
   const { repo } = project;
   const screen = passingScreen(project);
   setResults(repo, { ...AFTER, [FAILURE]: 'exception' });
   const errored = startRun(repo, CHANGE);
-  assert.deepEqual([errored.role, errored.execution_status], ['final', 'error']);
+  assert.deepEqual([errored.role, errored.execution_status, errored.unverified_by.includes('execution_incomplete')], ['final', 'error', true]);
   let status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'repair_execution', JSON.stringify(status.next));
+  assert.deepEqual(factsOf(status.situation), { code: 'execution_incomplete', run_id: errored.run_id, failed_checks: [] });
   assert.deepEqual([status.final.candidate, status.final.pending, status.final.incomplete, status.final.finals], [screen.run_id, true, [], []]);
+  assert.deepEqual(status.suggestion.command, ['run', 'start', CHANGE, '--repo', repo]);
   setResults(repo, AFTER);
   const final = startRun(repo, CHANGE);
   assert.deepEqual([final.role, runRecord(project, final).final_of, final.verdict], ['final', screen.run_id, 'pass']);
-  completeReport(repo, final.run_id, { review: false });
   status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'ask_acceptance', JSON.stringify(status.next));
+  assert.deepEqual([status.situation.code, status.situation.run_id], ['acceptable', final.run_id], JSON.stringify(status.situation));
   assert.deepEqual(status.runs.map((run) => [run.role, run.execution_status]), [['screen', 'completed'], ['final', 'error'], ['final', 'completed']]);
 });
 
-test('stuck compares the last two full runs of any role over the packages both ran', (t) => {
+test('stuck compares the last two full runs of any role over the packages both ran, and is a warning', (t) => {
   const project = finalsLoop(t);
   const { repo } = project;
   passingScreen(project, { ...AFTER, [FAILURE]: { c1: ['pass', 'fail', 'pass'] } }, 'Try a change whose result varies');
   const final = startRun(repo, CHANGE);
   assert.deepEqual(final.skipped.map((entry) => entry.case), [SUCCESS]);
-  completeReport(repo, final.run_id);
   changeCode(repo, { ...AFTER, [FAILURE]: { c1: 'fail' } }, 'Try another change');
   const screen = fullRun(repo);
   assert.deepEqual([screen.role, screen.verdict], ['screen', 'fail']);
-  completeReport(repo, screen.run_id);
   const status = loopStatus(repo, CHANGE);
   assert.equal(status.stuck, true);
-  assert.deepEqual([status.next.action, status.next.owner], ['stop_stuck', 'user'], JSON.stringify(status.next));
-  assert.equal(status.next.message, `The same gating checks failed in the last two runs on different code: ${FAILURE}/c1=fail. Stop, report what was tried, and ask the user how to proceed. This loop has ended: \`run start\` refuses its head runs. A code change does not lift this stop.`);
+  assert.ok(status.warnings.includes(`stuck: the same gating checks failed in the last two runs on different code: ${FAILURE}/c1=fail.`), JSON.stringify(status.warnings));
+  // The user did not ask to stop on it, so the loop goes on.
+  assert.deepEqual([status.phase, status.ended, status.gates.head_run, status.situation.code], ['live', null, null, 'open']);
 });
 
-test('final runs count toward the budget, and a final run past it stops on budget', (t) => {
+test('final runs count toward the budget, and a final run past it stops on budget until the user revises it', (t) => {
   const project = readyProject(t, { live: [FAILURE], attempts: 3 });
   const { repo } = project;
   startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
   startLoop(repo, CHANGE, { iterations: 2, minutes: 60 });
-  const screen = passingScreen(project);
+  passingScreen(project);
   let status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.loop.used.iterations], ['final_run', 1]);
+  assert.deepEqual([status.situation.code, status.loop.used.iterations], ['final_run_due', 1]);
   const final = startRun(repo, CHANGE);
   assert.equal(final.role, 'final');
-  completeReport(repo, final.run_id, { review: false });
   status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.loop.used.iterations], ['ask_acceptance', 2]);
+  // The budget is used up, and the passing final run can still be accepted.
+  assert.deepEqual([status.phase, status.situation.code, status.loop.used.iterations, status.gates.accept], ['closing', 'acceptable', 2, []]);
 
   const short = readyProject(t, { live: [FAILURE], attempts: 3 });
-  const shortBase = startRun(short.repo, CHANGE, { baseline: true, expect: writeExpectations(short.repo, EXPECT) });
+  startRun(short.repo, CHANGE, { baseline: true, expect: writeExpectations(short.repo, EXPECT) });
   // The first full run is a screen run, so one run never reaches a final run.
-  assert.ok(startLoop(short.repo, CHANGE, { iterations: 1, minutes: 60 }).warnings.includes('A budget of 1 full run leaves no room for a final run: in this loop the first full run is a screen run, and only a passing final run after it can be accepted, so it needs at least 2 full runs. Tell the user before the first run.'));
-  const only = passingScreen(short);
+  const started = startLoop(short.repo, CHANGE, { iterations: 1, minutes: 60 });
+  assert.ok(started.warnings.includes('A budget of 1 full run leaves no room for a final run: in this loop the first full run is a screen run, and only a passing final run after it can be accepted.'), JSON.stringify(started.warnings));
+  const only = passingScreen(short, AFTER, 'Stop the success notice when a submission fails', { review: false });
   status = loopStatus(short.repo, CHANGE);
-  assert.deepEqual([status.next.action, status.next.owner], ['stop_budget', 'user'], JSON.stringify(status.next));
-  // It says what the final run takes, and that only the final run is left.
-  assert.match(status.next.message, new RegExp(`^The budget is used up \\(1 of 1 runs, \\d+ of 60 minutes\\)\\. Screen run ${only.run_id} passed and its final review is done; the final run needs more budget: ${FAILURE} runs 3 times and every other package once\\.`));
-  assert.ok(status.next.message.endsWith(`once.${FINAL_COST(shortBase.run_id)} Stop and tell the user that only the final run is left, and what it takes. This loop has ended: \`run start\` refuses its head runs. A bigger budget goes to a new loop, once the user agrees: \`loop start --max-iterations N --max-minutes M\`. A new loop counts only its own runs, so it screens and reviews this code again before its final run: a screen run of the code as it is, with no change, then its report and the final review.`), status.next.message);
-  assertStopBudget(status.next, short.repo, 'budget_used_up');
-  assert.ok(!status.next.message.includes('what still fails'), status.next.message);
-  assert.equal(screen.role, 'screen');
+  assertStopBudget(status, 'budget_used_up');
+  // Only the final run is left, and what it takes is stated.
+  assert.equal(status.ended.screen_run, only.run_id);
+  assert.deepEqual([status.ended.situation.code, status.ended.situation.candidate, status.ended.situation.final_plan],
+    ['final_run_due', only.run_id, { packages: [FAILURE], attempts: 3, others_once: [SUCCESS] }]);
+  assert.equal(typeof status.ended.situation.estimate.minutes, 'number');
+  // The user lets the loop go on with one more run; the final run is due again.
+  const revised = budgetLoop(short.repo, CHANGE, { iterations: 2, ...CONSENT });
+  assert.deepEqual([revised.resumed, revised.budget.iterations, revised.revision.from.iterations, revised.revision.by], [true, 2, 1, CONSENT.by]);
+  assertFinalDue(loopStatus(short.repo, CHANGE), only.run_id, short.repo);
+  assert.equal(startRun(short.repo, CHANGE).role, 'final');
 });
 
-test('without a package that varies, or with one attempt, no run is a screen or a final run and a passing run is accepted as before', (t) => {
+test('without a package that varies, or with one attempt, no run is a screen or a final run and a reviewed passing run is accepted', (t) => {
   const project = inLoop(t);
   const { repo, tools } = project;
   changeCode(repo, AFTER, 'Stop the success notice when a submission fails');
   const run = fullRun(repo);
-  assert.deepEqual([run.role, runRecord(project, run).role], [null, null]);
+  assert.deepEqual([run.role, runRecord(project, run).role, run.acceptable], [null, null, true]);
   let status = loopStatus(repo, CHANGE);
-  assert.deepEqual(status.final, { needed: false, attempts: null, live: [], candidate: null, pending: false, finals: [], failed: [], incomplete: [] });
+  assert.deepEqual(status.final, { needed: false, attempts: null, live: [], candidate: null, pending: false, finals: [], failed: [], incomplete: [], stops_at_failed: 2 });
   assert.deepEqual(status.runs.map((entry) => entry.role), [null]);
-  completeReport(repo, run.run_id);
+  assert.deepEqual(factsOf(status.situation), { code: 'acceptable', run_id: run.run_id, role: null, screen_run: null });
+  assert.deepEqual(codes(status.gates.accept), ['review_missing']);
+  reviewRun(project, run.run_id);
   status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'ask_acceptance');
-  const { accepted } = acceptLoop(repo, CHANGE, { run: run.run_id, by: 'Dana', ref: 'thread 1' });
+  assert.deepEqual(status.gates.accept, []);
+  const { accepted } = acceptLoop(repo, CHANGE, { run: run.run_id, ...CONSENT });
   assert.deepEqual([accepted.final_run, accepted.screen_run, accepted.history.map((entry) => entry.role)], [null, null, [null]]);
   // The plan of such a loop is fixed too, also once the user accepted it.
-  assert.throws(() => startRun(repo, CHANGE, { attempts: 1 }), (error) => {
-    refusedWith('run_plan_fixed')(error);
-    assert.ok(error.gaps[0].message.startsWith('The user accepted the loop for this Spec export, and its run plan stays fixed: run start reads'), error.gaps[0].message);
-    assert.doesNotMatch(error.gaps[0].message, /ends this loop/);
-    return true;
-  });
+  const refusal = refusedBeforeRun(project, { model: 'synthetic/m1' }, 'run_plan_fixed');
+  assert.deepEqual([refusal.differs, refusal.plan.tier], [[{ key: 'model', given: 'synthetic/m1', plan: null }], 'light']);
   assert.ok(tools.runs().length > 0);
 
   // One attempt of a live package: the plan has nothing to repeat.
@@ -386,34 +416,39 @@ test('without a package that varies, or with one attempt, no run is a screen or 
   changeCode(one.repo, AFTER, 'Stop the success notice when a submission fails');
   const single = fullRun(one.repo);
   assert.deepEqual([single.role, single.attempts], [null, { [FAILURE]: 1, [SUCCESS]: 1 }]);
-  assert.deepEqual([loopStatus(one.repo, CHANGE).final.needed, loopStatus(one.repo, CHANGE).final.live], [false, [FAILURE]]);
+  status = loopStatus(one.repo, CHANGE);
+  assert.deepEqual([status.final.needed, status.final.live], [false, [FAILURE]]);
 });
 
 test('a full run recorded before runs had a role that ran the plan\'s attempts reads as a final run, and is reviewed and accepted', (t) => {
   const project = liveLoop(t, 3);
   const { repo, runs, root } = project;
-  const screen = passingScreen(project);
+  const screen = passingScreen(project, AFTER, 'Stop the success notice when a submission fails', { review: false });
   const final = startRun(repo, CHANGE);
-  // The loop as an earlier release left it: one full run that ran the plan, with no role.
+  // Today the run index keeps every run: a screen run whose folder is removed counts as a failure of its code, the final run's.
   rmSync(path.join(runs, screen.run_id), { recursive: true, force: true });
   rmSync(path.join(root, 'reports', `${screen.run_id}.md`));
+  const lost = loopStatus(repo, CHANGE);
+  assert.deepEqual(lost.loop.lost_runs, [screen.run_id]);
+  assertEnded(lost, 'stop_unstable');
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: final.run_id, ...CONSENT }), refusedWith('unstable'));
+  // The loop as an earlier release left it: no run index, no final review, and one full run that ran the plan, with no role.
+  withoutLedger(project);
   const file = path.join(runs, final.run_id, 'run.json');
   const { role, final_of: finalOf, run_order: order, ...record } = readJSON(file);
   assert.deepEqual([role, finalOf, order], ['final', screen.run_id, [FAILURE, SUCCESS]]);
   writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
   let status = loopStatus(repo, CHANGE);
   assert.deepEqual(status.runs.map((entry) => entry.role), ['final']);
-  assert.equal(status.next.action, 'write_report');
-  const text = readFileSync(writeReport(repo, CHANGE).file, 'utf8');
-  assert.match(text, /^<!-- Leave this empty until `loop status` says final_review\./m);
-  completeReport(repo, final.run_id, { review: false });
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'final_review');
-  completeReport(repo, final.run_id);
+  assert.deepEqual(factsOf(status.situation), { code: 'acceptable', run_id: final.run_id, role: 'final', screen_run: null });
+  // Acceptance needs a final review of its code, recorded now.
+  assert.deepEqual(codes(status.gates.accept), ['review_missing']);
+  reviewRun(project, final.run_id);
   status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'ask_acceptance', JSON.stringify(status.next));
-  assert.ok(status.next.message.startsWith(`Show the user the per-check comparison of final run ${final.run_id}, its report, and this: ${STRENGTH_3}`), status.next.message);
-  const { accepted } = acceptLoop(repo, CHANGE, { run: final.run_id, by: 'Dana', ref: 'thread 1' });
-  assert.deepEqual([accepted.final_run, accepted.screen_run], [final.run_id, null]);
+  assert.deepEqual(status.gates.accept, []);
+  assert.ok(status.strength.sentence.startsWith(STRENGTH_3), status.strength.sentence);
+  const { accepted } = acceptLoop(repo, CHANGE, { run: final.run_id, ...CONSENT });
+  assert.deepEqual([accepted.final_run, accepted.screen_run, accepted.review.run_id], [final.run_id, null, final.run_id]);
 });
 
 test('a head run outside a loop is no final run: after it, one failed final run of the loop still means changing the code', (t) => {
@@ -422,16 +457,15 @@ test('a head run outside a loop is no final run: after it, one failed final run 
   startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
   // A head run on the code before the change, before the loop: it fails as the baseline does.
   const outside = startRun(repo, CHANGE);
-  assert.deepEqual([outside.role, outside.verdict, runRecord(project, outside).role], [null, 'fail', null]);
+  assert.deepEqual([outside.role, outside.verdict, outside.in_loop, outside.acceptable, runRecord(project, outside).role], [null, 'fail', false, false, null]);
   startLoop(repo, CHANGE);
   resultsOutsideCode(repo);
   passingScreen(project, { ...AFTER, [FAILURE]: { c1: ['pass', 'fail', 'pass'] } }, 'Try a change whose result varies');
   const final = startRun(repo, CHANGE);
   assert.deepEqual([final.role, final.verdict], ['final', 'fail']);
-  completeReport(repo, final.run_id);
   const status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'iterate', JSON.stringify(status.next));
-  assert.match(status.next.message, /one more failed final run of this loop stops it \(stop_unstable\)/);
+  assert.equal(status.situation.code, 'final_failed', JSON.stringify(status.situation));
+  assert.match(status.situation.message, /one more failed final run of this loop stops it \(stop_unstable\)/);
   assert.deepEqual(status.final.failed, [final.run_id]);
 });
 
@@ -444,11 +478,11 @@ test('full runs recorded before runs had a role that failed are ordinary iterati
     changeCode(repo, failing, label);
     const run = fullRun(repo);
     assert.deepEqual([run.role, run.verdict], ['screen', 'fail']);
-    completeReport(repo, run.run_id);
     made.push(run);
   }
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'stop_stuck');
-  // As an earlier release recorded them: no role, and the plan's attempts.
+  assert.equal(loopStatus(repo, CHANGE).stuck, true);
+  // As an earlier release recorded them: no run index, no role, and the plan's attempts.
+  withoutLedger(project);
   for (const run of made) {
     const file = path.join(runs, run.run_id, 'run.json');
     const { role, ...record } = readJSON(file);
@@ -457,43 +491,34 @@ test('full runs recorded before runs had a role that failed are ordinary iterati
     record.environment_ref.attempts = 3;
     writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
   }
-  // A failed run without a role is a screen run, whatever attempts it made.
+  // A failed run without a role is a screen run, whatever attempts it made, so two of them stop nothing.
   const status = loopStatus(repo, CHANGE);
   assert.deepEqual(status.runs.map((entry) => entry.role), ['screen', 'screen']);
   assert.deepEqual(status.final.failed, []);
-  assert.deepEqual([status.next.action, status.next.owner], ['stop_stuck', 'user'], JSON.stringify(status.next));
+  assert.deepEqual([status.phase, status.ended, status.stuck, status.situation.code], ['live', null, true, 'open'], JSON.stringify(status.situation));
 });
 
-test('a full run of the code of a passing final run asks for acceptance of that final run, and a missing report of it comes first', (t) => {
+test('a full run of the code of a passing final run is a screen run, and the final run stays the one to accept', (t) => {
   const project = finalsLoop(t);
   const { repo } = project;
   const screen = passingScreen(project);
   const final = startRun(repo, CHANGE);
   assert.deepEqual([final.role, final.verdict], ['final', 'pass']);
-  // Run again before the final run's report is written.
+  // Run again on the same code.
   const again = fullRun(repo);
-  assert.deepEqual([again.role, again.verdict], ['screen', 'pass']);
-  assert.equal(again.next, `The screen run passed, and final run ${final.run_id} of this code passed already: that is the run to accept. Run \`loop status\` next: write this run's report first.`);
+  assert.deepEqual([again.role, again.verdict, again.acceptable, again.final_passed_before], ['screen', 'pass', false, final.run_id]);
   let status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'write_report');
-  assert.match(status.next.message, / Leave Review empty: no final review follows for this code\.$/);
-  completeReport(repo, again.run_id, { review: false });
-  status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'write_report', JSON.stringify(status.next));
-  assert.deepEqual(status.next.command, ['loop', 'report', CHANGE, '--repo', repo, '--run', final.run_id]);
-  assert.ok(status.next.message.startsWith(`Final run ${final.run_id} passed on the code and packages of ${again.run_id}, so it is the run to accept. Write its report first: `), status.next.message);
-  completeReport(repo, final.run_id, { review: false });
-  status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'ask_acceptance', JSON.stringify(status.next));
-  assert.equal(status.next.command[status.next.command.indexOf('--run') + 1], final.run_id);
-  assert.equal(status.next.message, `Show the user the per-check comparison of final run ${final.run_id}, its report and the report of screen run ${screen.run_id} with its Review, and this: ${STRENGTH_3} Screen run ${again.run_id} ran the same code again and adds nothing to accept.${usedText(status)} Record acceptance only with their own words; a pass is not acceptance.`);
+  assert.deepEqual(factsOf(status.situation), { code: 'acceptable', run_id: final.run_id, role: 'final', screen_run: screen.run_id, repeated_by: again.run_id });
+  assert.equal(status.suggestion.command[status.suggestion.command.indexOf('--run') + 1], final.run_id);
+  assert.equal(status.strength.sentence, STRENGTH_FIRST_FINAL);
   // Another run of it changes nothing.
   const third = fullRun(repo);
   assert.equal(third.role, 'screen');
-  completeReport(repo, third.run_id, { review: false });
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'ask_acceptance');
-  acceptLoop(repo, CHANGE, { run: final.run_id, by: 'Dana', ref: 'thread 1' });
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'done');
+  status = loopStatus(repo, CHANGE);
+  assert.deepEqual([status.situation.code, status.situation.run_id, status.situation.repeated_by], ['acceptable', final.run_id, third.run_id]);
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: again.run_id, ...CONSENT }), refusedWith('not_final'));
+  acceptLoop(repo, CHANGE, { run: final.run_id, ...CONSENT });
+  assert.equal(loopStatus(repo, CHANGE).phase, 'done');
 });
 
 test('a screen run that passed on code that already failed stops on budget once the runs are used up', (t) => {
@@ -505,13 +530,14 @@ test('a screen run that passed on code that already failed stops on budget once 
   passingScreen(project, { ...AFTER, [FAILURE]: { c1: ['pass', 'fail', 'pass'] } }, 'Try a change whose result varies');
   const final = startRun(repo, CHANGE);
   assert.deepEqual([final.role, final.verdict], ['final', 'fail']);
-  completeReport(repo, final.run_id);
   const again = fullRun(repo);
   assert.deepEqual([again.role, again.verdict], ['screen', 'pass']);
-  completeReport(repo, again.run_id, { review: false });
   const status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.loop.used.iterations], ['stop_budget', 3], JSON.stringify(status.next));
-  assert.match(status.next.message, new RegExp(`^The budget is used up \\(3 of 3 runs, \\d+ of 60 minutes\\)\\. Screen run ${again.run_id} passed, but its code failed ${FAILURE}/c1 in ${final.run_id}\\. A pass never cancels a failure of the same code, so no final run of it can be accepted\\. Another screen run needs more budget\\. Stop and report`));
+  assertStopBudget(status, 'budget_used_up');
+  assert.equal(status.loop.used.iterations, 3);
+  // Where the loop stood when the budget ran out.
+  assert.deepEqual([status.ended.situation.code, status.ended.situation.run_id], ['screen_burned', again.run_id], JSON.stringify(status.ended.situation));
+  assert.deepEqual([...new Set(status.ended.situation.failures.map((entry) => entry.run_id))], [final.run_id]);
 });
 
 test('after two failed final runs, another run of the same code keeps the loop stopped for the user', (t) => {
@@ -519,17 +545,15 @@ test('after two failed final runs, another run of the same code keeps the loop s
   const { repo } = project;
   passingScreen(project, { ...AFTER, [FAILURE]: { c1: ['pass', 'fail', 'pass'] } }, 'Try a change whose result varies');
   const first = startRun(repo, CHANGE);
-  completeReport(repo, first.run_id);
   passingScreen(project, { ...AFTER, [FAILURE]: { c1: ['pass', 'pass', 'fail'] } }, 'Try another change whose result varies');
   const second = startRun(repo, CHANGE);
-  completeReport(repo, second.run_id);
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'stop_unstable');
+  assertEnded(loopStatus(repo, CHANGE), 'stop_unstable');
   // The same code again, with no change, is refused before Harbor.
   setResults(repo, { ...AFTER, [FAILURE]: { c1: 'fail' } });
-  refusedBeforeRun(project, {}, 'stop_unstable');
+  lockedBeforeRun(project, {}, 'stop_unstable');
   const status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.next.owner], ['stop_unstable', 'user'], JSON.stringify(status.next));
-  assert.ok(status.next.message.startsWith(`Two final runs of this loop failed: ${first.run_id} (${FAILURE}/c1 passed 2 of 3 attempts) and ${second.run_id} (${FAILURE}/c1 passed 2 of 3 attempts).`), status.next.message);
+  assertEnded(status, 'stop_unstable');
+  assert.deepEqual(status.ended.failed_finals.map((entry) => entry.run_id), [first.run_id, second.run_id]);
 });
 
 test('a final run records its packages in the order they ran', (t) => {
@@ -554,17 +578,17 @@ test('loop status names the final run whenever one is due on the code as it is n
   const { repo } = project;
   const label = 'Stop the success notice when a submission fails';
   const screen = passingScreen(project, AFTER, label);
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'final_run');
+  assertFinalDue(loopStatus(repo, CHANGE), screen.run_id, repo);
   changeCode(repo, BROKEN, 'Try something else');
   const other = fullRun(repo);
   assert.deepEqual([other.role, other.verdict], ['screen', 'fail']);
-  completeReport(repo, other.run_id);
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'split_changes');
+  let status = loopStatus(repo, CHANGE);
+  assert.equal(status.situation.code, 'regression', JSON.stringify(status.situation));
+  assert.deepEqual(status.regressions.map((entry) => [entry.case, entry.check, entry.failing_run]), [[SUCCESS, 'c1', other.run_id]]);
   // The code of the screen run again: its final run is due.
   changeCode(repo, AFTER, label);
-  const status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.final.candidate, status.final.pending], ['final_run', screen.run_id, true], JSON.stringify(status.next));
-  assert.equal(status.next.message, FINAL_RUN(screen.run_id, project.base.run_id));
+  status = loopStatus(repo, CHANGE);
+  assertFinalDue(status, screen.run_id, repo);
   const final = startRun(repo, CHANGE);
   assert.deepEqual([final.role, runRecord(project, final).final_of], ['final', screen.run_id]);
 });
@@ -572,41 +596,39 @@ test('loop status names the final run whenever one is due on the code as it is n
 test('in a new project the user confirms the checks before the packages are connected, and the baseline then records that nothing could run', (t) => {
   const project = readyProject(t, { mode: 'new', unconnected: [FAILURE, SUCCESS], live: [FAILURE], confirm: false, results: {} });
   const { repo } = project;
-  let check = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
-  assert.deepEqual([check.next.action, check.next.command], ['confirm_checks', ['eval', 'review', CHANGE, '--repo', repo]]);
-  assert.match(confirmChecks(project, { attempts: 3 }).next, /^The checks are confirmed\. Record the baseline next/);
-  check = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(check.next.action, 'record_baseline', JSON.stringify(check));
-  assert.deepEqual(check.next.command, ['run', 'start', CHANGE, '--repo', repo, '--baseline', '--unavailable', 'no_implementation']);
-  assert.ok(check.next.note.startsWith('No package can run yet in this new project, so the baseline records that nothing could run: --unavailable no_implementation.'), check.next.note);
+  let flow = checkWorkflow(repo, 'run-eval', CHANGE);
+  // The user's confirmation is pending: eval review gives what they decide on.
+  assert.deepEqual(flow.suggestion.command, ['eval', 'review', CHANGE, '--repo', repo]);
+  assert.ok(allowedActions(flow).includes('eval confirm --verdicts --by --ref'), JSON.stringify(allowedActions(flow)));
+  assert.ok(!allowedActions(flow).includes('loop start --by --ref'));
+  // A baseline before the confirmation cannot settle the number of attempts, not even one that runs nothing.
+  const undecided = refusedBeforeRun(project, { baseline: true, unavailable: 'no_implementation', attempts: 3 }, 'attempts_undecided');
+  assertGapShape(undecided, { owner: 'user', layer: 'confirmation' });
+  const confirmed = confirmChecks(project, { attempts: 3, tier: 'full' });
+  assert.deepEqual([confirmed.new_loop_needs, confirmed.connect_first, confirmed.baseline.recorded], [{ baseline: true, user_consent: true }, true, null]);
+  flow = checkWorkflow(repo, 'run-eval', CHANGE);
+  assert.ok(allowedActions(flow).includes('run start --baseline --unavailable'), JSON.stringify(allowedActions(flow)));
   const base = startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
-  assert.deepEqual([base.is_baseline, base.run_plan.attempts, base.run_plan.source], [false, 3, 'confirmation']);
-  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'start_loop');
-
-  // An unavailable baseline recorded before the confirmation, with the plan the user then confirms, is the one the loop starts on.
-  const other = readyProject(t, { mode: 'new', unconnected: [FAILURE, SUCCESS], live: [FAILURE], confirm: false, results: {} });
-  const early = startRun(other.repo, CHANGE, { baseline: true, unavailable: 'no_implementation', attempts: 3 });
-  assert.equal(confirmChecks(other, { attempts: 3 }).next, `The checks are confirmed. That no baseline could run is recorded already (${early.run_id}), with this plan: start the loop next with \`loop start\`, which takes the budget the user confirmed.`);
-  assert.equal(checkWorkflow(other.repo, 'run-eval', CHANGE).next.action, 'start_loop');
+  assert.deepEqual([base.is_baseline, base.run_plan.attempts, base.run_plan.source, base.loop_baseline.usable], [false, 3, 'confirmation', true]);
+  flow = checkWorkflow(repo, 'run-eval', CHANGE);
+  assert.ok(allowedActions(flow).includes('loop start --by --ref'), JSON.stringify(allowedActions(flow)));
+  assert.deepEqual(flow.suggestion.command.slice(0, 2), ['loop', 'start']);
 });
 
-test('a baseline that fixed its own number of attempts is recorded again from the confirmation, and a confirmed budget of one full run leaves no room for a final run', (t) => {
+test('a baseline cannot fix its own number of attempts before the user confirms them, and a confirmed budget of one full run leaves no room for a final run', (t) => {
   const project = readyProject(t, { live: [FAILURE], confirm: false });
   const { repo } = project;
-  startRun(repo, CHANGE, { baseline: true, attempts: 3, expect: writeExpectations(repo, EXPECT) });
-  writeFileSync(path.join(repo, '.dockerignore'), 'node_modules\n');
-  assert.throws(() => startLoop(repo, CHANGE), (error) => {
-    blockedWith('baseline_not_at_start')(error);
-    assert.ok(gapOf(error, 'baseline_not_at_start').message.includes('record the baseline again instead, with the same --expect file and no --attempts, --agent or --model; the baseline reads the plan from confirmed.json. Otherwise:'), error.message);
-    return true;
-  });
+  const undecided = refusedBeforeRun(project, { baseline: true, attempts: 3, expect: writeExpectations(repo, EXPECT) }, 'attempts_undecided');
+  assertGapShape(undecided, { owner: 'user', layer: 'confirmation' });
   const result = confirmChecks(project, { attempts: 3, iterations: 1, minutes: 60 });
-  assert.ok(result.warnings.includes('A budget of 1 full run leaves no room for a final run: a package with a live dependency runs 3 times, so each iteration\'s full run is a screen run, and only a passing final run after it can be accepted. A loop needs at least 2 full runs; tell the user.'), JSON.stringify(result.warnings));
+  assert.ok(result.warnings.includes('A budget of 1 full run leaves no room for a final run: a package with a live dependency runs 3 times, so each iteration\'s full run is a screen run, and only a passing final run after it can be accepted.'), JSON.stringify(result.warnings));
+  assert.deepEqual([result.new_loop_needs, result.suggestion.command.slice(0, 3)], [{ baseline: true, user_consent: true }, ['run', 'start', CHANGE]]);
+  // The baseline reads the plan from the confirmation.
+  const base = startRun(repo, CHANGE, { baseline: true, expect: writeExpectations(repo, EXPECT) });
+  assert.deepEqual([base.is_baseline, base.run_plan.attempts, base.run_plan.source, base.run_plan.confirmation], [true, 3, 'confirmation', result.confirmation.id]);
 });
 
-// --- Later runs against an acceptance, final runs with an errored attempt,
-// and the commands the messages name. ---
+// --- Later runs against an acceptance, final runs with an errored attempt. ---
 
 test('a gating check added after the acceptance that fails in a later full run of the accepted code withdraws the acceptance', (t) => {
   const project = inLoop(t);
@@ -615,9 +637,9 @@ test('a gating check added after the acceptance that fails in a later full run o
   changeCode(repo, { ...AFTER, [SUCCESS]: { ...AFTER[SUCCESS], c3: 'fail' } }, 'Stop the success notice when a submission fails');
   const passed = fullRun(repo);
   assert.equal(passed.verdict, 'pass');
-  completeReport(repo, passed.run_id);
-  acceptLoop(repo, CHANGE, { run: passed.run_id, by: 'Dana', ref: 'thread 1' });
-  assert.equal(loopStatus(repo, CHANGE).next.action, 'done');
+  reviewRun(project, passed.run_id);
+  acceptLoop(repo, CHANGE, { run: passed.run_id, ...CONSENT });
+  assert.equal(loopStatus(repo, CHANGE).phase, 'done');
   editChecks(repo, SUCCESS, (declared) => {
     declared.checks.push({ ...declared.checks.find((check) => check.id === 'c1'), id: 'c3' });
     for (const fixture of declared.fixtures) fixture.expect.c3 = fixture.expect.c1;
@@ -626,8 +648,9 @@ test('a gating check added after the acceptance that fails in a later full run o
   const later = startRun(repo, CHANGE);
   assert.deepEqual([later.execution_status, later.verdict], ['completed', 'fail']);
   const status = loopStatus(repo, CHANGE);
-  assert.notEqual(status.next.action, 'done', JSON.stringify(status.next));
-  assert.equal(status.accepted.outdated, true);
+  assert.notEqual(status.phase, 'done', JSON.stringify(status.situation));
+  assert.equal(status.accepted, false);
+  assert.equal(status.acceptance.outdated, true);
   assert.ok(status.warnings.some((warning) => warning.startsWith(`Run ${later.run_id}, after the user accepted run ${passed.run_id}, fails, so the acceptance no longer covers this loop.`)), JSON.stringify(status.warnings));
 });
 
@@ -635,11 +658,12 @@ test('a latest run that did not complete is not compared for regressions, also a
   const project = inLoop(t);
   const { repo } = project;
   changeCode(repo, AFTER, 'the fix');
-  completeReport(repo, fullRun(repo).run_id);
+  fullRun(repo);
   changeCode(repo, { ...AFTER, [SUCCESS]: 'exception' }, 'another edit');
   const errored = startRun(repo, CHANGE);
   assert.deepEqual([errored.execution_status, errored.verdict], ['error', 'unverified']);
-  // As an older release recorded an exception trial: the verifier's results kept, the run failed.
+  // As an older release recorded an exception trial: no run index, the verifier's results kept, the run failed.
+  withoutLedger(project);
   const folder = path.join(project.runs, errored.run_id);
   writeFileSync(path.join(folder, 'run.json'), `${JSON.stringify({ ...readJSON(path.join(folder, 'run.json')), verdict: 'fail' }, null, 2)}\n`);
   rmSync(path.join(folder, SUCCESS, 'attempts.json'), { force: true });
@@ -648,28 +672,25 @@ test('a latest run that did not complete is not compared for regressions, also a
   for (const entry of compare.results) if (entry.case === SUCCESS && entry.check === 'c1') Object.assign(entry, { after: 'fail', verdict: 'violated' });
   writeFileSync(path.join(folder, 'compare.json'), `${JSON.stringify(compare, null, 2)}\n`);
   const status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'repair_execution');
+  assert.deepEqual([status.situation.code, status.situation.run_id], ['execution_incomplete', errored.run_id], JSON.stringify(status.situation));
   assert.deepEqual([status.regressions, status.lost_progress], [[], []]);
 });
 
 test('a final run that failed in an attempt that completed counts as a failed final run, also when another attempt errored', (t) => {
   const project = finalsLoop(t);
   const { repo } = project;
-  passingScreen(project);
+  const screen = passingScreen(project);
   setResults(repo, { ...AFTER, [FAILURE]: ['exception', { c1: 'fail' }, { c1: 'pass' }] });
   const final = startRun(repo, CHANGE);
   assert.deepEqual([final.role, final.execution_status, final.verdict], ['final', 'error', 'fail']);
   assert.deepEqual(final.skipped.filter((entry) => entry.reason === 'final_stopped').map((entry) => entry.case), [SUCCESS]);
-  assert.ok(final.next.startsWith('Execution did not complete: read cases[].execution.reason and each case\'s logs/harbor.log, and fix the cause. But submit-failure-s1 failed a gating check in an attempt that completed, which is a result of the code and counts: this final run failed, and this code can never be accepted. Run `loop status` next.'), final.next);
-  let status = loopStatus(repo, CHANGE);
+  // The failure is a result of the code and counts, whatever else errored.
+  assert.deepEqual(final.failures_count, { cases: [FAILURE], final_failed: true });
+  const status = loopStatus(repo, CHANGE);
   assert.deepEqual(status.final.failed, [final.run_id]);
   assert.equal(status.final.candidate, null);
-  assert.equal(status.next.action, 'write_report', JSON.stringify(status.next));
-  completeReport(repo, final.run_id, { review: false });
-  status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'iterate', JSON.stringify(status.next));
-  assert.ok(status.next.message.startsWith(`Final run ${final.run_id} of the code of screen run`), status.next.message);
-  assert.ok(status.next.message.includes('Another attempt of it did not complete: read cases[].execution.reason and each logs/harbor.log, and fix that cause too'), status.next.message);
+  assert.deepEqual(factsOf(status.situation), { code: 'final_failed', run_id: final.run_id, final_of: screen.run_id,
+    failed: [{ case: FAILURE, check: 'c1', passed: 1, attempts: 3 }], errored: true });
 });
 
 test('a screen run with an errored package and a failure in an attempt that completed says the failure counts', (t) => {
@@ -678,9 +699,9 @@ test('a screen run with an errored package and a failure in an attempt that comp
   changeCode(repo, { [FAILURE]: { c1: 'fail' }, [SUCCESS]: 'exception' }, 'A first try');
   const screen = startRun(repo, CHANGE);
   assert.deepEqual([screen.role, screen.execution_status, screen.verdict], ['screen', 'error', 'fail']);
+  assert.deepEqual(screen.failures_count, { cases: [FAILURE] });
   const status = loopStatus(repo, CHANGE);
-  assert.equal(status.next.action, 'repair_execution');
-  assert.ok(status.next.message.endsWith(`But ${FAILURE}/c1 failed in an attempt that completed, which is a result of the code and counts: no run of this code with these packages can be accepted. Fix the cause, then change the code before the next run.`), status.next.message);
+  assert.deepEqual(factsOf(status.situation), { code: 'execution_incomplete', run_id: screen.run_id, failed_checks: [`${FAILURE}/c1`] });
 });
 
 test('a loop that needs a final run keeps needing it once the live package\'s git-ignored eval check record is gone, so its screen run is not accepted', (t) => {
@@ -692,11 +713,11 @@ test('a loop that needs a final run keeps needing it once the live package\'s gi
   rmSync(path.join(root, 'checks', FAILURE), { recursive: true, force: true });
   const status = loopStatus(repo, CHANGE);
   assert.deepEqual([status.final.needed, status.final.live], [true, [FAILURE]], JSON.stringify(status.final));
-  assert.equal(status.next.action, 'final_run', JSON.stringify(status.next));
+  assertFinalDue(status, screen.run_id);
   // A run would skip the package until eval check proves it again.
-  assert.deepEqual(status.next.command, ['eval', 'check', CHANGE, '--repo', repo]);
-  assert.match(status.next.message, new RegExp(`Prove ${FAILURE} with \`eval check\` first`));
-  assert.throws(() => acceptLoop(repo, CHANGE, { run: screen.run_id, by: 'Dana', ref: 'thread 1' }), refusedWith('not_final'));
+  assert.deepEqual(status.situation.unchecked, [FAILURE]);
+  assert.deepEqual(status.suggestion.command, ['eval', 'check', CHANGE, '--repo', repo]);
+  assert.throws(() => acceptLoop(repo, CHANGE, { run: screen.run_id, ...CONSENT }), refusedWith('not_final'));
   assert.equal(existsSync(path.join(root, 'accepted.json')), false);
   // Proved again, the final run follows as before.
   assert.equal(checkEval(repo, CHANGE).passed, true);

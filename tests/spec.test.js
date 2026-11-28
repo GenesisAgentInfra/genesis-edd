@@ -6,10 +6,20 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { ROOT, SCHEMA, initProject, openspec, projectRoot, readJSON } from '../src/project.js';
-import { exportSpec, newSpec, specInstructions, specStatus, validateSpec } from '../src/spec.js';
-import { checkWorkflow } from '../src/workflow.js';
+import { exportFacts, exportSpec, frozenSpec, newSpec, specInstructions, specStatus, validateSpec } from '../src/spec.js';
+import { checkWorkflow, workflowStatus } from '../src/workflow.js';
+import { actionOf, assertGapShape, assertNoRoutes, useFakeTools } from './helpers/edd.js';
 
 const fixture = readFileSync(path.join(ROOT, 'examples/report-notifications/spec.md'), 'utf8');
+const NAME = 'report-notifications';
+const CLI = path.join(ROOT, 'bin/genesis-edd.js');
+const gapOf = (gaps, code) => (gaps ?? []).find((gap) => gap.code === code);
+// workflow status reads Docker and Harbor too: here the fake ones, so nothing
+// real runs. The Spec layer is what this file is about.
+function statusOf(t, repo, name = NAME) {
+  useFakeTools(t);
+  return workflowStatus(repo, name);
+}
 function project(t, mode = 'new', agent = 'none') {
   const repo = projectRoot(mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-test-')));
   t.after(() => rmSync(repo, { recursive: true, force: true }));
@@ -55,16 +65,46 @@ test('exports freeze expectations and revisions have distinct identities', (t) =
   const second = exportSpec(repo, 'report-notifications');
   assert.notEqual(first.id, second.id);
   assert.equal(readFileSync(first.file, 'utf8'), original);
+  // Every export is one line of exports.jsonl, which names the one before it.
+  const log = readFileSync(path.join(repo, 'openspec/changes/report-notifications/exports.jsonl'), 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  assert.deepEqual(log.map((entry) => [entry.id, entry.source, entry.previous]), [[first.id, 'export', null], [second.id, 'export', first.id]]);
+  // A handoff whose content no longer matches its address is never rewritten.
   writeFileSync(second.file, '{}');
-  assert.throws(() => exportSpec(repo, 'report-notifications'), /modified/);
+  assert.throws(() => exportSpec(repo, 'report-notifications'), (error) => {
+    assert.equal(error.code, 'HANDOFF_INVALID');
+    assert.match(error.message, /exists with other content than the export it is named for .*A handoff is never rewritten\./);
+    assertGapShape(error.gaps[0], { code: 'handoff_invalid', owner: 'agent', layer: 'spec', digest: second.id });
+    return true;
+  });
+  assert.equal(readFileSync(second.file, 'utf8'), '{}');
 });
 
-test('valid proposed requirements are drafts and cannot be exported', (t) => {
-  const { repo } = authored(t, fixture.replace('state: explicit', 'state: proposed'));
+test('a proposed requirement is a draft: the export leaves it out and lists it, and drafts alone cannot be exported', (t) => {
+  const { repo, file } = authored(t, fixture.replace('state: explicit', 'state: proposed'));
   const result = validateSpec(repo, 'report-notifications');
   assert.equal(result.valid, true, JSON.stringify(result));
   assert.equal(result.ready_for_eval_design, false);
-  assert.throws(() => exportSpec(repo, 'report-notifications'), /not an accepted requirement/);
+  const excluded = { requirement: 'REQ-submit-failure', name: '提交失败时不发送成功通知', path: 'specs/notifications/spec.md', state: 'proposed', reason: 'proposed' };
+  assert.deepEqual(result.excluded, [excluded]);
+  assert.throws(() => exportSpec(repo, 'report-notifications'), (error) => {
+    assert.equal(error.code, 'SPEC_INPUT_BLOCKED');
+    // Accepting a requirement is the user's decision.
+    assertGapShape(gapOf(error.gaps, 'requirements_all_excluded'), { owner: 'user', kind: 'business', layer: 'spec', requirement_ids: ['REQ-submit-failure'] });
+    return true;
+  });
+  assert.equal(existsSync(path.join(repo, 'openspec/changes/report-notifications/handoffs')), false);
+
+  // Beside an accepted requirement, a proposed one is left out of the handoff
+  // and never becomes a check; the export lists it, and so does what the user is shown.
+  writeFileSync(file, twoExplicit.replace(second, second.replace('explicit', 'proposed')));
+  const exported = exportSpec(repo, 'report-notifications');
+  const handoff = readJSON(exported.file);
+  assert.deepEqual(handoff.requirements.map((requirement) => requirement.id), ['REQ-submit-failure']);
+  const left = { requirement: 'REQ-submit-success', name: '提交成功时发送成功通知', path: 'specs/notifications/spec.md', state: 'proposed', reason: 'proposed' };
+  assert.deepEqual(handoff.excluded, [left]);
+  assert.deepEqual(exported.excluded, [left]);
+  assert.deepEqual(exported.must_show.excluded, [left]);
+  assert.deepEqual(exported.must_show.requirements.map((requirement) => requirement.requirement), ['REQ-submit-failure']);
 });
 
 test('open business questions prevent handoff even if OpenSpec artifacts are complete', (t) => {
@@ -111,18 +151,20 @@ test('a quote cannot back more explicit requirements than it states', (t) => {
     .replace(second, second.replace('source: request', 'source: again')));
   assert.equal(validateSpec(repo, 'report-notifications').valid, false);
 
-  // A derived rule is a valid draft once it is labelled as a proposal.
+  // A derived rule is a valid draft once it is labelled as a proposal: the
+  // stated requirement can be exported, and the proposal is left out of it.
   writeFileSync(file, twoExplicit.replace(second, second.replace('explicit', 'proposed')));
   const draft = validateSpec(repo, 'report-notifications');
   assert.equal(draft.valid, true, JSON.stringify(draft.errors));
-  assert.equal(draft.ready_for_eval_design, false);
+  assert.equal(draft.ready_for_eval_design, true);
+  assert.deepEqual(draft.excluded.map((entry) => [entry.requirement, entry.reason]), [['REQ-submit-success', 'proposed']]);
 
   // Two requirements are explicit when the quoted words state both.
   writeFileSync(file, twoExplicit.replace('不要发送成功通知。"', '不要发送成功通知。提交成功时发送成功通知。"'));
   assert.equal(validateSpec(repo, 'report-notifications').ready_for_eval_design, true);
 });
 
-test('export lists each requirement beside the words and outcomes it rests on', (t) => {
+test('export lists each requirement beside the words, outcomes and scenarios it rests on', (t) => {
   const { repo } = authored(t, twoExplicit.replace('不要发送成功通知。"', '不要发送成功通知。提交成功时发送成功通知。"')
     .replace(second, `${second.replace('explicit', 'confirmed')}\n    confirmation:\n      by: Example user\n      ref: example:approval-message`));
   const quote = '报告提交失败时，不要发送成功通知。提交成功时发送成功通知。';
@@ -131,12 +173,14 @@ test('export lists each requirement beside the words and outcomes it rests on', 
       requirement: 'REQ-submit-failure', name: '提交失败时不发送成功通知', path: 'specs/notifications/spec.md', state: 'explicit',
       basis: { source: 'request', kind: 'user', quote },
       statement: '系统 MUST 在报告提交失败时不发送成功通知。', outcomes: ['本次提交发送的成功通知数量为零'],
+      scenarios: [{ name: '提交失败', given: [], when: ['报告提交返回失败'], then: ['本次提交发送的成功通知数量为零'] }],
     },
     {
       requirement: 'REQ-submit-success', name: '提交成功时发送成功通知', path: 'specs/notifications/spec.md', state: 'confirmed',
       basis: { source: 'request', kind: 'user', quote },
       confirmation: { by: 'Example user', ref: 'example:approval-message' },
       statement: '系统 MUST 在报告提交成功时发送成功通知。', outcomes: ['本次提交发送的成功通知数量为一', '不发送失败通知'],
+      scenarios: [{ name: '提交成功', given: ['报告内容完整', '提交服务可用'], when: ['报告提交返回成功'], then: ['本次提交发送的成功通知数量为一', '不发送失败通知'] }],
     },
   ]);
 });
@@ -160,7 +204,7 @@ test('handoffs carry structured requirements so later stages need not parse Mark
   }]);
 });
 
-test('impact records touched flows and evidence, checked against the Map and the project', (t) => {
+test('impact records touched flows and evidence, checked against the Map and the project; what does not check out is a warning the export records', (t) => {
   const repo = project(t, 'existing');
   mkdirSync(path.join(repo, 'app'));
   writeFileSync(path.join(repo, 'app/notify.py'), 'def notify():\n    return True\n');
@@ -185,24 +229,35 @@ test('impact records touched flows and evidence, checked against the Map and the
   ]);
   assert.deepEqual(readJSON(exported.file).impact.entries, exported.impact);
 
-  for (const [entries, pattern] of [
-    ['  - flow: flow_unknown\n    entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:1', /not in the recorded Map/],
-    ['  - entry: POST /reports\n    effect: changes\n    evidence: app/missing.py:1', /does not point to a file/],
-    ['  - entry: POST /reports\n    effect: changes\n    evidence: ../outside.py', /does not point to a file/],
-    ['  - entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:99', /line is outside the file/],
-    ['  - entry: POST /reports\n    effect: rewrites\n    evidence: app/notify.py', /needs entry, effect/],
+  // Impact describes what the request touches; it holds back no export. An
+  // entry without the fields it needs is left out; any other entry stays.
+  for (const [entries, pattern, kept] of [
+    ['  - flow: flow_unknown\n    entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:1', /entries\[0\] flow is not in the recorded Map: flow_unknown/, 1],
+    ['  - entry: POST /reports\n    effect: changes\n    evidence: app/missing.py:1', /entries\[0\] evidence does not point to a file in the project: app\/missing\.py:1/, 1],
+    ['  - entry: POST /reports\n    effect: changes\n    evidence: ../outside.py', /entries\[0\] evidence does not point to a file in the project: \.\.\/outside\.py/, 1],
+    ['  - entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:99', /entries\[0\] evidence line is outside the file: app\/notify\.py:99/, 1],
+    ['  - entry: POST /reports\n    effect: rewrites\n    evidence: app/notify.py', /entries\[0\] needs entry, effect \(changes or may_affect\) and evidence \(path or path:line\); it is left out\./, 0],
   ]) {
     impact(entries);
     const result = validateSpec(repo, 'report-notifications');
-    assert.equal(result.valid, false, entries);
-    assert.match(result.errors.join('\n'), pattern);
-    assert.equal(result.gaps.find((gap) => gap.code === 'impact_invalid').owner, 'agent');
+    assert.equal(result.ready_for_eval_design, true, `${entries}\n${result.errors.join('\n')}`);
+    assert.match(result.warnings.filter((warning) => warning.startsWith('impact.md: ')).join('\n'), pattern, entries);
+    assert.equal(gapOf(result.gaps, 'impact_invalid'), undefined);
+    assert.equal(result.impact.entries.length, kept, entries);
+    assert.match(result.impact.problems.join('\n'), pattern);
   }
+  // The export records the entries with the problems found in them.
+  const recorded = readJSON(exportSpec(repo, 'report-notifications').file).impact;
+  assert.deepEqual(recorded.entries, []);
+  assert.match(recorded.problems.join('\n'), /it is left out/);
   writeFileSync(impactFile, 'No frontmatter here.\n');
-  assert.match(validateSpec(repo, 'report-notifications').errors.join('\n'), /genesis_impact: 1/);
+  const bare = validateSpec(repo, 'report-notifications');
+  assert.equal(bare.ready_for_eval_design, true);
+  assert.match(bare.warnings.join('\n'), /impact\.md: Needs YAML frontmatter with genesis_impact: 1 and a non-empty entries list\./);
 });
 
 test('code that moves impact evidence after export keeps that export usable, not a new one', (t) => {
+  useFakeTools(t);
   const repo = project(t, 'existing');
   mkdirSync(path.join(repo, 'app'));
   const source = path.join(repo, 'app/notify.py');
@@ -214,29 +269,41 @@ test('code that moves impact evidence after export keeps that export usable, not
   writeFileSync(impactFile, impact);
   const exported = exportSpec(repo, 'report-notifications');
 
-  for (const move of [() => writeFileSync(source, 'pass'), () => rmSync(source)]) {
+  for (const [move, pattern] of [[() => writeFileSync(source, 'pass'), /evidence line is outside the file: app\/notify\.py:2/], [() => rmSync(source), /evidence does not point to a file in the project: app\/notify\.py:2/]]) {
     move();
-    const strict = validateSpec(repo, 'report-notifications');
-    assert.equal(strict.valid, false);
-    assert.equal(strict.gaps.find((gap) => gap.code === 'impact_invalid').working_tree, true);
-    const check = checkWorkflow(repo, 'write-eval', 'report-notifications');
-    assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
-    assert.equal(check.handoff.id, exported.id);
-    assert.match(check.warnings.join('\n'), /moved since the Spec was exported/);
-    assert.equal(exportSpec(repo, 'report-notifications').id, exported.id);
+    // Checked now, the evidence no longer holds: a warning.
+    const now = validateSpec(repo, 'report-notifications');
+    assert.equal(now.ready_for_eval_design, true, JSON.stringify(now.errors));
+    assert.match(now.warnings.join('\n'), pattern);
+    // Later stages read the export by digest, which still holds.
+    const frozen = frozenSpec(repo, 'report-notifications');
+    assert.deepEqual(frozen.gaps, []);
+    assert.equal(frozen.handoff.id, exported.id);
+    // Exporting the same draft again writes nothing.
+    const again = exportSpec(repo, 'report-notifications');
+    assert.equal(again.id, exported.id);
+    assert.equal(again.unchanged, true);
   }
+  const status = workflowStatus(repo, 'report-notifications');
+  assert.equal(status.layers.spec.export_holds, true, JSON.stringify(status.layers.spec.gaps));
+  assert.equal(status.layers.spec.export.id, exported.id);
 
-  // A changed impact.md is a new export, and a new export needs current evidence.
+  // A changed impact.md is a new export. Until then later stages read the
+  // export's impact; the new export records the evidence that does not check out.
   writeFileSync(impactFile, impact.replace('effect: changes', 'effect: may_affect'));
-  const check = checkWorkflow(repo, 'write-eval', 'report-notifications');
-  assert.equal(check.status, 'blocked');
-  assert.ok(check.gaps.some((gap) => gap.code === 'impact_invalid'));
-  assert.throws(() => exportSpec(repo, 'report-notifications'), /does not point to a file/);
+  const frozen = frozenSpec(repo, 'report-notifications');
+  assert.equal(frozen.handoff.id, exported.id);
+  assert.match(frozen.validation.warnings.join('\n'), /impact\.md differs from the one export .* holds; later stages read the export's\./);
+  const changed = exportSpec(repo, 'report-notifications');
+  assert.notEqual(changed.id, exported.id);
+  assert.deepEqual(readJSON(changed.file).impact.problems, ['entries[0] evidence does not point to a file in the project: app/notify.py:2']);
 
-  // Any other problem keeps the export blocked even when evidence also moved.
+  // Any other problem blocks a new export, and later stages see the draft as
+  // not exported.
   writeFileSync(impactFile, impact);
   writeSpec(repo, fixture.replace('source: request', 'source: unknown'));
-  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').status, 'blocked');
+  assert.throws(() => exportSpec(repo, 'report-notifications'), /references an unknown source/);
+  assertGapShape(frozenSpec(repo, 'report-notifications').gaps[0], { code: 'handoff_missing', owner: 'agent', layer: 'spec', changed: ['specs/notifications/spec.md'] });
 });
 
 test('confirmed interpretations need an actor and actual confirmation reference', (t) => {
@@ -246,11 +313,17 @@ test('confirmed interpretations need an actor and actual confirmation reference'
   assert.equal(validateSpec(repo, 'report-notifications').ready_for_eval_design, true);
 });
 
-test('missing outcomes are rejected by the real OpenSpec strict validator', (t) => {
+test('missing outcomes are rejected by Genesis\'s own reading of the scenarios and by the real OpenSpec strict validator', (t) => {
+  // The AND continues the WHEN step, so the scenario has no THEN step.
   const { repo } = authored(t, fixture.replace('- **THEN** 本次提交发送的成功通知数量为零', '- **AND** 不发送通知'));
   const result = validateSpec(repo, 'report-notifications');
   assert.equal(result.valid, false);
-  assert.match(result.errors.join('\n'), /OpenSpec strict validation failed/);
+  assertGapShape(gapOf(result.gaps, 'scenario_incomplete'), {
+    owner: 'agent', layer: 'spec', path: 'specs/notifications/spec.md', line: 28, requirement_id: 'REQ-submit-failure', scenario: '提交失败',
+    message: 'specs/notifications/spec.md:28: scenario "提交失败" of REQ-submit-failure lacks a THEN step.',
+  });
+  assert.match(gapOf(result.gaps, 'spec_format_invalid').message, /^OpenSpec strict reports problems that change what is read as requirements, scenarios or steps: .*scenario "提交失败" is missing a THEN step/);
+  assert.throws(() => exportSpec(repo, 'report-notifications'), /lacks a THEN step/);
 });
 
 test('archive warning exception never hides extra requirements in the preamble', (t) => {
@@ -258,6 +331,7 @@ test('archive warning exception never hides extra requirements in the preamble',
   const result = validateSpec(repo, 'report-notifications');
   assert.equal(result.valid, false);
   assert.equal(result.openspec_advisory_issues.length, 0);
+  assertGapShape(gapOf(result.gaps, 'spec_format_invalid'), { owner: 'agent', layer: 'spec', path: 'specs/notifications/spec.md', line: 18, text: 'The system MUST additionally email every administrator.' });
 });
 
 test('unknown sources, orphan provenance and duplicate stable IDs are rejected', (t) => {
@@ -283,9 +357,10 @@ test('existing project records real Git base and Map identity; stale contents bl
   writeFileSync(mapFile, JSON.stringify({ snapshot_id: 'sha256:example', analysis_status: 'partial', mode: 'map' }));
   const created = newSpec(repo, 'report-notifications', { map: mapFile });
   // Partial, but no step is named from code. Without a source, only its
-  // freshness is left unchecked.
-  assert.equal(created.warnings.length, 1);
-  assert.match(created.warnings[0], /^Whether this Map still matches the code was not checked: it does not record the code it was read from/);
+  // freshness is left unchecked. (The other warning is about .dockerignore.)
+  const mapWarnings = created.warnings.filter((warning) => !/\.dockerignore/.test(warning));
+  assert.equal(mapWarnings.length, 1, JSON.stringify(created.warnings));
+  assert.match(mapWarnings[0], /^Whether this Map still matches the code was not checked: it does not record the code it was read from/);
   assert.equal(created.context.code.base_commit, git(['rev-parse', 'HEAD']));
   assert.equal(created.context.map.status, 'available');
   assert.equal(created.context.map.analysis_status, 'partial');
@@ -301,7 +376,13 @@ test('existing project records real Git base and Map identity; stale contents bl
   writeFileSync(mapFile, JSON.stringify({ snapshot_id: 'sha256:changed', analysis_status: 'complete' }));
   assert.equal(validateSpec(repo, 'report-notifications').ready_for_eval_design, true);
   writeFileSync(copy, JSON.stringify({ snapshot_id: 'sha256:changed', analysis_status: 'complete' }));
-  assert.throws(() => exportSpec(repo, 'report-notifications'), /Referenced Map changed/);
+  assert.throws(() => exportSpec(repo, 'report-notifications'), (error) => {
+    assertGapShape(gapOf(error.gaps, 'map_changed'), {
+      owner: 'agent', layer: 'spec', path: 'openspec/changes/report-notifications/business-map.json', digest: created.context.map.sha256,
+    });
+    assert.match(error.message, /The Map openspec\/changes\/report-notifications\/business-map\.json no longer has the digest genesis\.json records/);
+    return true;
+  });
 });
 
 test('files Genesis writes do not make the application working tree dirty', (t) => {
@@ -333,7 +414,11 @@ test('existing projects without a Map remain usable with an explicit limitation'
   const result = validateSpec(repo, 'report-notifications');
   assert.equal(result.ready_for_eval_design, true);
   assert.match(result.warnings.join('\n'), /No Map supplied/);
-  assert.equal(checkWorkflow(repo, 'spec-export', 'report-notifications').status, 'ready');
+  const status = statusOf(t, repo);
+  assert.equal(status.layers.spec.map, null);
+  assert.equal(status.layers.spec.draft.ready_for_export, true, JSON.stringify(status.layers.spec.draft.gaps));
+  assert.match(status.layers.spec.draft.warnings.join('\n'), /No Map supplied/);
+  assert.equal(actionOf(status, 'spec', 'export').allowed, true);
 });
 
 test('without a recorded Map, impact.md flow IDs are left unchecked and validation says so', (t) => {
@@ -346,7 +431,7 @@ test('without a recorded Map, impact.md flow IDs are left unchecked and validati
   writeFileSync(impactFile, '---\ngenesis_impact: 1\nentries:\n  - flow: flow_doesnotexist\n    entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:2\n---\n');
   const result = validateSpec(repo, 'report-notifications');
   assert.equal(result.ready_for_eval_design, true, JSON.stringify(result.errors));
-  assert.ok(result.warnings.includes('impact.md names flow IDs (flow_doesnotexist), but no Map is recorded, so they could not be checked. A flow ID comes from the recorded Map; without one, leave `flow` out.'), JSON.stringify(result.warnings));
+  assert.ok(result.warnings.includes('impact.md names flow IDs (flow_doesnotexist), but no Map is recorded, so they could not be checked. A flow ID comes from the recorded Map.'), JSON.stringify(result.warnings));
   writeFileSync(impactFile, '---\ngenesis_impact: 1\nentries:\n  - entry: POST /reports\n    effect: changes\n    evidence: app/notify.py:2\n---\n');
   assert.doesNotMatch(validateSpec(repo, 'report-notifications').warnings.join('\n'), /flow IDs/);
 });
@@ -397,22 +482,36 @@ test('init keeps a .gitignore of the user\'s own in a skill folder and names ski
   git(['commit', '-q', '-m', 'Commit installed skills']);
   const again = initProject(repo, 'new', 'claude');
   assert.equal(again.warnings.length, 1);
-  assert.match(again.warnings[0], /git rm -r --cached \.claude\/skills\/agent-spec \.claude\/skills\/write-eval`/);
+  assert.equal(again.warnings[0], 'Git still tracks skill folders an earlier install committed: .claude/skills/agent-spec, .claude/skills/write-eval. They point at this machine\'s checkout, and their .gitignore does not untrack them; `git rm -r --cached` of those folders takes them out of Git and leaves the files on disk.');
   assert.doesNotMatch(again.warnings[0], /run-eval|loop-and-implement/);
 });
 
-test('the Map of a Genesis change review is refused: it covers only the flows that change touched', (t) => {
+test('the Map of a Genesis change review is accepted and recorded as covering only what that review analyzed', (t) => {
   const repo = project(t, 'existing');
   const review = path.join(repo, '.genesis/out/latest');
   mkdirSync(review, { recursive: true });
   writeFileSync(path.join(review, 'business-map.json'), JSON.stringify({ snapshot_id: 'sha256:review', analysis_status: 'complete' }));
   writeFileSync(path.join(review, 'change-report.json'), '{}');
-  assert.throws(() => newSpec(repo, 'after-review', { map: path.join(review, 'business-map.json') }), /change review/);
-  assert.equal(existsSync(path.join(repo, 'openspec/changes/after-review')), false);
-  rmSync(path.join(review, 'change-report.json'));
-  const created = newSpec(repo, 'after-map', { map: path.join(review, 'business-map.json') });
+  // change-report.json beside it marks a change review, whatever the Map says.
+  const created = newSpec(repo, 'after-review', { map: path.join(review, 'business-map.json') });
   assert.equal(created.context.map.status, 'available');
-  assert.equal(created.context.map.path, 'openspec/changes/after-map/business-map.json');
+  assert.equal(created.context.map.path, 'openspec/changes/after-review/business-map.json');
+  assert.equal(created.context.map.mode, 'change');
+  assert.equal(created.context.map.coverage_scope, 'partial');
+  assert.ok(created.warnings.includes('This Map comes from a Genesis change review (change-report.json is beside it): it covers only what that review analyzed, not the whole project. It is recorded with coverage_scope partial, and a Genesis review that starts from it covers only those flows.'), JSON.stringify(created.warnings));
+  // Every check repeats that limit, and the export records it and shows it to the user.
+  writeSpec(repo, fixture, 'after-review');
+  const result = validateSpec(repo, 'after-review');
+  assert.equal(result.ready_for_eval_design, true, JSON.stringify(result.errors));
+  assert.ok(result.warnings.includes('This Map comes from a Genesis change review: it covers only what that review analyzed (coverage_scope partial), and a Genesis review started from it covers only those flows.'), JSON.stringify(result.warnings));
+  const exported = exportSpec(repo, 'after-review');
+  assert.equal(readJSON(exported.file).context.map.coverage_scope, 'partial');
+  assert.deepEqual(exported.must_show.map, [{ freshness: 'unverified', mode: 'change', analysis_status: 'complete', coverage_scope: 'partial' }]);
+  // Without the report beside it, the same Map is of unknown mode.
+  rmSync(path.join(review, 'change-report.json'));
+  const created2 = newSpec(repo, 'after-map', { map: path.join(review, 'business-map.json') });
+  assert.equal(created2.context.map.mode, 'unknown');
+  assert.equal('coverage_scope' in created2.context.map, false);
   assert.ok(existsSync(path.join(repo, 'openspec/changes/after-map/business-map.json')));
 });
 
@@ -445,7 +544,7 @@ test('the Map is copied byte for byte, from anywhere, and a partial Map with cod
   assert.equal(existsSync(path.join(repo, 'openspec/changes/no-map/business-map.json')), false);
 });
 
-test('a Map whose mode is change is refused, and one without a mode is used as unknown, never as map', (t) => {
+test('a Map whose mode is change is recorded as partial coverage, one of a mode Genesis does not know is refused, and one without a mode is used as unknown, never as map', (t) => {
   const repo = project(t, 'existing');
   const outside = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-map-'));
   t.after(() => rmSync(outside, { recursive: true, force: true }));
@@ -456,26 +555,30 @@ test('a Map whose mode is change is refused, and one without a mode is used as u
     return file;
   };
   const base = { snapshot_id: 'sha256:modes', analysis_status: 'complete' };
-  assert.throws(() => newSpec(repo, 'from-review', { map: write('review.json', { ...base, mode: 'change' }) }),
-    /comes from a Genesis change review \(its mode is change\) and covers only what that review analyzed/);
-  assert.equal(existsSync(path.join(repo, 'openspec/changes/from-review')), false);
+  const review = newSpec(repo, 'from-review', { map: write('review.json', { ...base, mode: 'change' }) });
+  assert.equal(review.context.map.mode, 'change');
+  assert.equal(review.context.map.coverage_scope, 'partial');
+  assert.match(review.warnings.join('\n'), /comes from a Genesis change review \(its mode is change\): it covers only what that review analyzed, not the whole project\. It is recorded with coverage_scope partial/);
   assert.throws(() => newSpec(repo, 'odd-mode', { map: write('odd.json', { ...base, mode: 'diff' }) }), /mode Genesis EDD does not know: "diff"/);
   assert.equal(existsSync(path.join(repo, 'openspec/changes/odd-mode')), false);
 
   const full = newSpec(repo, 'from-map', { map: write('map.json', { ...base, mode: 'map' }) });
   assert.equal(full.context.map.mode, 'map');
-  assert.doesNotMatch(full.warnings.join('\n'), /does not say whether/);
+  assert.equal('coverage_scope' in full.context.map, false);
+  assert.doesNotMatch(full.warnings.join('\n'), /does not say whether|change review/);
   // A Map from Genesis before mode existed may be either kind.
   for (const [change, value] of [['from-older', base], ['null-mode', { ...base, mode: null }]]) {
     const older = newSpec(repo, change, { map: write(`${change}.json`, value) });
     assert.equal(older.context.map.mode, 'unknown');
-    assert.match(older.warnings.join('\n'), /does not say whether it maps the whole project or a change review: Genesis before 9c0c914 wrote no mode\. Nothing beside it marks a review, so it is used and recorded with mode unknown\./);
+    assert.ok(older.warnings.includes('This Map does not say whether it maps the whole project or a change review: Genesis before 9c0c914 wrote no mode, and nothing beside it marks a review, so it is recorded with mode unknown.'), JSON.stringify(older.warnings));
   }
   // change-report.json beside a Map still marks a review, whatever its mode says.
   const latest = write('latest/business-map.json', { ...base, mode: 'map' });
   writeFileSync(path.join(path.dirname(latest), 'change-report.json'), '{}');
-  assert.throws(() => newSpec(repo, 'beside-report', { map: latest }), /change-report\.json is beside it/);
-  assert.equal(existsSync(path.join(repo, 'openspec/changes/beside-report')), false);
+  const beside = newSpec(repo, 'beside-report', { map: latest });
+  assert.equal(beside.context.map.mode, 'change');
+  assert.equal(beside.context.map.coverage_scope, 'partial');
+  assert.match(beside.warnings.join('\n'), /comes from a Genesis change review \(change-report\.json is beside it\)/);
 });
 
 // A Git project with the given application files committed.
@@ -543,7 +646,7 @@ test('a clean, complete Map is verified while every file it read is unchanged at
   // Those edits are named, since impact.md evidence is read from them.
   const head = git('rev-parse', 'HEAD').slice(0, 7);
   assert.deepEqual(edited.warnings.filter((warning) => /uncommitted edits/.test(warning)), [
-    `1 of the files this Map was read from has uncommitted edits (app/notify.py). Its freshness compares commit ${head}, not those edits, while impact.md evidence is read from the working tree. If the edits are not part of this request, the Map and that evidence may describe different code: tell the user.`,
+    `1 of the files this Map was read from has uncommitted edits (app/notify.py). Its freshness compares commit ${head}, not those edits, while impact.md evidence is read from the working tree, so the Map and that evidence may describe different code.`,
   ]);
   // Edits to files the Map did not read are not named.
   git('checkout', '--', 'app/notify.py');
@@ -562,7 +665,7 @@ test('a Map is stale once a file it read changed or is gone; a dirty or partial 
 
   const stale = newSpec(repo, 'stale', { map: sourcedMap(t, source) });
   assert.equal(stale.context.map.freshness, 'stale');
-  assert.match(stale.warnings.join('\n'), new RegExp(`This Map no longer matches the code of commit ${head.slice(0, 7)}: 2 of the 3 files it was read from changed or are gone since Genesis read them \\(app/notify\\.py, docs/报告 notes\\.md\\)\\. .*map the project again with \`/genesis map\`, remove the change folder \`spec new\` just created`));
+  assert.match(stale.warnings.join('\n'), new RegExp(`This Map no longer matches the code of commit ${head.slice(0, 7)}: 2 of the 3 files it was read from changed or are gone since Genesis read them \\(app/notify\\.py, docs/报告 notes\\.md\\)\\. Its flows may describe code that is not there anymore\\. Until the change is first exported, \`spec remap\` can replace it with a Map of this code\\.`));
   // Files left out do not hide a file that changed.
   assert.equal(newSpec(repo, 'stale-partial', { map: sourcedMap(t, { ...source, integrity_status: 'partial' }) }).context.map.freshness, 'stale');
   // Read with uncommitted changes, a digest may be of code no commit holds.
@@ -611,32 +714,53 @@ test('freshness reads every listed file as stored, binary content and more than 
   assert.match(stale.warnings.join('\n'), /1 of the 701 files it was read from changed or are gone since Genesis read them \(src\/m650\.py\)/);
 });
 
-test('validate, export and workflow check repeat what genesis.json recorded about the Map', (t) => {
+test('validate and export work the Map\'s facts out again from its copy, against the commit checked out now, whatever genesis.json says', (t) => {
   const { repo, git } = committedProject(t, APP);
   const head = git('rev-parse', 'HEAD').slice(0, 7);
   const source = sourceOf(git('rev-parse', 'HEAD'), APP);
   const notes = (change) => validateSpec(repo, change).warnings.filter((warning) => /Map/.test(warning));
   newSpec(repo, 'fresh', { map: sourcedMap(t, source) });
   writeSpec(repo, fixture, 'fresh');
-  const verified = [`The Map was verified against the code of base commit ${head}.`];
+  const verified = [`The Map was verified against the code of commit ${head}.`];
   assert.deepEqual(notes('fresh'), verified);
-  const check = checkWorkflow(repo, 'spec-export', 'fresh');
-  assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
-  assert.deepEqual(check.warnings.filter((warning) => /Map/.test(warning)), verified);
-  assert.deepEqual(exportSpec(repo, 'fresh').warnings.filter((warning) => /Map/.test(warning)), verified);
-  assert.deepEqual(checkWorkflow(repo, 'write-eval', 'fresh').warnings.filter((warning) => /Map/.test(warning)), verified);
+  const exported = exportSpec(repo, 'fresh');
+  assert.deepEqual(exported.warnings.filter((warning) => /Map/.test(warning)), verified);
+  assert.equal(readJSON(exported.file).context.map.freshness, 'verified');
+  // A verified Map of the whole project limits nothing the user must hear about.
+  assert.equal('map' in exported.must_show, false);
 
-  // A stale Map stays usable, and every check says so, not only spec new.
+  // After a commit that changes a file the Map read, the same Map is stale
+  // when checked now. The export made before keeps what it recorded.
   writeFiles(repo, { 'app/notify.py': 'def notify(report):\n    return "queued"\n' });
   git('commit', '-q', '-am', 'Queue notices');
   const later = git('rev-parse', 'HEAD').slice(0, 7);
+  const stale = `This Map no longer matches the code of commit ${later}: 1 of the 3 files it was read from changed or are gone since Genesis read them (app/notify.py). Its flows may describe code that is not there anymore. Until the change is first exported, \`spec remap\` can replace it with a Map of this code.`;
+  const differs = 'genesis.json records the Map differently from what the Map gives now: freshness verified there, stale from the Map. The Map decides, and an export records what it gives.';
+  assert.deepEqual(notes('fresh'), [differs, stale]);
+  assert.deepEqual(validateSpec(repo, 'fresh').map_differs, [{ field: 'freshness', recorded: 'verified', computed: 'stale' }]);
+  assert.equal(readJSON(exported.file).context.map.freshness, 'verified');
+
+  // genesis.json edited to call a stale Map verified changes nothing: the
+  // export records what the Map gives, and shows the user that it is stale.
   newSpec(repo, 'stale', { map: sourcedMap(t, source) });
   writeSpec(repo, fixture, 'stale');
-  const stale = [`This Map no longer matched the code of base commit ${later} when \`spec new\` checked it (freshness stale): its flows may describe code that is not there anymore. Tell the user. To write the Spec against the code as it is, map the project again with \`/genesis map\` and create a new change with the new Map; do not edit genesis.json.`];
-  assert.deepEqual(notes('stale'), stale);
-  const staleCheck = checkWorkflow(repo, 'spec-export', 'stale');
-  assert.equal(staleCheck.status, 'ready');
-  assert.deepEqual(staleCheck.warnings.filter((warning) => /Map/.test(warning)), stale);
+  assert.deepEqual(notes('stale'), [stale]);
+  const contextFile = path.join(repo, 'openspec/changes/stale/genesis.json');
+  const context = readJSON(contextFile);
+  assert.equal(context.map.freshness, 'stale');
+  writeFileSync(contextFile, `${JSON.stringify({ ...context, map: { ...context.map, freshness: 'verified' } }, null, 2)}\n`);
+  const edited = validateSpec(repo, 'stale');
+  assert.equal(edited.ready_for_eval_design, true, JSON.stringify(edited.errors));
+  assert.deepEqual(edited.map_differs, [{ field: 'freshness', recorded: 'verified', computed: 'stale' }]);
+  assert.deepEqual(edited.warnings.filter((warning) => /Map/.test(warning)), [differs, stale]);
+  // workflow status shows the draft with the same warnings.
+  const draft = statusOf(t, repo, 'stale').layers.spec.draft;
+  assert.deepEqual(draft.map_differs, edited.map_differs);
+  assert.ok(draft.warnings.includes(stale), JSON.stringify(draft.warnings));
+  const staleExport = exportSpec(repo, 'stale');
+  assert.equal(readJSON(staleExport.file).context.map.freshness, 'stale');
+  assert.equal(staleExport.map.freshness, 'stale');
+  assert.deepEqual(staleExport.must_show.map, [{ freshness: 'stale', mode: 'map', analysis_status: 'complete' }]);
 
   // A Map without source or mode, partial, with steps named from code.
   const older = path.join(repo, 'older.json');
@@ -647,19 +771,24 @@ test('validate, export and workflow check repeat what genesis.json recorded abou
   newSpec(repo, 'older', { map: older });
   writeSpec(repo, fixture, 'older');
   assert.deepEqual(notes('older'), [
-    `Whether this Map still matched the code of base commit ${later} was not checked (freshness unverified): when \`spec new\` recorded it, the Map had no source, had been read with uncommitted changes or had left files out, or there was no commit to compare it with.`,
-    'This Map does not say whether it maps the whole project or a change review (mode unknown). Make sure it is a full map: the Map of a `/genesis review` covers only what that review analyzed.',
-    'This Map is partial: some flows are not described yet or leave code unaccounted for, or files were left out. Record that limit; do not call its coverage complete.',
-    '2 of the 3 steps in this Map belong to flows Genesis has not described yet and are named from the source code. That code goes into Git with the Map copy: tell the user before it is committed.',
+    'Whether this Map still matches the code was not checked: it does not record the code it was read from, which Genesis before 9c0c914 did not do. A Map from Genesis 9c0c914 or later can be checked.',
+    'This Map does not say whether it maps the whole project or a change review (mode unknown).',
+    'This Map is partial: some flows are not described yet or leave code unaccounted for, or files were left out.',
+    '2 of the 3 steps in this Map belong to flows Genesis has not described yet and are named from the source code, which goes into Git with the Map copy.',
   ]);
+  assert.deepEqual(exportSpec(repo, 'older').must_show.map, [{ freshness: 'unverified', mode: 'unknown', analysis_status: 'partial' }]);
 
-  // A change made before spec new recorded freshness says only that.
-  const contextFile = path.join(repo, 'openspec/changes/fresh/genesis.json');
-  const context = readJSON(contextFile);
-  delete context.map.freshness;
-  delete context.map.mode;
-  writeFileSync(contextFile, `${JSON.stringify(context, null, 2)}\n`);
-  assert.deepEqual(notes('fresh'), ['Whether this Map matches the code was not checked: the change was made before `spec new` recorded freshness.']);
+  // A genesis.json without freshness or mode, as spec new wrote before it
+  // recorded them: the Map gives both.
+  const freshContext = path.join(repo, 'openspec/changes/fresh/genesis.json');
+  const recorded = readJSON(freshContext);
+  delete recorded.map.freshness;
+  delete recorded.map.mode;
+  writeFileSync(freshContext, `${JSON.stringify(recorded, null, 2)}\n`);
+  assert.deepEqual(notes('fresh'), [
+    'genesis.json records the Map differently from what the Map gives now: mode nothing there, map from the Map; freshness nothing there, stale from the Map. The Map decides, and an export records what it gives.',
+    stale,
+  ]);
   assert.doesNotMatch(validateSpec(repo, 'fresh').warnings.join('\n'), /not automatically verified/);
 });
 
@@ -678,9 +807,9 @@ test('a complete Map records its entry coverage and warns about entries outside 
   assert.equal(created.context.map.analysis_status, 'complete');
   assert.deepEqual(created.context.map.coverage, counts);
   const outside = (warnings) => warnings.filter((warning) => /planned flows/.test(warning));
-  assert.deepEqual(outside(created.warnings), ['This Map\'s planned flows cover 1 of the 4 entries Genesis found: 1 skipped (1 budget) and 2 not handled. Its analysis_status says whether those flows are finished, not whether the whole project is mapped. If the request touches an entry outside them, read its code, or map it with `/genesis map`.']);
+  assert.deepEqual(outside(created.warnings), ['This Map\'s planned flows cover 1 of the 4 entries Genesis found: 1 skipped (1 budget) and 2 not handled. Its analysis_status says whether those flows are finished, not whether the whole project is mapped, so an entry outside them is not described by the Map.']);
   writeSpec(repo, fixture, 'some');
-  assert.deepEqual(outside(validateSpec(repo, 'some').warnings), ['This Map\'s planned flows cover 1 of the 4 entries Genesis found: 1 skipped and 2 not handled. Its analysis_status says whether those flows are finished, not whether the whole project is mapped. If the request touches an entry outside them, read its code, or map it with `/genesis map`.']);
+  assert.deepEqual(outside(validateSpec(repo, 'some').warnings), ['This Map\'s planned flows cover 1 of the 4 entries Genesis found: 1 skipped and 2 not handled. Its analysis_status says whether those flows are finished, not whether the whole project is mapped, so an entry outside them is not described by the Map.']);
   assert.equal(readJSON(exportSpec(repo, 'some').file).context.map.coverage.entries_unhandled, 2);
 
   // Every entry planned: recorded, no warning. No coverage: nothing recorded.
@@ -705,14 +834,14 @@ test('a committed Spec and its Map copy check out on another clone; Git gaps are
   writeFileSync(path.join(repo, '.genesis/.gitignore'), 'sessions/\nout/\n');
   const original = path.join(repo, '.genesis/out/ses_1/business-map.json');
   writeFileSync(original, JSON.stringify({ snapshot_id: 'sha256:one', analysis_status: 'complete', flows: [{ flow_id: 'flow_submit', name: 'Submit a report' }] }));
-  newSpec(repo, 'report-notifications', { map: original });
+  const created = newSpec(repo, 'report-notifications', { map: original });
   writeSpec(repo);
   const before = validateSpec(repo, 'report-notifications');
   assert.equal(before.ready_for_eval_design, true, JSON.stringify(before.errors));
   assert.doesNotMatch(before.warnings.join('\n'), /Git/);
   // An ignore rule that would keep the copy out is named before the first commit.
   writeFileSync(path.join(repo, '.gitignore'), 'business-map.json\n');
-  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /openspec\/changes\/report-notifications\/business-map\.json is ignored by Git, so other clones cannot check this Spec against its Map\. Commit it with the Spec\./);
+  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /openspec\/changes\/report-notifications\/business-map\.json is ignored by Git, so other clones cannot check this Spec against its Map\./);
   rmSync(path.join(repo, '.gitignore'));
   const exported = exportSpec(repo, 'report-notifications');
   git(repo, ['add', '-A']);
@@ -726,15 +855,20 @@ test('a committed Spec and its Map copy check out on another clone; Git gaps are
   const there = validateSpec(clone, 'report-notifications');
   assert.equal(there.ready_for_eval_design, true, JSON.stringify(there.errors));
   assert.doesNotMatch(there.warnings.join('\n'), /Git/);
-  assert.equal(checkWorkflow(clone, 'write-eval', 'report-notifications').handoff.id, exported.id);
-  // A missing copy is restored from Git; a link to it would dangle elsewhere.
+  const status = statusOf(t, clone);
+  assert.equal(status.layers.spec.export_holds, true, JSON.stringify(status.layers.spec.gaps));
+  assert.equal(status.layers.spec.export.id, exported.id);
+  // A missing copy is the Spec checks' finding, with the digest to restore
+  // it by. The export later stages read is checked by its digest and holds.
   const cloned = path.join(clone, 'openspec/changes/report-notifications/business-map.json');
   const kept = readFileSync(cloned);
   rmSync(cloned);
-  const gone = checkWorkflow(clone, 'write-eval', 'report-notifications');
-  assert.equal(gone.gaps[0].code, 'map_unavailable');
-  assert.equal(gone.next.owner, 'agent');
-  assert.equal(gone.gaps[0].message, 'Referenced Map is unavailable: openspec/changes/report-notifications/business-map.json is missing. It is committed with the Spec, so restore it from Git. Do not edit genesis.json.');
+  assertGapShape(gapOf(validateSpec(clone, 'report-notifications').gaps, 'map_unavailable'), {
+    owner: 'agent', layer: 'spec', path: 'openspec/changes/report-notifications/business-map.json', digest: created.context.map.sha256,
+    message: `The Map copy openspec/changes/report-notifications/business-map.json is missing. It is committed with the Spec, with digest ${created.context.map.sha256}.`,
+  });
+  assert.equal(frozenSpec(clone, 'report-notifications').handoff.id, exported.id);
+  // A link to it would dangle on other clones.
   writeFileSync(path.join(clone, 'map-elsewhere.json'), kept);
   symlinkSync('../../../map-elsewhere.json', cloned);
   assert.match(validateSpec(clone, 'report-notifications').errors.join('\n'), /business-map\.json is a symbolic link, which other clones cannot follow/);
@@ -742,7 +876,7 @@ test('a committed Spec and its Map copy check out on another clone; Git gaps are
   // genesis.json committed without the copy beside it.
   const copy = 'openspec/changes/report-notifications/business-map.json';
   git(repo, ['rm', '-q', '--cached', copy]);
-  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /business-map\.json is not in Git, though genesis\.json is, so other clones cannot check this Spec against its Map\. Commit it with the Spec\./);
+  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /business-map\.json is not in Git, though genesis\.json is, so other clones cannot check this Spec against its Map\./);
   writeFileSync(path.join(repo, '.gitignore'), 'business-map.json\n');
   assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /business-map\.json is ignored by Git/);
 });
@@ -777,13 +911,18 @@ test('a checkout with CRLF line ends keeps the identity of the Spec, its export 
   for (const file of ['specs/notifications/spec.md', 'impact.md', 'business-map.json']) {
     assert.match(readFileSync(path.join(clone, 'openspec/changes/report-notifications', file), 'utf8'), /\r\n/, file);
   }
-  const check = checkWorkflow(clone, 'write-eval', 'report-notifications');
-  assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
-  assert.equal(check.handoff.id, exported.id);
-  assert.equal(exportSpec(clone, 'report-notifications').id, exported.id);
+  const status = statusOf(t, clone);
+  assert.equal(status.layers.spec.export_holds, true, JSON.stringify(status.layers.spec.gaps));
+  assert.equal(status.layers.spec.export.id, exported.id);
+  assert.deepEqual(status.layers.spec.gaps, []);
+  const checked = validateSpec(clone, 'report-notifications');
+  assert.equal(checked.ready_for_eval_design, true, JSON.stringify(checked.errors));
+  const again = exportSpec(clone, 'report-notifications');
+  assert.equal(again.id, exported.id);
+  assert.equal(again.unchanged, true);
   // A Map copy with other content still fails, whatever its line ends.
   writeFileSync(path.join(clone, 'openspec/changes/report-notifications/business-map.json'), '{\r\n  "snapshot_id": "sha256:other"\r\n}\r\n');
-  assert.equal(checkWorkflow(clone, 'write-eval', 'report-notifications').gaps[0].code, 'map_changed');
+  assertGapShape(gapOf(validateSpec(clone, 'report-notifications').gaps, 'map_changed'), { owner: 'agent', layer: 'spec' });
 });
 
 test('a Map written with CRLF line ends keeps its identity in a checkout with LF line ends', (t) => {
@@ -801,7 +940,7 @@ test('a Map written with CRLF line ends keeps its identity in a checkout with LF
   newSpec(repo, 'report-notifications', { map: mapFile });
   writeSpec(repo);
   const exported = exportSpec(repo, 'report-notifications');
-  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').status, 'ready');
+  assert.equal(validateSpec(repo, 'report-notifications').ready_for_eval_design, true);
   git(repo, ['add', '-A']);
   git(repo, ['commit', '-q', '-m', 'Spec']);
 
@@ -810,12 +949,15 @@ test('a Map written with CRLF line ends keeps its identity in a checkout with LF
   git(os.tmpdir(), ['clone', '-q', '-c', 'core.autocrlf=false', '-c', 'core.eol=lf', repo, clone]);
   const copy = path.join(clone, 'openspec/changes/report-notifications/business-map.json');
   assert.doesNotMatch(readFileSync(copy, 'utf8'), /\r\n/);
-  const check = checkWorkflow(clone, 'write-eval', 'report-notifications');
-  assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
-  assert.equal(check.handoff.id, exported.id);
+  const checked = validateSpec(clone, 'report-notifications');
+  assert.equal(checked.ready_for_eval_design, true, JSON.stringify(checked.errors));
+  const status = statusOf(t, clone);
+  assert.equal(status.layers.spec.export_holds, true, JSON.stringify(status.layers.spec.gaps));
+  assert.equal(status.layers.spec.export.id, exported.id);
+  assert.equal(exportSpec(clone, 'report-notifications').id, exported.id);
   // A Map copy with other content still fails, whatever its line ends.
   writeFileSync(copy, '{\n  "snapshot_id": "sha256:other"\n}\n');
-  assert.equal(checkWorkflow(clone, 'write-eval', 'report-notifications').gaps[0].code, 'map_changed');
+  assertGapShape(gapOf(validateSpec(clone, 'report-notifications').gaps, 'map_changed'), { owner: 'agent', layer: 'spec' });
 });
 
 test('a change made before the Map was copied keeps its genesis.json; a copy with the recorded digest stands in', (t) => {
@@ -843,32 +985,37 @@ test('a change made before the Map was copied keeps its genesis.json; a copy wit
   // recorded digest decides, and impact is still checked against it.
   const bytes = readFileSync(original);
   writeFileSync(original, '{}');
-  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').gaps[0].code, 'map_changed');
-  assert.match(checkWorkflow(repo, 'write-eval', 'report-notifications').gaps[0].message, /Genesis rewrites \.genesis\/out\/latest\/ on every run, so look in the \.genesis\/out\/<session>\/ folders\. Copy it to openspec\/changes\/report-notifications\/business-map\.json/);
+  const rewritten = gapOf(validateSpec(repo, 'report-notifications').gaps, 'map_changed');
+  assertGapShape(rewritten, { owner: 'agent', layer: 'spec', path: '.genesis/out/ses_1/business-map.json', digest: context.map.sha256 });
+  assert.match(rewritten.message, /^The Map \.genesis\/out\/ses_1\/business-map\.json no longer has the digest genesis\.json records, sha256:[0-9a-f]{64}\. Genesis rewrites \.genesis\/out\/latest\/ on every run; the \.genesis\/out\/<session>\/ folders keep earlier Maps\./);
   writeFileSync(path.join(change, 'business-map.json'), bytes);
-  let changed = checkWorkflow(repo, 'write-eval', 'report-notifications');
-  assert.equal(changed.status, 'ready', JSON.stringify(changed.gaps));
-  assert.equal(changed.handoff.id, exported.id);
+  const restored = validateSpec(repo, 'report-notifications');
+  assert.equal(restored.ready_for_eval_design, true, JSON.stringify(restored.errors));
+  assert.equal(frozenSpec(repo, 'report-notifications').handoff.id, exported.id);
+  assert.equal(exportSpec(repo, 'report-notifications').id, exported.id);
   const impactFile = path.join(change, 'impact.md');
-  writeFileSync(impactFile, '---\ngenesis_impact: 1\nentries:\n  - flow: flow_unknown\n    entry: POST /reports\n    effect: changes\n    evidence: openspec/changes/report-notifications/genesis.json\n---\n');
-  assert.match(validateSpec(repo, 'report-notifications').errors.join('\n'), /not in the recorded Map: flow_unknown/);
+  const impact = (flow) => writeFileSync(impactFile, `---\ngenesis_impact: 1\nentries:\n  - flow: ${flow}\n    entry: POST /reports\n    effect: changes\n    evidence: openspec/changes/report-notifications/genesis.json\n---\n`);
+  impact('flow_unknown');
+  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /impact\.md: entries\[0\] flow is not in the recorded Map: flow_unknown/);
+  impact('flow_submit');
+  assert.doesNotMatch(validateSpec(repo, 'report-notifications').warnings.join('\n'), /not in the recorded Map/);
   rmSync(impactFile);
   rmSync(path.join(change, 'business-map.json'));
 
   // Another clone: Genesis's output is not there.
   rmSync(path.join(repo, '.genesis/out'), { recursive: true });
-  let result = checkWorkflow(repo, 'write-eval', 'report-notifications');
-  assert.equal(result.gaps[0].code, 'map_unavailable');
-  assert.match(result.gaps[0].message, /genesis\.json records \.genesis\/out\/ses_1\/business-map\.json, which this checkout does not have \(Genesis keeps its output out of Git\)\. Copy that file .* to openspec\/changes\/report-notifications\/business-map\.json/);
+  const missing = gapOf(validateSpec(repo, 'report-notifications').gaps, 'map_unavailable');
+  assertGapShape(missing, { owner: 'agent', layer: 'spec', path: 'openspec/changes/report-notifications/business-map.json', digest: context.map.sha256 });
+  assert.match(missing.message, /^genesis\.json records the Map at \.genesis\/out\/ses_1\/business-map\.json, which this checkout does not have \(Genesis keeps its output out of Git\), and openspec\/changes\/report-notifications\/business-map\.json is missing too\. A clone reads the Map from openspec\/changes\/report-notifications\/business-map\.json; its digest is sha256:/);
 
   // The copy stands in without touching genesis.json, so the export still matches.
   writeFileSync(path.join(change, 'business-map.json'), bytes);
-  result = checkWorkflow(repo, 'write-eval', 'report-notifications');
-  assert.equal(result.status, 'ready', JSON.stringify(result.gaps));
-  assert.equal(result.handoff.id, exported.id);
-  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /genesis\.json records the Map at \.genesis\/out\/ses_1\/business-map\.json; openspec\/changes\/report-notifications\/business-map\.json has the recorded digest and is used, as on other clones\./);
+  const result = validateSpec(repo, 'report-notifications');
+  assert.equal(result.ready_for_eval_design, true, JSON.stringify(result.errors));
+  assert.equal(exportSpec(repo, 'report-notifications').id, exported.id);
+  assert.match(result.warnings.join('\n'), /genesis\.json records the Map at \.genesis\/out\/ses_1\/business-map\.json; openspec\/changes\/report-notifications\/business-map\.json has the recorded digest and is used, as on other clones\./);
   writeFileSync(path.join(change, 'business-map.json'), '{}');
-  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').gaps[0].code, 'map_changed');
+  assert.ok(gapOf(validateSpec(repo, 'report-notifications').gaps, 'map_changed'));
 });
 
 test('init is idempotent, preserves existing config and preflights conflicts', (t) => {
@@ -960,26 +1107,38 @@ test('init renames the unmodified legacy skill without changing specs or handoff
   assert.deepEqual(repeated.migrated, []);
 });
 
-test('legacy migration preserves custom files and preflights all destinations', (t) => {
-  for (const target of ['skill', 'extra', 'schema', 'destination']) {
-    const { repo, schema } = legacyInstallation(t);
-    const oldSchema = readFileSync(schema, 'utf8');
-    const files = {
-      skill: '.claude/skills/genesis-spec/SKILL.md',
-      extra: '.claude/skills/genesis-spec/custom.md',
-      schema: 'openspec/schemas/genesis-spec/schema.yaml',
-      destination: '.claude/skills/agent-spec/SKILL.md',
-    };
+test('legacy migration keeps an edited legacy skill or destination as it is and lists it, and a differing schema stops init before it writes', (t) => {
+  const files = {
+    skill: '.claude/skills/genesis-spec/SKILL.md',
+    extra: '.claude/skills/genesis-spec/custom.md',
+    destination: '.claude/skills/agent-spec/SKILL.md',
+  };
+  for (const target of Object.keys(files)) {
+    const { repo } = legacyInstallation(t);
     const custom = path.join(repo, files[target]);
     mkdirSync(path.dirname(custom), { recursive: true });
     writeFileSync(custom, 'User customization\n');
-    assert.throws(() => initProject(repo, 'new', 'both'), /differs; left unchanged/);
-    assert.equal(readFileSync(custom, 'utf8'), 'User customization\n');
-    assert.equal(existsSync(path.join(repo, '.agents/skills/agent-spec')), false);
-    assert.equal(existsSync(path.join(repo, '.agents/skills/genesis-spec/SKILL.md')), true);
-    assert.equal(existsSync(path.join(repo, '.claude/skills/genesis-spec/SKILL.md')), true);
-    if (target !== 'schema') assert.equal(readFileSync(schema, 'utf8'), oldSchema);
+    const result = initProject(repo, 'new', 'both');
+    assert.equal(readFileSync(custom, 'utf8'), 'User customization\n', target);
+    const conflict = result.conflicts.find((entry) => entry.file === files[target]);
+    assert.ok(conflict, `${target}: ${JSON.stringify(result.conflicts)}`);
+    assert.equal(conflict.installed, sha256('User customization\n'));
+    assert.match(result.warnings.join('\n'), new RegExp(`left as (it is|they are): .*${files[target].replaceAll('.', '\\.')}`), target);
+    // The untouched installation is migrated; the edited one is not.
+    assert.equal(existsSync(path.join(repo, '.agents/skills/genesis-spec')), false, target);
+    assert.equal(existsSync(path.join(repo, '.agents/skills/agent-spec/SKILL.md')), true, target);
+    assert.deepEqual(result.migrated, target === 'destination' ? ['.agents/skills/genesis-spec', '.claude/skills/genesis-spec'] : ['.agents/skills/genesis-spec'], target);
+    assert.equal(existsSync(path.join(repo, '.claude/skills/genesis-spec/SKILL.md')), target !== 'destination', target);
   }
+  // A file that is not a skill file, such as the schema, still stops init
+  // before anything is written.
+  const { repo, schema } = legacyInstallation(t);
+  writeFileSync(schema, 'User customization\n');
+  assert.throws(() => initProject(repo, 'new', 'both'), /Existing file differs; left unchanged/);
+  assert.equal(readFileSync(schema, 'utf8'), 'User customization\n');
+  assert.equal(existsSync(path.join(repo, '.agents/skills/agent-spec')), false);
+  assert.equal(existsSync(path.join(repo, '.agents/skills/genesis-spec/SKILL.md')), true);
+  assert.equal(existsSync(path.join(repo, '.claude/skills/genesis-spec/SKILL.md')), true);
 });
 
 test('init updates an untouched earlier agent-spec and leaves an edited one alone', (t) => {
@@ -992,11 +1151,21 @@ test('init updates an untouched earlier agent-spec and leaves an edited one alon
   writeFileSync(path.join(skill, 'references/spec-format.md'), readFileSync(path.join(legacyFixture, 'skill/references/spec-format.md'), 'utf8'));
   const result = initProject(repo, 'new', 'claude');
   assert.deepEqual([...result.updated].sort(), ['.claude/skills/agent-spec/SKILL.md', '.claude/skills/agent-spec/references/spec-format.md']);
+  assert.deepEqual(result.conflicts, []);
   assert.equal(readFileSync(path.join(skill, 'SKILL.md'), 'utf8'), readFileSync(path.join(ROOT, 'skills/agent-spec/SKILL.md'), 'utf8'));
   assert.deepEqual(initProject(repo, 'new', 'claude').updated, []);
-  writeFileSync(path.join(skill, 'SKILL.md'), `${previous}\nTeam note\n`);
-  assert.throws(() => initProject(repo, 'new', 'claude'), /differs; left unchanged/);
+  // An edited skill file stays as the project left it, and init lists it with
+  // both digests while it installs everything else.
+  const edited = `${previous}\nTeam note\n`;
+  writeFileSync(path.join(skill, 'SKILL.md'), edited);
+  rmSync(path.join(skill, 'references/spec-format.md'));
+  const again = initProject(repo, 'new', 'claude');
+  assert.deepEqual(again.conflicts, [{
+    file: '.claude/skills/agent-spec/SKILL.md', installed: sha256(edited), shipped: sha256(readFileSync(path.join(ROOT, 'skills/agent-spec/SKILL.md'), 'utf8')), skill: 'agent-spec',
+  }]);
+  assert.deepEqual(again.created, ['.claude/skills/agent-spec/references/spec-format.md']);
   assert.match(readFileSync(path.join(skill, 'SKILL.md'), 'utf8'), /Team note/);
+  assert.ok(again.warnings.includes('An installed skill file differs from what this release ships and was left as it is: .claude/skills/agent-spec/SKILL.md. Every other file is installed. A skill\'s LOCAL.md is the project\'s own place for additions; init never writes it.'), JSON.stringify(again.warnings));
 });
 
 test('init updates the released skills, their references and example files included, when they are untouched', (t) => {
@@ -1028,16 +1197,38 @@ test('bad names and symlink destinations cannot escape the selected project', (t
   assert.equal(existsSync(path.join(outside, 'skills')), false);
 });
 
-test('workflow check of the Spec stage does not touch .genesis, so a symlinked .genesis does not block it', (t) => {
+test('spec validate and spec export do not touch .genesis, so a symlinked .genesis does not block them', (t) => {
   const repo = project(t);
   const outside = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-outside-'));
   t.after(() => rmSync(outside, { recursive: true, force: true }));
   symlinkSync(outside, path.join(repo, '.genesis'), 'dir');
   newSpec(repo, 'report-notifications');
   writeSpec(repo);
-  const check = checkWorkflow(repo, 'spec-export', 'report-notifications');
-  assert.equal(check.status, 'ready', JSON.stringify(check.gaps));
-  assert.equal(check.next.action, 'export_spec');
+  const result = validateSpec(repo, 'report-notifications');
+  assert.equal(result.ready_for_eval_design, true, JSON.stringify(result.errors));
+  // The CLI reads the loop's phase before an export; no loop is not a refusal.
+  const response = spawnSync(process.execPath, [CLI, 'spec', 'export', 'report-notifications', '--repo', repo], { encoding: 'utf8' });
+  assert.equal(response.status, 0, response.stderr);
+  const exported = JSON.parse(response.stdout);
+  assert.equal(exported.ends_loop, false);
+  assert.equal(frozenSpec(repo, 'report-notifications').handoff.id, exported.id);
+  assert.deepEqual(readdirSync(outside), []);
+});
+
+test('workflow status reports a symlinked .genesis as a gap and still gives the Spec layer', (t) => {
+  useFakeTools(t);
+  const repo = project(t);
+  const outside = mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-outside-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  symlinkSync(outside, path.join(repo, '.genesis'), 'dir');
+  newSpec(repo, 'report-notifications');
+  writeSpec(repo);
+  // workflow status is read-only and always exits 0.
+  const response = spawnSync(process.execPath, [CLI, 'workflow', 'status', 'report-notifications', '--repo', repo], { encoding: 'utf8' });
+  assert.equal(response.status, 0, response.stderr);
+  const status = JSON.parse(response.stdout);
+  assert.equal(status.layers.spec.draft.ready_for_export, true);
+  assert.ok(status.gaps.some((gap) => /symbolic link|symlink/.test(gap.message)), JSON.stringify(status.gaps));
   assert.deepEqual(readdirSync(outside), []);
 });
 
@@ -1051,84 +1242,101 @@ test('CLI reports invalid specs and deferred commands with nonzero exit codes', 
   }
 });
 
-test('input checks route missing artifacts without creating them or requesting business decisions', (t) => {
+test('workflow status names what is missing, layer by layer, without creating it or asking the user for a decision', (t) => {
+  useFakeTools(t);
   const repo = projectRoot(mkdtempSync(path.join(os.tmpdir(), 'genesis-edd-inputs-')));
   t.after(() => rmSync(repo, { recursive: true, force: true }));
-  let result = checkWorkflow(repo, 'spec-export', 'report-notifications');
-  assert.equal(result.status, 'blocked');
-  assert.equal(result.gaps[0].code, 'project_missing');
-  assert.equal(result.next.owner, 'agent');
-  assert.equal(result.next.route, 'init');
+  let result = workflowStatus(repo, 'report-notifications');
+  assertGapShape(result.gaps[0], { code: 'project_uninitialized', owner: 'agent', layer: 'machine' });
+  assert.deepEqual(result.actions.map((entry) => entry.command[0]), ['init']);
   assert.equal(existsSync(path.join(repo, 'openspec')), false);
   initProject(repo, 'new', 'none');
-  result = checkWorkflow(repo, 'spec-export', 'report-notifications');
-  assert.equal(result.gaps[0].code, 'change_missing');
-  assert.equal(result.next.route, 'agent-spec');
+  result = workflowStatus(repo, 'report-notifications');
+  assertGapShape(result.layers.spec.gaps[0], { code: 'change_missing', owner: 'agent', layer: 'spec', path: 'openspec/changes/report-notifications/' });
+  assert.equal(actionOf(result, 'spec', 'new').allowed, true);
+  assert.equal(actionOf(result, 'spec', 'import', '--handoff').allowed, true);
+  assert.equal(actionOf(result, 'spec', 'export'), undefined);
   assert.equal(existsSync(path.join(repo, 'openspec/changes/report-notifications')), false);
   newSpec(repo, 'report-notifications');
-  result = checkWorkflow(repo, 'spec-export', 'report-notifications');
-  assert.equal(result.gaps[0].code, 'spec_missing');
-  assert.equal(result.gaps[0].kind, 'artifact');
-  assert.equal(result.next.owner, 'agent');
+  result = workflowStatus(repo, 'report-notifications');
+  assertGapShape(gapOf(result.layers.spec.gaps, 'spec_missing'), { kind: 'artifact', owner: 'agent', layer: 'spec', path: 'openspec/changes/report-notifications/specs/' });
+  assert.deepEqual(actionOf(result, 'spec', 'export').blocked_by, ['spec_missing']);
   writeSpec(repo);
-  result = checkWorkflow(repo, 'spec-export', 'report-notifications');
-  assert.equal(result.status, 'ready');
-  assert.deepEqual(result.gaps, []);
+  result = workflowStatus(repo, 'report-notifications');
+  // Not exported yet is the only Spec gap left, and the export is allowed.
+  assert.deepEqual(result.layers.spec.gaps.map((gap) => gap.code), ['handoff_missing']);
+  assert.equal(result.layers.spec.draft.ready_for_export, true);
+  assert.equal(actionOf(result, 'spec', 'export').allowed, true);
+  // Nothing here is the user's to decide.
+  assert.ok(result.layers.spec.gaps.every((gap) => gap.owner === 'agent'));
+  for (const gap of result.gaps) assertGapShape(gap);
+  assertNoRoutes(result.gaps, 'gaps');
   assert.equal(existsSync(path.join(repo, 'openspec/changes/report-notifications/handoffs')), false);
 });
 
-test('business blockers identify requirements and questions; technical repair takes precedence', (t) => {
+test('business blockers name the requirements and questions and are the user\'s; technical problems are the agent\'s; no file is edited', (t) => {
+  useFakeTools(t);
   const content = fixture.replace('state: explicit', 'state: proposed')
     .replace('open_questions: []', 'open_questions: ["Should a successful retry send a notification?"]');
   const { repo, file } = authored(t, content);
-  let result = checkWorkflow(repo, 'spec-export', 'report-notifications');
-  assert.equal(result.status, 'blocked');
-  assert.equal(result.next.owner, 'user');
-  assert.equal(result.gaps.find((gap) => gap.code === 'requirement_proposed').requirement_id, 'REQ-submit-failure');
-  assert.equal(result.gaps.find((gap) => gap.code === 'business_question').question, 'Should a successful retry send a notification?');
+  let result = validateSpec(repo, 'report-notifications');
+  assert.equal(result.valid, true);
+  assert.equal(result.ready_for_eval_design, false);
+  assertGapShape(gapOf(result.gaps, 'requirements_all_excluded'), { kind: 'business', owner: 'user', layer: 'spec', requirement_ids: ['REQ-submit-failure'] });
+  // A question that names no requirement holds back the whole export.
+  assertGapShape(gapOf(result.gaps, 'business_question'), { kind: 'business', owner: 'user', layer: 'spec', question: 'Should a successful retry send a notification?' });
+  assert.deepEqual(result.excluded.map((entry) => [entry.requirement, entry.reason]), [['REQ-submit-failure', 'proposed']]);
   writeFileSync(file, content.replace('source: request', 'source: missing'));
-  result = checkWorkflow(repo, 'spec-export', 'report-notifications');
-  assert.equal(result.next.owner, 'agent');
-  assert.ok(result.gaps.some((gap) => gap.kind === 'technical'));
+  result = validateSpec(repo, 'report-notifications');
+  assertGapShape(result.gaps.find((gap) => gap.kind === 'technical'), { code: 'spec_invalid', owner: 'agent', layer: 'spec' });
+  assert.ok(result.gaps.filter((gap) => gap.kind === 'business').every((gap) => gap.owner === 'user'));
   assert.ok(result.gaps.some((gap) => gap.kind === 'business'));
+  // workflow status lists every gap that refuses the export; which to take
+  // first is the agent's choice.
+  const blocked = actionOf(workflowStatus(repo, 'report-notifications'), 'spec', 'export');
+  assert.equal(blocked.allowed, false);
+  assert.deepEqual([...blocked.blocked_by].sort(), ['business_question', 'requirements_all_excluded', 'spec_invalid']);
   assert.equal(readFileSync(file, 'utf8'), content.replace('source: request', 'source: missing'));
 });
 
-test('export rechecks changed inputs and reports the same classified blockers without a preflight', (t) => {
+test('export checks the draft again and refuses with the gaps validation gives, so an earlier check is not a permit', (t) => {
+  useFakeTools(t);
   const { repo, file } = authored(t);
-  assert.equal(checkWorkflow(repo, 'spec-export', 'report-notifications').status, 'ready');
+  assert.equal(actionOf(workflowStatus(repo, 'report-notifications'), 'spec', 'export').allowed, true);
   writeFileSync(file, fixture.replace('state: explicit', 'state: proposed'));
-  const gate = checkWorkflow(repo, 'spec-export', 'report-notifications');
+  const gate = validateSpec(repo, 'report-notifications');
   assert.throws(() => exportSpec(repo, 'report-notifications'), (error) => {
     assert.equal(error.code, 'SPEC_INPUT_BLOCKED');
     assert.deepEqual(error.gaps, gate.gaps);
-    assert.deepEqual(error.resume.command, ['spec', 'export', 'report-notifications', '--repo', repo]);
+    assert.equal('resume' in error, false);
+    for (const gap of error.gaps) assertGapShape(gap, { layer: 'spec' });
     return true;
   });
   assert.equal(existsSync(path.join(repo, 'openspec/changes/report-notifications/handoffs')), false);
 });
 
-test('write-eval input check requires the current frozen Spec and preserves older exports', (t) => {
+test('later stages read only the current export: none before the first, the edited draft is drift until exported again, and older exports stay', (t) => {
   const { repo, file } = authored(t);
-  let result = checkWorkflow(repo, 'write-eval', 'report-notifications');
-  assert.equal(result.inputs_ready, false);
-  assert.equal(result.next.route, 'spec-export');
-  assert.equal(result.gaps[0].code, 'handoff_missing');
-  assert.equal(result.resume.stage, 'write-eval');
+  let frozen = frozenSpec(repo, 'report-notifications');
+  assert.equal(frozen.handoff, undefined);
+  assertGapShape(frozen.gaps[0], { code: 'handoff_missing', owner: 'agent', layer: 'spec' });
   const first = exportSpec(repo, 'report-notifications');
   const original = readFileSync(first.file, 'utf8');
-  result = checkWorkflow(repo, 'write-eval', 'report-notifications');
-  assert.equal(result.inputs_ready, true);
-  assert.equal(result.status, 'ready');
-  assert.equal(result.handoff.id, first.id);
-  assert.equal(result.next.owner, 'agent');
+  frozen = frozenSpec(repo, 'report-notifications');
+  assert.deepEqual(frozen.gaps, []);
+  assert.equal(frozen.handoff.id, first.id);
+  assert.equal(frozen.source, 'export');
   writeFileSync(file, fixture.replace('revision: 1', 'revision: 2').replace('数量为零', '数量必须为零'));
-  result = checkWorkflow(repo, 'write-eval', 'report-notifications');
-  assert.equal(result.inputs_ready, false);
-  assert.equal(result.gaps[0].code, 'handoff_missing');
+  frozen = frozenSpec(repo, 'report-notifications');
+  assert.equal(frozen.handoff, undefined);
+  assertGapShape(frozen.gaps[0], { code: 'handoff_missing', owner: 'agent', layer: 'spec', digest: first.id, changed: ['specs/notifications/spec.md'], added: [], removed: [] });
+  assert.deepEqual(exportFacts(repo, 'report-notifications').drift, { changed: ['specs/notifications/spec.md'], added: [], removed: [] });
   assert.equal(readFileSync(first.file, 'utf8'), original);
   const second = exportSpec(repo, 'report-notifications');
-  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').handoff.id, second.id);
+  assert.equal(second.previous, first.id);
+  assert.equal(frozenSpec(repo, 'report-notifications').handoff.id, second.id);
+  assert.equal(specStatus(repo, 'report-notifications').export.id, second.id);
+  assert.equal(readFileSync(first.file, 'utf8'), original);
 });
 
 test('tampered handoffs and manually supplied readiness flags cannot pass the gate', (t) => {
@@ -1136,37 +1344,36 @@ test('tampered handoffs and manually supplied readiness flags cannot pass the ga
   const handoff = exportSpec(repo, 'report-notifications');
   const tampered = { ...readJSON(handoff.file), ready_for_eval_design: true, status: 'completed', specs: [] };
   writeFileSync(handoff.file, JSON.stringify(tampered));
-  for (const stage of ['spec-export', 'write-eval']) {
-    const result = checkWorkflow(repo, stage, 'report-notifications');
-    assert.equal(result.status, 'blocked');
-    assert.equal(result.gaps[0].code, 'handoff_invalid');
-    assert.equal(result.next.owner, 'agent');
-  }
+  const frozen = frozenSpec(repo, 'report-notifications');
+  assert.equal(frozen.handoff, undefined);
+  assertGapShape(frozen.gaps[0], { code: 'handoff_invalid', owner: 'agent', layer: 'spec', digest: handoff.id });
+  const status = statusOf(t, repo);
+  assert.equal(status.layers.spec.export_holds, false);
+  assert.ok(gapOf(status.layers.spec.gaps, 'handoff_invalid'), JSON.stringify(status.layers.spec.gaps));
   assert.throws(() => exportSpec(repo, 'report-notifications'), (error) => error.code === 'HANDOFF_INVALID');
   assert.deepEqual(readJSON(handoff.file), tampered);
 });
 
-test('broken context and changed Map snapshots route to technical recovery without asking business questions', (t) => {
+test('broken context and changed Map snapshots are technical gaps of the agent, never questions for the user', (t) => {
   const repo = project(t, 'existing');
   const map = path.join(repo, 'map.json');
   writeFileSync(map, JSON.stringify({ snapshot_id: 'original', analysis_status: 'partial' }));
   newSpec(repo, 'report-notifications', { map });
   writeSpec(repo);
   writeFileSync(path.join(repo, 'openspec/changes/report-notifications/business-map.json'), JSON.stringify({ snapshot_id: 'changed', analysis_status: 'complete' }));
-  let result = checkWorkflow(repo, 'spec-export', 'report-notifications');
-  assert.equal(result.gaps[0].code, 'map_changed');
-  assert.equal(result.next.owner, 'agent');
+  let result = validateSpec(repo, 'report-notifications');
+  assertGapShape(gapOf(result.gaps, 'map_changed'), { kind: 'technical', owner: 'agent', layer: 'spec' });
+  assert.ok(result.gaps.every((gap) => gap.owner === 'agent'), JSON.stringify(result.gaps));
   const context = path.join(repo, 'openspec/changes/report-notifications/genesis.json');
   for (const [content, code] of [['{broken', 'context_unavailable'], ['null', 'context_invalid']]) {
     writeFileSync(context, content);
-    result = checkWorkflow(repo, 'spec-export', 'report-notifications');
-    assert.equal(result.gaps[0].code, code);
-    assert.equal(result.gaps[0].kind, 'technical');
-    assert.equal(result.next.owner, 'agent');
+    result = validateSpec(repo, 'report-notifications');
+    assertGapShape(result.gaps[0], { code, kind: 'technical', owner: 'agent', layer: 'spec', path: 'openspec/changes/report-notifications/genesis.json' });
+    assert.equal(result.blockers.length, 0);
   }
 });
 
-test('a change folder spec new left unfinished is named for deletion, never deleted', (t) => {
+test('a change folder spec new left unfinished is named as such, never deleted, and can be adopted instead', (t) => {
   const repo = project(t, 'existing');
   const git = (...args) => {
     const result = spawnSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', ...args], { encoding: 'utf8' });
@@ -1179,26 +1386,42 @@ test('a change folder spec new left unfinished is named for deletion, never dele
     if (map) writeFileSync(path.join(repo, 'openspec/changes', name, 'business-map.json'), '{}');
     return path.join(repo, 'openspec/changes', name);
   };
-  const advice = (name) => `openspec/changes/${name}/ has no genesis.json and nothing in it is in Git: an earlier \`spec new\` stopped before it finished, so there is no recorded context to restore. Delete that folder and run \`spec new\` again.`;
+  const advice = (name) => `openspec/changes/${name}/ has no genesis.json and nothing in it is in Git: an earlier \`spec new\` stopped before it finished, so no code or Map context was recorded. The folder holds only what spec new writes, so deleting it loses nothing; \`spec new --adopt\` records the context for it instead.`;
   const folder = interrupted('report-notifications', true);
-  assert.throws(() => newSpec(repo, 'report-notifications'), (error) => error.message === advice('report-notifications'));
-  const check = checkWorkflow(repo, 'spec-export', 'report-notifications');
-  assert.equal(check.gaps[0].code, 'context_unavailable');
-  assert.equal(check.gaps[0].message, advice('report-notifications'));
-  assert.equal(check.next.owner, 'agent');
+  assert.throws(() => newSpec(repo, 'report-notifications'), (error) => {
+    assert.equal(error.message, advice('report-notifications'));
+    assert.equal(error.code, 'SPEC_CHANGE_EXISTS');
+    assertGapShape(error.gaps[0], { code: 'change_unfinished', owner: 'agent', layer: 'spec', path: 'openspec/changes/report-notifications/' });
+    return true;
+  });
+  const check = validateSpec(repo, 'report-notifications');
+  assertGapShape(check.gaps[0], { code: 'context_unavailable', owner: 'agent', layer: 'spec', message: advice('report-notifications') });
   assert.ok(existsSync(path.join(folder, '.openspec.yaml')));
   rmSync(folder, { recursive: true });
   assert.equal(newSpec(repo, 'report-notifications').context.map.status, 'missing');
+  // Adopting such a folder records the context and keeps what OpenSpec wrote.
+  const later = interrupted('later');
+  const metadata = readFileSync(path.join(later, '.openspec.yaml'), 'utf8');
+  const adopted = newSpec(repo, 'later', { adopt: true });
+  assert.equal(adopted.adopted, true);
+  assert.equal(readJSON(path.join(later, 'genesis.json')).project_mode, 'existing');
+  assert.equal(readFileSync(path.join(later, '.openspec.yaml'), 'utf8'), metadata);
 
   // Anything committed, or authored, is not an unfinished spec new.
+  const exists = (name) => (error) => {
+    assert.equal(error.code, 'SPEC_CHANGE_EXISTS');
+    assert.equal(error.message, `openspec/changes/${name}/ already exists. \`spec new --adopt\` adds the Genesis record to it and leaves its files as they are.`);
+    assertGapShape(error.gaps[0], { code: 'change_exists', owner: 'agent', layer: 'spec' });
+    return true;
+  };
   const committed = interrupted('committed');
   git('add', '--', 'openspec/changes/committed');
   git('commit', '-q', '-m', 'Half a change');
-  assert.throws(() => newSpec(repo, 'committed'), /^Error: Change already exists/);
-  assert.match(checkWorkflow(repo, 'spec-export', 'committed').gaps[0].message, /^Restore the recorded code\/Map context/);
+  assert.throws(() => newSpec(repo, 'committed'), exists('committed'));
+  assert.match(validateSpec(repo, 'committed').gaps[0].message, /^genesis\.json of the change cannot be read \(.*\)\. It records the code and the Map the Spec was written against, which only spec new records\.$/);
   const authored = interrupted('authored');
   writeSpec(repo, fixture, 'authored');
-  assert.throws(() => newSpec(repo, 'authored'), /^Error: Change already exists/);
+  assert.throws(() => newSpec(repo, 'authored'), exists('authored'));
   assert.ok(existsSync(committed) && existsSync(authored));
 
   // Without Git there is nothing to be committed.
@@ -1228,9 +1451,9 @@ test('in Git, a committed copy decides for a change made before the Map was copi
   const exported = exportSpec(repo, 'report-notifications');
   git(['add', '-A']);
   git(['commit', '-q', '-m', 'Spec made before the copy']);
-  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /\.genesis\/out\/ses_1\/business-map\.json is ignored by Git, so other clones cannot check this Spec against its Map\. Copy it to openspec\/changes\/report-notifications\/business-map\.json and commit it with the Spec; do not edit genesis\.json\./);
+  assert.match(validateSpec(repo, 'report-notifications').warnings.join('\n'), /\.genesis\/out\/ses_1\/business-map\.json is ignored by Git, so other clones cannot check this Spec against its Map\. A clone reads the copy at openspec\/changes\/report-notifications\/business-map\.json\./);
 
-  // Following that advice clears it.
+  // A committed copy clears it.
   const copy = path.join(change, 'business-map.json');
   writeFileSync(copy, readFileSync(original));
   git(['add', '-A']);
@@ -1238,67 +1461,83 @@ test('in Git, a committed copy decides for a change made before the Map was copi
   const fixed = validateSpec(repo, 'report-notifications');
   assert.equal(fixed.ready_for_eval_design, true, JSON.stringify(fixed.errors));
   assert.doesNotMatch(fixed.warnings.join('\n'), /Git/);
-  assert.equal(checkWorkflow(repo, 'write-eval', 'report-notifications').handoff.id, exported.id);
+  assert.equal(frozenSpec(repo, 'report-notifications').handoff.id, exported.id);
 
   // A wrong copy fails here as it would on any clone, though the recorded file still matches.
   writeFileSync(copy, JSON.stringify({ snapshot_id: 'sha256:later', analysis_status: 'complete' }));
-  const wrong = checkWorkflow(repo, 'write-eval', 'report-notifications');
-  assert.equal(wrong.gaps[0].code, 'map_changed');
-  assert.match(wrong.gaps[0].message, /^Referenced Map changed: openspec\/changes\/report-notifications\/business-map\.json no longer has the digest recorded in genesis\.json\. Other clones read this copy, so it must be the recorded Map\./);
+  const wrong = gapOf(validateSpec(repo, 'report-notifications').gaps, 'map_changed');
+  assertGapShape(wrong, { owner: 'agent', layer: 'spec', path: 'openspec/changes/report-notifications/business-map.json' });
+  assert.match(wrong.message, /^The Map openspec\/changes\/report-notifications\/business-map\.json no longer has the digest genesis\.json records, sha256:[0-9a-f]{64}\./);
 });
 
-test('CLI recovery resumes the original stage after a business decision is supplied', (t) => {
-  const { repo, file } = authored(t, fixture.replace('state: explicit', 'state: proposed'));
-  const run = (args) => spawnSync(process.execPath, [path.join(ROOT, 'bin/genesis-edd.js'), ...args], { encoding: 'utf8' });
-  let response = run(['workflow', 'check', 'spec-export', 'report-notifications', '--repo', repo]);
-  assert.equal(response.status, 1);
+test('CLI: workflow status exits 0 and names the user\'s decision; once the user decides, the export it lists succeeds', (t) => {
+  useFakeTools(t);
+  const proposed = fixture.replace('state: explicit', 'state: proposed');
+  const { repo, file } = authored(t, proposed);
+  const run = (args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
+  let response = run(['workflow', 'status', 'report-notifications', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
   const blocked = JSON.parse(response.stdout);
-  assert.equal(blocked.next.owner, 'user');
+  assertGapShape(gapOf(blocked.layers.spec.gaps, 'requirements_all_excluded'), { owner: 'user', layer: 'spec' });
+  assert.deepEqual(actionOf(blocked, 'spec', 'export').blocked_by, ['requirements_all_excluded']);
+  // The earlier stage form reads the same status; the stage does nothing.
+  response = run(['workflow', 'check', 'spec-export', 'report-notifications', '--repo', repo]);
+  assert.equal(response.status, 0, response.stderr);
+  const staged = JSON.parse(response.stdout);
+  assert.equal(staged.stage_ignored, 'spec-export');
+  assert.deepEqual(staged.gaps, blocked.gaps);
+  // The user's decision is recorded in the Spec, with who and where.
   const confirmed = fixture.replace('state: explicit', 'state: confirmed\n    confirmation:\n      by: Example user\n      ref: example:approval-message');
   writeFileSync(file, confirmed);
-  response = run(blocked.resume.command);
+  response = run(['workflow', 'status', 'report-notifications', '--repo', repo]);
   assert.equal(response.status, 0, response.stderr);
-  const ready = JSON.parse(response.stdout);
-  assert.equal(ready.status, 'ready');
-  response = run(ready.next.command);
+  const action = actionOf(JSON.parse(response.stdout), 'spec', 'export');
+  assert.equal(action.allowed, true);
+  response = run(action.command);
   assert.equal(response.status, 0, response.stderr);
-  assert.equal(readJSON(JSON.parse(response.stdout).file).specs[0].content, confirmed);
-  writeFileSync(file, fixture.replace('state: explicit', 'state: proposed'));
-  response = run(ready.next.command);
+  const exported = JSON.parse(response.stdout);
+  assert.equal(readJSON(exported.file).specs[0].content, confirmed);
+  assert.deepEqual(exported.must_show.requirements[0].confirmation, { by: 'Example user', ref: 'example:approval-message' });
+  writeFileSync(file, proposed);
+  response = run(action.command);
   assert.equal(response.status, 1);
-  assert.equal(JSON.parse(response.stderr).gaps[0].code, 'requirement_proposed');
+  const refusal = JSON.parse(response.stderr);
+  assert.equal(refusal.code, 'SPEC_INPUT_BLOCKED');
+  assert.equal(refusal.gaps[0].code, 'requirements_all_excluded');
 });
 
-test('later stage entries return diagnostics without claiming readiness or running a stage', (t) => {
+test('the stage commands of earlier releases read the workflow status, exit 0 and run nothing', (t) => {
+  useFakeTools(t);
   const { repo } = authored(t);
-  for (const stage of ['loop-and-implement']) {
+  for (const stage of ['write-eval', 'loop-and-implement']) {
     const result = checkWorkflow(repo, stage, 'report-notifications');
-    assert.equal(result.status, 'blocked');
-    assert.equal(result.inputs_ready, false);
-    const response = spawnSync(process.execPath, [path.join(ROOT, 'bin/genesis-edd.js'), stage, 'report-notifications', '--repo', repo], { encoding: 'utf8' });
-    assert.equal(response.status, 1);
+    assert.equal(result.stage_ignored, stage);
+    assert.equal(result.schema, 'genesis-edd.workflow-status/1');
+    const response = spawnSync(process.execPath, [CLI, stage, 'report-notifications', '--repo', repo], { encoding: 'utf8' });
+    assert.equal(response.status, 0, response.stderr);
     const diagnostic = JSON.parse(response.stdout);
-    assert.equal(diagnostic.inputs_ready, result.inputs_ready);
-    assert.equal(diagnostic.status, result.status);
+    assert.equal(diagnostic.stage_ignored, stage);
     assert.deepEqual(diagnostic.gaps, result.gaps);
-    assert.deepEqual(diagnostic.resume, result.resume);
+    assert.deepEqual(diagnostic.actions, result.actions);
+    assertNoRoutes(diagnostic.gaps, 'gaps');
   }
   assert.equal(existsSync(path.join(repo, 'openspec/changes/report-notifications/handoffs')), false);
-  assert.throws(() => checkWorkflow(repo, 'unknown', 'report-notifications'), /Unknown stage/);
+  // A stage name is no longer read, so an unknown one is ignored too.
+  assert.equal(checkWorkflow(repo, 'unknown', 'report-notifications').stage_ignored, 'unknown');
   assert.throws(() => checkWorkflow(repo, 'spec-export', '../escape'), /kebab-case/);
 });
 
-test('a project whose Spec schema is missing, as in a clone committed without openspec/schemas/, is told to run init again, which restores it', (t) => {
+test('a project whose Spec schema is missing, as in a clone committed without openspec/schemas/, is told that init writes it again, which restores it', (t) => {
   const repo = project(t, 'existing');
   newSpec(repo, 'report-notifications');
   writeSpec(repo);
   rmSync(path.join(repo, 'openspec/schemas'), { recursive: true, force: true });
-  const check = checkWorkflow(repo, 'spec-export', 'report-notifications');
-  assert.equal(check.status, 'blocked');
-  const gap = check.gaps.find((entry) => entry.code === 'project_invalid');
-  assert.ok(gap, JSON.stringify(check.gaps));
-  assert.equal(gap.route, 'init');
-  assert.ok(gap.message.startsWith(`openspec/schemas/${SCHEMA}/ is missing, so OpenSpec cannot read this project's Specs. Run \`init --repo <app> --mode existing --agent none\``), gap.message);
+  const gap = gapOf(validateSpec(repo, 'report-notifications').gaps, 'project_invalid');
+  assertGapShape(gap, { owner: 'agent', layer: 'spec' });
+  assert.ok(gap.message.startsWith(`openspec/schemas/${SCHEMA}/ is missing, so OpenSpec cannot read this project's Specs. \`init --mode existing --agent none\` writes the schema again without changing other files or installing skills`), gap.message);
+  const status = statusOf(t, repo);
+  assert.equal(status.gaps[0].message, gap.message);
+  assert.deepEqual(status.actions.map((entry) => entry.command[0]), ['init']);
   assert.throws(() => newSpec(repo, 'another-change'), /openspec\/schemas\/genesis-spec\/ is missing/);
 
   initProject(repo, 'existing', 'none');

@@ -61,7 +61,11 @@ With Harbor 0.26 in local Docker, and again with Harbor 0.27.0:
 The packages ran as checks.json 1.0. They are shown in 1.1, which names the
 THEN line each check verifies (`then`) and says who wrote each fixture and what
 it leaves (`origin`, `note`); the checks a run reads are the same. Every
-fixture here is the author's: the packages have no reviewer's counterexample
-yet, which a checks.json 1.1 package needs before it is ready, so
-`eval validate` reports them missing `review` until a reviewer adds one per
-line, as `references/review.md` says.
+fixture here is the author's, and there is no reviewer's counterexample yet.
+In the full tier a checks.json 1.1 package needs one for every line before it
+is ready, so `eval validate` reports these missing `review`. In the light
+tier the probe of `eval check` stands in for the fixtures, and a line needs a
+counterexample only when no real failure at the baseline proves it, as
+[references/review.md](../../references/review.md) says. Each dependency
+here carries a `note` from before `stand_in` existed, so `eval validate`
+warns that no stand-in is on record.

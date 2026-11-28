@@ -12,6 +12,11 @@
 // the fixture named by GENESIS_EDD_FIXTURE expects in PACKAGE/tests/checks.json.
 // A fixture script that does not exist fails the trial, as the real agent would.
 //
+// With -a nop (the empty-run probe of eval check) the program never runs, so
+// every check is "unknown", as a verifier that finds no evidence reports.
+// GENESIS_EDD_REPO/app/probe.json, keyed like results.json, stands in for a
+// verifier that judges without evidence, to test a probe that fails.
+//
 // With any other agent the results come from the application:
 // GENESIS_EDD_REPO/app/results.json, keyed by the package folder name.
 //
@@ -102,10 +107,10 @@ function fixturePlan() {
 // The seconds a trial takes, when the object gives them.
 const seconds = (given) => (typeof given?.$seconds === 'number' && given.$seconds >= 0 ? { seconds: given.$seconds } : {});
 
-function applicationResults() {
+function applicationResults(name = 'results.json') {
   const repo = process.env.GENESIS_EDD_REPO;
   if (!repo) stop('GENESIS_EDD_REPO is not set');
-  const file = path.join(repo, 'app/results.json');
+  const file = path.join(repo, 'app', name);
   if (!existsSync(file)) return {};
   try { return JSON.parse(readFileSync(file, 'utf8')); } catch (cause) { return stop(`cannot read ${file}: ${cause.message}`, 3); }
 }
@@ -123,7 +128,7 @@ function applicationPlan(entry, attempt) {
 }
 
 const fixture = options['-a'] === FIXTURE_AGENT;
-const results = fixture ? null : applicationResults();
+const results = fixture ? null : applicationResults(options['-a'] === 'nop' ? 'probe.json' : 'results.json');
 const job = path.join(options['-o'], options['--job-name'] ?? 'harbor');
 // The first attempt starts with this call; each later one, one second after
 // the one before it finished.

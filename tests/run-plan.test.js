@@ -10,14 +10,14 @@ import test from 'node:test';
 import { readJSON } from '../src/project.js';
 import { validateEval } from '../src/eval.js';
 import { checkEval, codeSnapshot, readCounts, runTools, sameCode, savePatch, startRun } from '../src/run.js';
-import { loopStatus, startLoop } from '../src/loop.js';
-import { checkWorkflow } from '../src/workflow.js';
+import { loopStatus } from '../src/loop.js';
+import { workflowStatus } from '../src/workflow.js';
 import {
   AFTER, AGENT, BEFORE, CHANGE, FAKE_HARBOR_VERSION, LIVE_DEPENDENCY, cli, commit, confirmChecks, connect, dropCheck, editChecks, git, harborThen, readRecord,
   readyProject, setResults, writeExpectations,
 } from './helpers/edd.js';
 import {
-  FAILURE, SUCCESS, runIds, find, valueOf, refused, loopFile,
+  FAILURE, SUCCESS, runIds, find, valueOf, refused, loopFile, actionOf, assertGapShape, startLoop,
 } from './helpers/run.js';
 
 // --- The run plan: the user's number of attempts, and each attempt's record ---
@@ -27,32 +27,37 @@ const attemptsGiven = (tools, count) => Object.fromEntries(tools.runs().slice(-c
   .map((call) => [path.basename(valueOf(call.argv, '-p')), valueOf(call.argv, '-k')]));
 const BASELINE_PLAN = { pass_rule: 'all', agent: AGENT, model: null, source: 'baseline' };
 
-test('a baseline is refused before anything runs while a package declares a live dependency and no --attempts is given', (t) => {
+test('a baseline is refused before anything runs while a package declares a live dependency and no confirmation gives the number of attempts, whatever --attempts says', (t) => {
   // Without the user's confirmation of the checks, which would hold the number.
   const { repo, tools, runs } = readyProject(t, { live: [SUCCESS], confirm: false });
   const calls = tools.runs().length;
-  assert.throws(() => startRun(repo, CHANGE, { baseline: true }), (error) => {
-    refused('attempts_undecided')(error);
-    const [entry] = error.gaps;
-    assert.deepEqual([entry.kind, entry.owner, entry.route], ['business', 'user', 'run-eval']);
-    assert.ok(entry.message.startsWith(`${SUCCESS} declares a live dependency, so its results can differ from one attempt to the next. How many attempts`), entry.message);
-    assert.match(entry.message, /pass --attempts N\. Propose 5, or 3 when the budget is tight/);
-    assert.doesNotMatch(entry.message, /write-eval/);
-    return true;
-  });
-  const refusal = cli(['run', 'start', CHANGE, '--repo', repo, '--baseline']);
-  assert.equal(refusal.status, 1);
-  assert.deepEqual(refusal.json.gaps.map((gap) => gap.code), ['attempts_undecided']);
+  for (const options of [{}, { attempts: 3 }]) {
+    assert.throws(() => startRun(repo, CHANGE, { baseline: true, ...options }), (error) => {
+      refused('attempts_undecided')(error);
+      const entry = assertGapShape(error.gaps[0], { kind: 'business', owner: 'user', layer: 'confirmation' });
+      assert.deepEqual(entry.live, [SUCCESS]);
+      assert.ok(entry.message.startsWith(`${SUCCESS} declares a live dependency, so its results can differ from one attempt to the next. How many attempts`), entry.message);
+      // A run's own --attempts never settles the user's number.
+      assert.ok(entry.message.includes('only the number a checks confirmation records (`eval confirm --attempts N`) settles it, not a run\'s own --attempts'), entry.message);
+      assert.doesNotMatch(entry.message, /write-eval/);
+      return true;
+    }, JSON.stringify(options));
+  }
+  for (const args of [[], ['--attempts', '3']]) {
+    const refusal = cli(['run', 'start', CHANGE, '--repo', repo, '--baseline', ...args]);
+    assert.equal(refusal.status, 1);
+    assert.deepEqual(refusal.json.gaps.map((gap) => gap.code), ['attempts_undecided']);
+  }
   assert.equal(tools.runs().length, calls);
   assert.deepEqual(runIds(runs), []);
 });
 
-test('the baseline runs N attempts of each package with a live dependency and one of every other, and later full runs follow it', (t) => {
-  const { repo, tools } = readyProject(t, { live: [FAILURE], confirm: false });
-  const base = startRun(repo, CHANGE, { baseline: true, attempts: 3 });
+test('the baseline runs the confirmed N attempts of each package with a live dependency and one of every other, and later full runs follow it', (t) => {
+  const { repo, tools, confirmation } = readyProject(t, { live: [FAILURE] });
+  const base = startRun(repo, CHANGE, { baseline: true });
   assert.equal(base.execution_status, 'completed', JSON.stringify(base));
   assert.deepEqual(attemptsGiven(tools, 2), { [FAILURE]: '3', [SUCCESS]: '1' });
-  const plan = { attempts: 3, ...BASELINE_PLAN };
+  const plan = { attempts: 3, ...BASELINE_PLAN, source: 'confirmation', confirmation: confirmation.confirmation.id, tier: 'full' };
   assert.deepEqual(base.run_plan, plan);
   assert.deepEqual(base.attempts, { [FAILURE]: 3, [SUCCESS]: 1 });
   const recorded = readRecord(base).run.environment_ref;
@@ -90,32 +95,48 @@ test('without a live dependency or a model a baseline needs no --attempts, and o
   assert.ok(five.warnings.includes('No package declares a live dependency, so every package runs once. The baseline keeps --attempts 5 for a package that declares one later.'), JSON.stringify(five.warnings));
 });
 
-test('with a model in the kit and no package declaring a live dependency, the baseline needs --attempts and points at write-eval', (t) => {
-  const { repo, tools } = readyProject(t, { model: 'synthetic/model-1', confirm: false });
-  assert.throws(() => startRun(repo, CHANGE, { baseline: true }), (error) => {
-    refused('attempts_undecided')(error);
-    const { message } = error.gaps[0];
-    assert.ok(message.startsWith(`The evaluated agent runs with model synthetic/model-1, but ${FAILURE}, ${SUCCESS} declare no live dependency. How many attempts`), message);
-    assert.ok(message.endsWith(`If a scenario of ${FAILURE}, ${SUCCESS} calls the model, declare it in that package's tests/checks.json dependencies with mode live in write-eval and prove it again with eval check before the baseline.`), message);
-    return true;
-  });
-  const base = startRun(repo, CHANGE, { baseline: true, attempts: 2 });
+test('with a model in the kit and no package declaring a live dependency, a baseline waits for the user\'s number of attempts, then runs every package once', (t) => {
+  const project = readyProject(t, { model: 'synthetic/model-1', confirm: false });
+  const { repo, tools } = project;
+  for (const options of [{}, { attempts: 2 }]) {
+    assert.throws(() => startRun(repo, CHANGE, { baseline: true, ...options }), (error) => {
+      refused('attempts_undecided')(error);
+      const { message, model, undeclared } = error.gaps[0];
+      assert.deepEqual([model, undeclared], ['synthetic/model-1', [FAILURE, SUCCESS]]);
+      assert.ok(message.startsWith(`The evaluated agent runs with model synthetic/model-1, but ${FAILURE}, ${SUCCESS} declare no live dependency. How many attempts`), message);
+      assert.ok(message.endsWith(`A scenario of ${FAILURE}, ${SUCCESS} that calls the model is a live dependency of that package.`), message);
+      // The facts only: no skill to go to.
+      assert.doesNotMatch(message, /write-eval/);
+      return true;
+    }, JSON.stringify(options));
+  }
+  const { confirmation } = confirmChecks(project, { attempts: 2 });
+  const base = startRun(repo, CHANGE, { baseline: true });
   assert.equal(base.execution_status, 'completed', JSON.stringify(base));
   assert.deepEqual(attemptsGiven(tools, 2), { [FAILURE]: '1', [SUCCESS]: '1' });
-  assert.ok(base.warnings.includes(`${FAILURE}, ${SUCCESS} declare no live dependency although the agent runs with model synthetic/model-1, so they run once. If a scenario calls the model, declare that in write-eval.`), JSON.stringify(base.warnings));
-  assert.deepEqual(base.run_plan, { attempts: 2, pass_rule: 'all', agent: AGENT, model: 'synthetic/model-1', source: 'baseline' });
+  assert.deepEqual(base.run_plan, { attempts: 2, pass_rule: 'all', agent: AGENT, model: 'synthetic/model-1', source: 'confirmation', confirmation: confirmation.id, tier: 'full' });
+  // A head run says the packages declare no live dependency, so they ran once.
+  setResults(repo, AFTER);
+  const head = startRun(repo, CHANGE);
+  assert.ok(head.warnings.includes(`${FAILURE}, ${SUCCESS} declare no live dependency although the agent runs with model synthetic/model-1, so they ran once.`), JSON.stringify(head.warnings));
+  assert.deepEqual(attemptsGiven(tools, 2), { [FAILURE]: '1', [SUCCESS]: '1' });
 });
 
-test('an unavailable baseline needs --attempts too while a package declares a live dependency, and keeps the plan with no attempts made', (t) => {
-  const { repo, tools } = readyProject(t, { mode: 'new', results: {}, live: [FAILURE], confirm: false });
+test('an unavailable baseline waits for the user\'s number of attempts too while a package declares a live dependency, and keeps the plan with no attempts made', (t) => {
+  const project = readyProject(t, { mode: 'new', results: {}, live: [FAILURE], confirm: false });
+  const { repo, tools } = project;
   const calls = tools.calls().length;
-  assert.throws(() => startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' }), refused('attempts_undecided'));
-  const base = startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation', attempts: 3 });
+  for (const options of [{}, { attempts: 3 }]) {
+    assert.throws(() => startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation', ...options }), refused('attempts_undecided'), JSON.stringify(options));
+  }
+  const { confirmation } = confirmChecks(project, { attempts: 3 });
+  const base = startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
   assert.equal(base.execution_status, 'not_run');
-  assert.deepEqual(base.run_plan, { attempts: 3, ...BASELINE_PLAN });
+  assert.deepEqual(base.run_plan, { attempts: 3, ...BASELINE_PLAN, source: 'confirmation', confirmation: confirmation.id, tier: 'full' });
   assert.deepEqual(base.attempts, {});
   const environment = readRecord(base).run.environment_ref;
   assert.deepEqual([environment.attempts, environment.attempts_by_case, environment.run_plan.attempts], [3, {}, 3]);
+  // Nothing ran, and the confirmation ran nothing either.
   assert.equal(tools.calls().length, calls);
 });
 
@@ -126,9 +147,9 @@ test('a baseline runs the plan the user confirmed with the checks, and is refuse
   for (const [options, differs] of [[{ attempts: 2 }, '2 attempts'], [{ model: 'synthetic/other' }, 'model synthetic/other'], [{ agent: 'other_agent:OtherAgent' }, 'agent other_agent:OtherAgent']]) {
     assert.throws(() => startRun(repo, CHANGE, { baseline: true, ...options }), (error) => {
       refused('run_plan_differs')(error);
-      const [entry] = error.gaps;
-      assert.deepEqual([entry.kind, entry.owner, entry.route], ['artifact', 'agent', 'run-eval']);
-      assert.equal(entry.message, `The user confirmed 3 attempts, agent ${AGENT}, model none for this Spec export (confirmed.json). This baseline would use ${differs}. Run without --attempts, --agent and --model to use the confirmed plan; to change it, show the user and record a new \`eval confirm --reason <why>\` with the new flags first.`);
+      const entry = assertGapShape(error.gaps[0], { kind: 'artifact', owner: 'agent', layer: 'confirmation' });
+      assert.deepEqual([entry.confirmed, entry.given], [{ attempts: 3, agent: AGENT, model: null }, [differs]]);
+      assert.equal(entry.message, `The user confirmed 3 attempts, agent ${AGENT}, model none for this Spec export (confirmed.json), and this baseline would use ${differs}. Another plan is the user's decision, recorded with \`eval confirm\`.`);
       return true;
     }, JSON.stringify(options));
   }
@@ -138,11 +159,13 @@ test('a baseline runs the plan the user confirmed with the checks, and is refuse
   const base = startRun(repo, CHANGE, { baseline: true, attempts: 3, agent: AGENT });
   assert.equal(base.is_baseline, true, JSON.stringify(base));
   assert.deepEqual(attemptsGiven(tools, 2), { [FAILURE]: '3', [SUCCESS]: '1' });
-  assert.deepEqual(base.run_plan, { attempts: 3, pass_rule: 'all', agent: AGENT, model: null, source: 'confirmation', confirmation: id });
+  assert.deepEqual(base.run_plan, { attempts: 3, pass_rule: 'all', agent: AGENT, model: null, source: 'confirmation', confirmation: id, tier: 'full' });
   const record = readRecord(base).run;
   assert.deepEqual(record.checks_confirmation, { id, at: confirmation.confirmation.confirmed.at });
   assert.ok(!base.warnings.some((warning) => warning.includes('confirm')), JSON.stringify(base.warnings));
-  assert.match(base.next, /^The baseline is recorded\. Start the implementation loop before changing any code: `loop start` \(loop-and-implement\) takes the budget the user confirmed in confirmed\.json/);
+  // A loop can start on it: the confirmation covers it.
+  assert.deepEqual([base.confirmation_current, base.loop_baseline], [true, { usable: true, reasons: [] }]);
+  assert.equal(base.suggestion, null);
   // Without flags too.
   assert.deepEqual(startRun(repo, CHANGE, { baseline: true }).run_plan, base.run_plan);
 });
@@ -152,8 +175,9 @@ test('a baseline without the user\'s confirmation runs with a warning, and every
   const { repo } = project;
   const base = startRun(repo, CHANGE, { baseline: true });
   assert.equal(base.is_baseline, true);
-  assert.ok(base.warnings.includes('The user has not confirmed the checks of this Spec export. Run `eval review`, have a reviewer answer it in review.json, show the user the review and the run plan, and record their confirmation with `eval confirm` before `loop start`.'), JSON.stringify(base.warnings));
-  assert.match(base.next, /^The baseline is recorded\. Have the user confirm the checks first \(`eval review`, `eval confirm`\): `loop start` refuses checks_unconfirmed\./);
+  assert.ok(base.warnings.includes('The user has not confirmed the checks of this Spec export. Only the user confirms them; a loop runs only on checks the user confirmed.'), JSON.stringify(base.warnings));
+  // As far as the record goes a loop could start on it, but no confirmation covers it yet.
+  assert.deepEqual([base.confirmation_current, base.loop_baseline], [false, { usable: true, reasons: [] }]);
   assert.equal(readRecord(base).run.checks_confirmation, null);
   const { confirmation } = confirmChecks(project);
   setResults(repo, AFTER);
@@ -166,7 +190,8 @@ test('a baseline without the user\'s confirmation runs with a warning, and every
   assert.equal(readRecord(startRun(repo, CHANGE)).run.checks_confirmation, null);
   // The baseline warns which packages changed.
   const again = startRun(repo, CHANGE, { baseline: true });
-  assert.ok(again.warnings.some((warning) => warning.startsWith(`${FAILURE} changed since the user confirmed the checks (${FAILURE}/environment/Dockerfile).`)), JSON.stringify(again.warnings));
+  assert.ok(again.warnings.some((warning) => warning.startsWith(`${FAILURE} changed since the user confirmed the checks`) && warning.includes(`${FAILURE}/environment/Dockerfile`)), JSON.stringify(again.warnings));
+  assert.equal(again.confirmation_current, false);
 });
 
 test('each attempt is recorded in attempts.json with its trial, status, results and times, and check-results.json keeps its fields', (t) => {
@@ -298,7 +323,7 @@ test('a baseline recorded before run plans keeps running every package its numbe
   assert.deepEqual(attemptsGiven(tools, 2), { [FAILURE]: '2', [SUCCESS]: '2' });
   assert.deepEqual(head.run_plan, { attempts: 2, pass_rule: 'all', agent: AGENT, model: null, source: 'legacy', uniform: true });
   assert.deepEqual(head.warnings.filter((warning) => warning.includes('before runs followed a run plan')), [
-    `The baseline ${base.run_id} was recorded before runs followed a run plan, so every package runs 2 times, as it did there. A new baseline asks for the number of attempts of each package that declares a live dependency.`]);
+    `The baseline ${base.run_id} was recorded before runs followed a run plan, so every package runs 2 times, as it did there.`]);
   assert.deepEqual(find(readRecord(head).compare, FAILURE, 'c1').before_counts, { pass: 0, fail: 2, unknown: 0 });
 });
 
@@ -310,65 +335,74 @@ test('a baseline check that passed in some attempts and failed in others is base
   assert.deepEqual(base.baseline_unstable, [{ case: FAILURE, check: 'c1', expected: 'pass', counts: { pass: 2, fail: 1, unknown: 0 } }]);
   assert.deepEqual(base.baseline_mismatch, []);
   assert.deepEqual(readRecord(base).run.baseline_unstable, base.baseline_unstable);
-  assert.ok(base.warnings.includes(`Checks that passed in some attempts and failed in others at the baseline (baseline_unstable): ${FAILURE}/c1 2 of 3 passed. Their result before the change is not settled, so a later pass shows nothing about this change. Read their logs/ for what differed between the attempts, and tell the user. Do not change an expectation to fit one outcome.`), JSON.stringify(base.warnings));
-  assert.ok(base.next.endsWith(' Some checks passed in some attempts and failed in others (baseline_unstable): tell the user before the loop starts, and leave their expectations as they are.'), base.next);
-  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'start_loop');
+  assert.ok(base.warnings.includes(`Checks that passed in some attempts and failed in others at the baseline (baseline_unstable): ${FAILURE}/c1 2 of 3 passed. Their result before the change is not settled, so a later pass shows nothing about this change.`), JSON.stringify(base.warnings));
+  // An unstable check does not keep a loop from starting.
+  assert.deepEqual(base.loop_baseline, { usable: true, reasons: [] });
+  assert.equal(actionOf(workflowStatus(repo, CHANGE), 'loop', 'start').allowed, true);
 
   const flipped = startRun(repo, CHANGE, { baseline: true, attempts: 3, expect: writeExpectations(repo, { ...expected, [`${FAILURE}/c1`]: 'fail' }) });
-  assert.ok(flipped.warnings.includes(`The expected result of ${FAILURE}/c1 changed from pass to fail since the baseline ${base.run_id}, where it was unstable. An expectation follows what the change does, not one outcome of an unstable check.`), JSON.stringify(flipped.warnings));
+  assert.ok(flipped.warnings.includes(`The expected result of ${FAILURE}/c1 changed from pass to fail since the baseline ${base.run_id}, where it was unstable.`), JSON.stringify(flipped.warnings));
   const started = startLoop(repo, CHANGE);
-  assert.ok(started.warnings.includes(`The baseline ${flipped.run_id} has checks whose attempts disagreed (baseline_unstable): ${FAILURE}/c1. Their comparison with the baseline shows nothing about the change; tell the user.`), JSON.stringify(started.warnings));
-  assert.deepEqual(started.run_plan, { attempts: 3, ...BASELINE_PLAN, source: 'confirmation', confirmation: confirmation.confirmation.id });
+  assert.ok(started.warnings.includes(`The baseline ${flipped.run_id} has checks whose attempts disagreed (baseline_unstable): ${FAILURE}/c1. Their comparison with the baseline shows nothing about the change.`), JSON.stringify(started.warnings));
+  assert.deepEqual(started.run_plan, { attempts: 3, ...BASELINE_PLAN, source: 'confirmation', confirmation: confirmation.confirmation.id, tier: 'full' });
 });
 
-// The refusal of a plan flag inside a loop.
-const RUN_PLAN_FIXED = 'A loop runs for this Spec export, and its run plan is fixed: run start reads the number of attempts, the agent and the model from the loop\'s checks confirmation in confirmed.json, and a baseline reads them from the latest confirmation. Run without --attempts, --agent and --model. To change the plan, the user confirms another one with `eval confirm`, which ends this loop.';
-
-test('inside a loop --attempts, --agent and --model are refused before anything runs, equal values and base records included', (t) => {
+test('inside a loop --attempts, --agent and --model that differ from the plan are refused before anything runs, and values equal to the plan are taken', (t) => {
   const { repo, root, runs, tools } = readyProject(t, { live: [FAILURE] });
-  startRun(repo, CHANGE, { baseline: true, attempts: 3 });
+  startRun(repo, CHANGE, { baseline: true });
   startLoop(repo, CHANGE);
-  setResults(repo, AFTER);
   const before = runIds(runs);
   const calls = tools.runs().length;
-  // The plan's number and one are refused too.
-  for (const value of ['5', '3', '1']) {
+  // A base record on the start code reads the plan of the user's
+  // confirmation, and another one is refused.
+  assert.throws(() => startRun(repo, CHANGE, { baseline: true, model: 'synthetic/other' }), refused('run_plan_differs'));
+  setResults(repo, AFTER);
+  for (const value of ['5', '1']) {
     const attempts = cli(['run', 'start', CHANGE, '--repo', repo, '--attempts', value]);
     assert.equal(attempts.status, 1);
     assert.deepEqual(attempts.json.gaps.map((gap) => gap.code), ['run_plan_fixed']);
-    const [entry] = attempts.json.gaps;
-    assert.deepEqual([entry.kind, entry.owner, entry.route], ['artifact', 'agent', 'run-eval']);
-    assert.equal(entry.message, RUN_PLAN_FIXED);
+    const entry = assertGapShape(attempts.json.gaps[0], { kind: 'artifact', owner: 'agent', layer: 'loop' });
+    assert.deepEqual(entry.differs, [{ key: 'attempts', given: Number(value), plan: 3 }]);
+    assert.deepEqual(entry.plan, { attempts: 3, agent: AGENT, model: null, tier: 'full' });
+    assert.ok(entry.message.startsWith(`A loop runs for this Spec export, and its run plan is fixed by its checks confirmation: 3 attempts, agent ${AGENT}, model none. This run gives attempts ${value}.`), entry.message);
   }
-  for (const options of [{ attempts: 3, case: [FAILURE] }, { model: 'synthetic/other' }, { model: 'synthetic/other', attempts: 2 }, { agent: AGENT },
-    { agent: 'other_agent:OtherAgent' }, { baseline: true, model: 'synthetic/other' }]) {
+  for (const options of [{ attempts: 2, case: [FAILURE] }, { model: 'synthetic/other' }, { model: 'synthetic/other', attempts: 2 }, { agent: 'other_agent:OtherAgent' }]) {
     assert.throws(() => startRun(repo, CHANGE, options), refused('run_plan_fixed'), JSON.stringify(options));
   }
   assert.deepEqual(runIds(runs), before);
   assert.equal(tools.runs().length, calls);
-  // A partial run makes one attempt of each package and has no role.
-  const partial = startRun(repo, CHANGE, { case: [FAILURE] });
+  // The plan's own values are taken. A partial run makes one attempt of each
+  // package unless --attempts says, and has no role.
+  const partial = startRun(repo, CHANGE, { case: [FAILURE], agent: AGENT });
   assert.deepEqual([partial.execution_status, partial.role, readRecord(partial).run.role], ['completed', null, null]);
   assert.deepEqual(attemptsGiven(tools, 1), { [FAILURE]: '1' });
   assert.deepEqual(partial.attempts, { [FAILURE]: 1 });
-  assert.equal(tools.runs().length, calls + 1);
-  assert.equal(runIds(runs).length, before.length + 1);
-  // A model written into harness.json changes the kit, which ends the loop.
+  const planned = startRun(repo, CHANGE, { case: [FAILURE], attempts: 3 });
+  assert.equal(planned.execution_status, 'completed', JSON.stringify(planned));
+  assert.deepEqual(attemptsGiven(tools, 1), { [FAILURE]: '3' });
+  assert.equal(tools.runs().length, calls + 2);
+  assert.equal(runIds(runs).length, before.length + 2);
+  // A model written into harness.json changes the kit, which ends the loop,
+  // and the change is locked until the user decides.
   const harness = path.join(root, '..', 'harness', 'harness.json');
   writeFileSync(harness, `${JSON.stringify({ agent: AGENT, model: 'synthetic/kit-model' })}\n`);
   checkEval(repo, CHANGE);
   const status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.next.reason], ['loop_ended', 'packages_changed']);
+  assert.deepEqual([status.phase, status.ended?.reason], ['ended', 'packages_changed'], JSON.stringify(status.ended));
   assert.ok(status.ended.files.includes('kit/harness.json'), JSON.stringify(status.ended));
-  assert.throws(() => startRun(repo, CHANGE), refused('loop_ended'));
+  assert.throws(() => startRun(repo, CHANGE), (error) => {
+    refused('change_locked', 'loop_ended')(error);
+    assert.equal(error.gaps[0].reason, 'packages_changed');
+    return true;
+  });
 });
 
 test('inside a loop a head run without flags uses the model of the loop\'s checks confirmation, even when harness.json names none', (t) => {
   const project = readyProject(t, { live: [FAILURE], confirm: false });
   const { repo, tools } = project;
-  startRun(repo, CHANGE, { baseline: true, model: 'synthetic/model-m', attempts: 2 });
-  // The user confirms the plan the baseline ran.
+  // The user confirms the plan, and the baseline runs it.
   confirmChecks(project, { attempts: 2, model: 'synthetic/model-m' });
+  startRun(repo, CHANGE, { baseline: true, model: 'synthetic/model-m', attempts: 2 });
   startLoop(repo, CHANGE);
   setResults(repo, AFTER);
   const head = startRun(repo, CHANGE);
@@ -385,11 +419,12 @@ test('outside a loop --attempts overrides the plan for the packages with a live 
   const head = startRun(repo, CHANGE, { attempts: 2 });
   assert.deepEqual(attemptsGiven(tools, 2), { [FAILURE]: '2', [SUCCESS]: '1' });
   assert.deepEqual(head.warnings.filter((warning) => warning.startsWith('The settings of this run differ')), [
-    `The settings of this run differ from those of the baseline ${base.run_id}: attempts 2 here, 3 in the baseline. A different result may come from that, not from the change. Run with the baseline's settings to compare like with like.`]);
+    `The settings of this run differ from those of the baseline ${base.run_id}: attempts 2 here, 3 in the baseline. A different result may come from that, not from the change.`]);
 });
 
 test('after an unavailable baseline the user confirmed with model none, a head run with another model is refused, and a confirmation of another model ends the loop', (t) => {
-  const project = readyProject(t, { mode: 'new', results: {} });
+  // The light tier names no model, so this change is confirmed in the full tier.
+  const project = readyProject(t, { mode: 'new', results: {}, tier: 'full' });
   const { repo, runs, tools } = project;
   assert.equal(project.confirmation.confirmation.run_plan.model, null);
   const base = startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
@@ -407,12 +442,20 @@ test('after an unavailable baseline the user confirmed with model none, a head r
   assert.equal(readRecord(head).run.environment_ref.model, null);
   assert.equal(loopStatus(repo, CHANGE).loop.run_plan.model, null);
   // The user confirms another model: the loop has ended.
-  const revised = confirmChecks(project, { model: 'synthetic/model-m', attempts: 1, reason: 'The user chose model-m.' });
+  const revised = confirmChecks(project, { model: 'synthetic/model-m', attempts: 1, reason: 'The user chose model-m.', tier: 'full' });
   assert.equal(revised.confirmation.run_plan.model, 'synthetic/model-m');
-  assert.ok(revised.next.startsWith('The loop for this Spec has ended (confirmation_changed). The checks are confirmed. Record the baseline next: `run start --baseline --unavailable no_implementation` reads N, the agent and the model from confirmed.json.'), revised.next);
+  assert.deepEqual(revised.loop, { started_at: first.started_at, phase: 'ended', ended: true, reason: 'confirmation_changed' });
+  // A new loop needs a baseline of this plan, recorded the same way, and the user's consent.
+  assert.deepEqual(revised.new_loop_needs, { baseline: true, user_consent: true });
+  assert.deepEqual([revised.baseline.kept, revised.baseline.unavailable, revised.baseline.on], [false, 'no_implementation', 'start_code']);
   const status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.next.reason, status.ended.plan], ['loop_ended', 'confirmation_changed', ['model']]);
-  assert.throws(() => startRun(repo, CHANGE), refused('loop_ended'));
+  assert.deepEqual([status.phase, status.ended.reason, status.ended.plan], ['ended', 'confirmation_changed', ['model']]);
+  assert.ok(status.ended.new_loop.consents.includes('new_loop'), JSON.stringify(status.ended.new_loop));
+  assert.throws(() => startRun(repo, CHANGE), (error) => {
+    refused('change_locked', 'loop_ended')(error);
+    assert.equal(error.gaps[0].reason, 'confirmation_changed');
+    return true;
+  });
   // A new loop needs a baseline of that plan on the start code.
   assert.throws(() => startLoop(repo, CHANGE), (error) => error.gaps.some((gap) => gap.code === 'baseline_plan_differs'));
   setResults(repo, {});
@@ -427,33 +470,38 @@ test('after an unavailable baseline the user confirmed with model none, a head r
   assert.equal(readRecord(next).run.environment_ref.model, 'synthetic/model-m');
 });
 
-test('inside a loop a head run takes the model or agent the user confirmed over the one harness.json names, and a flag for it is refused', (t) => {
+test('inside a loop a head run takes the model or agent the user confirmed over the one harness.json names, a flag for another one is refused, and one for the same is taken', (t) => {
   const project = readyProject(t, { live: [FAILURE], model: 'synthetic/kit-model', confirm: false });
   const { repo, tools } = project;
-  startRun(repo, CHANGE, { baseline: true, model: 'synthetic/flag-model', attempts: 2 });
   confirmChecks(project, { attempts: 2, model: 'synthetic/flag-model' });
+  startRun(repo, CHANGE, { baseline: true });
   startLoop(repo, CHANGE);
   setResults(repo, AFTER);
   // No flag is needed: the run takes the confirmed model.
   const head = startRun(repo, CHANGE);
   assert.equal(head.verdict, 'pass');
   assert.ok(tools.runs().slice(-2).every((call) => valueOf(call.argv, '-m') === 'synthetic/flag-model'));
-  for (const model of ['synthetic/flag-model', 'synthetic/third-model']) {
-    assert.throws(() => startRun(repo, CHANGE, { model }), (error) => {
-      refused('run_plan_fixed')(error);
-      assert.doesNotMatch(error.gaps[0].message, /pass --model/);
-      return true;
-    });
-  }
+  assert.throws(() => startRun(repo, CHANGE, { model: 'synthetic/third-model' }), (error) => {
+    refused('run_plan_fixed')(error);
+    assert.deepEqual(error.gaps[0].differs, [{ key: 'model', given: 'synthetic/third-model', plan: 'synthetic/flag-model' }]);
+    return true;
+  });
+  // Nor is the model harness.json names the plan's.
+  assert.throws(() => startRun(repo, CHANGE, { model: 'synthetic/kit-model', case: [FAILURE] }), refused('run_plan_fixed'));
+  const same = startRun(repo, CHANGE, { model: 'synthetic/flag-model', case: [FAILURE] });
+  assert.equal(same.execution_status, 'completed', JSON.stringify(same));
+  assert.equal(valueOf(tools.runs().at(-1).argv, '-m'), 'synthetic/flag-model');
 
   const other = readyProject(t, { live: [FAILURE], confirm: false });
-  startRun(other.repo, CHANGE, { baseline: true, agent: 'other_agent:OtherAgent', attempts: 2 });
   confirmChecks(other, { attempts: 2, agent: 'other_agent:OtherAgent' });
+  startRun(other.repo, CHANGE, { baseline: true });
   startLoop(other.repo, CHANGE);
   setResults(other.repo, AFTER);
   assert.equal(startRun(other.repo, CHANGE).verdict, 'pass');
   assert.ok(other.tools.runs().slice(-2).every((call) => valueOf(call.argv, '-a') === 'other_agent:OtherAgent'));
-  assert.throws(() => startRun(other.repo, CHANGE, { agent: 'other_agent:OtherAgent' }), refused('run_plan_fixed'));
+  // The agent of harness.json is not the plan's.
+  assert.throws(() => startRun(other.repo, CHANGE, { agent: AGENT }), refused('run_plan_fixed'));
+  assert.equal(startRun(other.repo, CHANGE, { agent: 'other_agent:OtherAgent', case: [FAILURE] }).execution_status, 'completed');
 });
 
 test('a loop does not start on a baseline that fixed no number of attempts once a package declares a live dependency', (t) => {
@@ -466,49 +514,65 @@ test('a loop does not start on a baseline that fixed no number of attempts once 
   writeFileSync(file, `${JSON.stringify(declared, null, 2)}\n`);
   checkEval(repo, CHANGE);
   // The changed package needs the user's confirmation first, with the number of attempts.
-  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'confirm_checks');
+  const unconfirmed = workflowStatus(repo, CHANGE);
+  assert.equal(unconfirmed.layers.confirmation.current, false);
+  assert.deepEqual(unconfirmed.layers.confirmation.changed_since, [FAILURE]);
+  const confirmAction = actionOf(unconfirmed, 'eval', 'confirm');
+  assert.deepEqual([confirmAction.by, confirmAction.needed], ['user', true], JSON.stringify(confirmAction));
+  assert.throws(() => confirmChecks(project, { reason: `${FAILURE} calls the model.` }), (error) => error.gaps.some((gap) => gap.code === 'attempts_undecided'));
   confirmChecks(project, { reason: `${FAILURE} calls the model.`, attempts: 3 });
-  // Then workflow check gives the baseline command again, the way it was recorded.
-  const recorded = checkWorkflow(repo, 'run-eval', CHANGE);
-  assert.equal(recorded.next.action, 'record_baseline', JSON.stringify(recorded.next));
-  // The confirmation holds the number, so the command passes none.
-  assert.deepEqual(recorded.next.command, ['run', 'start', CHANGE, '--repo', repo, '--baseline', '--unavailable', 'no_implementation']);
-  assert.ok(recorded.next.note.startsWith(`The baseline ${base.run_id} fixed no number of attempts, so no loop can run ${FAILURE} on it: record it again. The baseline reads the number of attempts, the agent and the model the user confirmed from confirmed.json: pass none of them.`), recorded.next.note);
-  assert.equal(checkWorkflow(repo, 'loop-and-implement', CHANGE).next.action, 'resolve_business_decisions');
+  // That baseline fixed no number of attempts: a loop on it is refused, and
+  // recording it again the same way is allowed.
+  const recorded = workflowStatus(repo, CHANGE);
+  assert.ok(actionOf(recorded, 'loop', 'start').blocked_by.includes('attempts_undecided'), JSON.stringify(actionOf(recorded, 'loop', 'start')));
+  assert.equal(actionOf(recorded, 'run', 'start', '--baseline', '--unavailable').allowed, true);
   assert.throws(() => startLoop(repo, CHANGE), (error) => {
     assert.equal(error.code, 'LOOP_INPUT_BLOCKED');
     assert.deepEqual(error.gaps.map((gap) => gap.code), ['attempts_undecided']);
-    const [entry] = error.gaps;
-    assert.deepEqual([entry.kind, entry.owner, entry.route], ['business', 'user', 'run-eval']);
-    assert.equal(entry.message, `${FAILURE} declares a live dependency, but the baseline ${base.run_id} fixed no number of attempts, so a loop on that baseline could not run it the user's number of times. That number is the user's decision. The user confirmed 3 attempts in confirmed.json: record the baseline again with \`run start --baseline --unavailable no_implementation\`, which reads that number, then run \`loop start\`.`);
+    const entry = assertGapShape(error.gaps[0]);
+    assert.equal(entry.message, `${FAILURE} declares a live dependency, but the baseline ${base.run_id} fixed no number of attempts, so a loop on that baseline could not run it the user's number of times. That number is the user's decision; they confirmed 3 attempts in confirmed.json, which a baseline recorded now reads.`);
     return true;
   });
-  const again = startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
-  assert.equal(again.run_plan.attempts, 3);
-  assert.equal(checkWorkflow(repo, 'run-eval', CHANGE).next.action, 'start_loop');
-  assert.equal(startLoop(repo, CHANGE).loop.baseline, again.run_id);
+  const rerecorded = startRun(repo, CHANGE, { baseline: true, unavailable: 'no_implementation' });
+  assert.equal(rerecorded.run_plan.attempts, 3);
+  assert.equal(actionOf(workflowStatus(repo, CHANGE), 'loop', 'start').allowed, true);
+  assert.equal(startLoop(repo, CHANGE).loop.baseline, rerecorded.run_id);
 });
 
-test('a package that declares a live dependency after a baseline that fixed no number of attempts ends a loop, and warns outside one', (t) => {
-  const project = readyProject(t);
-  const { repo, root } = project;
-  const base = startRun(repo, CHANGE, { baseline: true });
-  startLoop(repo, CHANGE);
+// Declares a live dependency in FAILURE and proves it again.
+function declareLive(repo, root) {
   const file = path.join(root, 'evals', FAILURE, 'tests/checks.json');
   const declared = readJSON(file);
   declared.dependencies = [LIVE_DEPENDENCY];
   writeFileSync(file, `${JSON.stringify(declared, null, 2)}\n`);
   checkEval(repo, CHANGE);
+}
+
+test('a package that declares a live dependency after a baseline that fixed no number of attempts ends a loop, and warns outside one', (t) => {
+  const project = readyProject(t);
+  const { repo, root } = project;
+  startRun(repo, CHANGE, { baseline: true });
+  startLoop(repo, CHANGE);
+  declareLive(repo, root);
   setResults(repo, AFTER);
-  // The package changed, so the loop has ended.
+  // The package changed, so the loop has ended, and the change is locked.
   const status = loopStatus(repo, CHANGE);
-  assert.deepEqual([status.next.action, status.next.reason, status.ended.packages], ['loop_ended', 'packages_changed', [FAILURE]]);
-  assert.throws(() => startRun(repo, CHANGE), refused('loop_ended'));
+  assert.deepEqual([status.phase, status.ended.reason, status.ended.packages], ['ended', 'packages_changed', [FAILURE]]);
+  assert.throws(() => startRun(repo, CHANGE), (error) => {
+    refused('change_locked', 'loop_ended')(error);
+    assert.equal(error.gaps[0].reason, 'packages_changed');
+    return true;
+  });
   // The user's confirmation of it needs their number of attempts.
   assert.throws(() => confirmChecks(project, { reason: `${FAILURE} calls the model.` }), (error) => error.gaps.some((gap) => gap.code === 'attempts_undecided'));
+
   // Outside a loop the package runs once, with a warning.
-  rmSync(loopFile(root));
-  const outside = startRun(repo, CHANGE);
+  const free = readyProject(t);
+  const base = startRun(free.repo, CHANGE, { baseline: true });
+  declareLive(free.repo, free.root);
+  setResults(free.repo, AFTER);
+  const outside = startRun(free.repo, CHANGE);
   assert.equal(outside.execution_status, 'completed');
   assert.ok(outside.warnings.includes(`${FAILURE} declares a live dependency, but the baseline ${base.run_id} fixed no number of attempts, so it ran once.`), JSON.stringify(outside.warnings));
+  assert.deepEqual(outside.attempts, { [FAILURE]: 1, [SUCCESS]: 1 });
 });
